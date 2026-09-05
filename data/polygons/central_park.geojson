@@ -1,0 +1,19 @@
+{
+  "type": "Feature",
+  "properties": {
+    "name": "Central Park and surrounding buildings",
+    "description": "Central Park with an approximately 600 ft perimeter for full surrounding building facades and depth"
+  },
+  "geometry": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [-73.9464162546693, 40.79744739790463],
+        [-73.97214903625844, 40.762172461435725],
+        [-73.98468045044403, 40.76745321539847],
+        [-73.95895226799378, 40.802730921759526],
+        [-73.9464162546693, 40.79744739790463]
+      ]
+    ]
+  }
+}

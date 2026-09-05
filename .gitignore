@@ -1,0 +1,8 @@
+.venv/
+data/raw/
+data/cache/
+output/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.DS_Store
