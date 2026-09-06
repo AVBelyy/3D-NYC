@@ -21,14 +21,19 @@ from generate_3mf import build_config, parser as generator_parser  # noqa: E402
 from plan_map_chunks import (  # noqa: E402
     ELEVATION_CELL_M,
     MAX_ELEVATION_CELLS,
+    PlannerInputs,
     SemanticRouteCost,
     SeamScorer,
     axes_for_orientation,
     main as planner_main,
     maximum_safe_scale,
     optimize_axis,
+    optimize_semantic_junctions,
     parse_polygon,
+    parser as planner_parser,
+    regularize_semantic_line,
     route_semantic_edge,
+    run_planner,
 )
 
 
@@ -144,6 +149,50 @@ class PartitionTests(unittest.TestCase):
         self.assertEqual(scorer.details(line)["buildings_cut"], 0)
         self.assertGreater(scorer.details(line)["road_fraction"], 0.25)
 
+    def test_tall_building_has_larger_keep_together_zone(self):
+        aoi = box(0, 0, 70, 30)
+        buildings = gpd.GeoDataFrame({
+            "height_roof": [10.0, 300.0],
+            "geometry": [box(0, 5, 10, 15), box(40, 5, 50, 15)],
+        }, crs=2263)
+        empty = gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs=2263), crs=2263)
+        costs = SemanticRouteCost(
+            aoi, buildings=buildings, roads=empty, trails=empty, parks=empty,
+            water=empty, hard_layers=[], sample_ft=1.0,
+        )
+        values = costs.values(np.asarray([13.0, 53.0]), np.asarray([10.0, 10.0]))
+        self.assertGreater(values[1], values[0] + 1_000_000)
+
+    def test_route_regularization_penalizes_many_short_sides(self):
+        line = LineString([(0, 0), (1, 0.2), (2, -0.2), (3, 0.2), (4, 0)])
+        simplified, report = regularize_semantic_line(
+            line, scorer=None, step_ft=1.0, grid_step_mm=0.25,
+            minimum_segment_mm=1.0, complexity_penalty=6.0,
+        )
+        self.assertLess(len(shapely.get_coordinates(simplified)), len(shapely.get_coordinates(line)))
+        self.assertEqual(report["short_sides"], 0)
+        self.assertEqual(report["raw_path_vertices"], 5)
+
+    def test_internal_junction_can_move_in_two_dimensions_onto_road(self):
+        aoi = box(0, 0, 200, 200)
+        empty = gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs=2263), crs=2263)
+        roads = gpd.GeoDataFrame({"geometry": [box(107, 107, 115, 115)]}, crs=2263)
+        costs = SemanticRouteCost(
+            aoi, buildings=empty, roads=roads, trails=empty, parks=empty,
+            water=empty, hard_layers=[], sample_ft=1.0,
+        )
+        junctions, reports = optimize_semantic_junctions(
+            x_cuts=[0, 100, 200], y_cuts=[0, 100, 200],
+            maximum_x_cells=130, maximum_y_cells=130,
+            maximum_deviation_cells=20, search_every_cells=1,
+            origin=np.asarray([0.0, 0.0]), x_axis=np.asarray([1.0, 0.0]),
+            y_axis=np.asarray([0.0, 1.0]), step_ft=1.0, grid_step_mm=1.0,
+            cost_surface=costs,
+        )
+        self.assertEqual(len(reports), 1)
+        self.assertGreater(junctions[(1, 1)][0], 100)
+        self.assertGreater(junctions[(1, 1)][1], 100)
+
     def test_feature_collection_input_is_dissolved(self):
         payload = {
             "type": "FeatureCollection",
@@ -174,20 +223,26 @@ class PartitionTests(unittest.TestCase):
 
 
 class PlannerEndToEndTests(unittest.TestCase):
-    def test_geometric_plan_has_exact_coverage_and_preflightable_commands(self):
+    def test_data_free_geometric_plan_has_exact_coverage_and_preflightable_commands(self):
         polygon = "POLYGON ((-74.0 40.76, -73.96 40.76, -73.96 40.79, -74.0 40.79, -74.0 40.76))"
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "plan"
-            argv = [
-                "plan_map_chunks.py", "--bounding-polygon", polygon,
+            root = Path(directory)
+            output = root / "plan"
+            args = planner_parser().parse_args([
+                "--bounding-polygon", polygon,
                 "--max-chunks", "9", "--scale", "6286.5",
                 "--orientation-deg", "0", "--geometric-only",
                 "--skip-terrain-scan", "--plan-id", "test_plan",
+                "--data-dir", str(root / "empty-data"),
+                "--generation-output-dir", str(root / "generated"),
+                "--no-preview-basemap",
                 "--output-dir", str(output),
-            ]
-            with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
-                planner_main()
+            ])
+            with contextlib.redirect_stdout(io.StringIO()):
+                run_planner(args, inputs=PlannerInputs.data_free())
             plan = json.loads((output / "plan.json").read_text())
+            self.assertEqual(plan["generation"]["readiness"]["result"], "not_checked")
+            self.assertEqual(plan["validated_caches"], {})
             self.assertEqual(plan["coverage"]["result"], "passed")
             self.assertLessEqual(plan["chunk_count"], 9)
             self.assertLessEqual(plan["coverage"]["missing_area_sq_ft"], plan["coverage"]["tolerance_sq_ft"])
@@ -217,6 +272,45 @@ class PlannerEndToEndTests(unittest.TestCase):
             events = [json.loads(line) for line in (output / "logs/planner.jsonl").read_text().splitlines()]
             self.assertEqual(events[-1]["event"], "planner_completed")
             self.assertTrue(any(event["event"] == "generator_command_preflighted" for event in events))
+
+    def test_production_entrypoint_still_requires_generation_caches(self):
+        polygon = "POLYGON ((-74.0 40.76, -73.99 40.76, -73.99 40.77, -74.0 40.77, -74.0 40.76))"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            args = planner_parser().parse_args([
+                "--bounding-polygon", polygon,
+                "--max-chunks", "1", "--scale", "6286.5",
+                "--orientation-deg", "0", "--geometric-only",
+                "--skip-terrain-scan", "--no-preview-basemap",
+                "--data-dir", str(root / "empty-data"),
+                "--output-dir", str(root / "plan"),
+            ])
+            with contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(SystemExit, "LiDAR cache is missing"):
+                    run_planner(args)
+            self.assertFalse((root / "plan").exists())
+
+    def test_data_free_inputs_reject_modes_that_consume_external_data(self):
+        polygon = "POLYGON ((-74.0 40.76, -73.99 40.76, -73.99 40.77, -74.0 40.77, -74.0 40.76))"
+        cases = [
+            (["--skip-terrain-scan", "--no-preview-basemap"], "Semantic planning"),
+            (["--geometric-only", "--no-preview-basemap"], "Terrain scanning"),
+            (["--geometric-only", "--skip-terrain-scan"], "Preview basemap"),
+        ]
+        for mode_args, message in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                args = planner_parser().parse_args([
+                    "--bounding-polygon", polygon,
+                    "--max-chunks", "1", "--scale", "6286.5",
+                    "--orientation-deg", "0",
+                    "--data-dir", str(root / "empty-data"),
+                    "--output-dir", str(root / "plan"),
+                    *mode_args,
+                ])
+                with contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaisesRegex(ValueError, message):
+                        run_planner(args, inputs=PlannerInputs.data_free())
 
 
 if __name__ == "__main__":

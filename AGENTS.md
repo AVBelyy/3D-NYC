@@ -43,6 +43,12 @@ Run commands from the repository root. Use Python 3.12 and install
   unless the task explicitly requires it.
 - Do not use ignored generated models, plans, logs, or local cache inventories
   as the sole evidence for a tracked documentation claim.
+- Keep the default test suite hermetic: it must pass from a clean checkout with
+  empty `data/raw/`, `data/cache/`, and `output/` directories. Tests for
+  orchestration must inject explicit resolved inputs or use small tracked
+  fixtures; they must not silently read a developer's ignored caches or create
+  fake manifests marked production-ready. Put full real-data checks in an
+  explicitly marked, separately provisioned integration workflow.
 - Preserve the distinction between EPSG:2263 source geometry, metre-valued
   NAVD88 elevations, and millimetre-valued print geometry.
 

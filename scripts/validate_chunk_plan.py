@@ -1097,10 +1097,10 @@ def validate_plan(
     except (OSError, json.JSONDecodeError) as error:
         diagnostics.error("PLAN_UNREADABLE", f"Plan file cannot be read: {error}", plan=str(plan_path))
         return _report(plan_path, diagnostics)
-    if plan.get("schema_version") not in {1, 2, 3}:
+    if plan.get("schema_version") not in {1, 2, 3, 4}:
         diagnostics.error(
             "PLAN_SCHEMA_UNSUPPORTED",
-            f"Plan schema_version must be 1, 2 or 3; got {plan.get('schema_version')!r}.",
+            f"Plan schema_version must be 1, 2, 3 or 4; got {plan.get('schema_version')!r}.",
             schema_version=plan.get("schema_version"),
         )
     records = plan.get("chunks")
@@ -1238,6 +1238,14 @@ def validate_plan(
     if not isinstance(generation, dict):
         diagnostics.error("GENERATION_SCHEMA_INVALID", "plan.generation must be an object.")
         generation = {}
+    readiness = generation.get("readiness")
+    if readiness is not None:
+        if not isinstance(readiness, dict) or readiness.get("result") not in {"validated", "not_checked"}:
+            diagnostics.error(
+                "GENERATION_READINESS_INVALID",
+                "plan.generation.readiness.result must be 'validated' or 'not_checked'.",
+            )
+    readiness_record = readiness if isinstance(readiness, dict) else {}
     shared_options = _normalized_shared_options(plan)
     shared_flags = _normalized_shared_flags(plan)
     if not shared_options:
@@ -1328,8 +1336,14 @@ def validate_plan(
         )
 
     commands_path = Path(str(plan.get("files", {}).get("commands", "")))
+    readiness_prefix = (
+        "# Source-cache readiness was not checked while creating this plan.\n"
+        "# Validate/provision the generated command inputs before running it.\n\n"
+        if readiness_record.get("result") == "not_checked" else ""
+    )
     expected_commands = (
         "#!/bin/sh\nset -eu\n\n"
+        + readiness_prefix
         + shlex.join(generation.get("static_validation_argv", [])) + "\n\n"
         + "\n\n".join(record.get("command", "") for record in records) + "\n\n"
         + shlex.join(generation.get("post_generation_validation_argv", [])) + "\n"

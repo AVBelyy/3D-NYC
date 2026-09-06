@@ -1,34 +1,58 @@
 # Plan gap-free multi-plate NYC maps
 
-[`scripts/plan_map_chunks.py`](../scripts/plan_map_chunks.py) partitions one WGS84 Polygon or MultiPolygon into reproducible `generate_3mf.py` jobs. Every chunk uses one common map scale, terrain datum, terrain-relief factor, orientation and manufacturing-grid phase. The emitted polygons have disjoint interiors and their union is independently checked against the exact request.
+[`scripts/plan_map_chunks.py`](../scripts/plan_map_chunks.py) partitions one
+WGS84 Polygon or MultiPolygon into neighboring `generate_3mf.py` jobs. Every
+chunk shares one scale, orientation, terrain datum, terrain-relief factor, and
+manufacturing-grid phase. The planner checks that chunk interiors do not
+overlap and that their union covers the exact request.
 
-The planner writes commands; it does not run the expensive 3MF jobs itself.
+Planning writes commands; it does not generate the 3MF files itself.
+
+## Prerequisites
+
+Run from the repository root in the same Python 3.12 environment used by the
+generator. Planning requires complete, production-ready caches for building
+footprints, Planimetrics, parks trails, parks structures, land cover,
+OpenStreetMap, and 3D buildings, plus LiDAR rasters covering the request and
+source padding. See the [cache runbook](cache_source_datasets.md).
+
+This readiness check applies to the production CLI even when
+`--geometric-only` and `--skip-terrain-scan` are selected, because the emitted
+generation commands still consume the complete source set. The deterministic
+planning core has an explicit resolved-input boundary for hermetic tests; a
+data-free invocation is recorded as `generation.readiness.result=not_checked`
+and its command script warns that inputs must be provisioned before execution.
+
+The planner does not use MTA entrances to choose seams, but its default offline
+generation commands still require the MTA entrance cache or downloaded raw CSV.
 
 ## Recommended workflow
 
-Run from the repository root with completed citywide vector, OSM, CityGML, land-cover and 0.5 m LiDAR caches:
+This example uses a polygon tracked in the repository:
 
-```sh
+```bash
 .venv/bin/python scripts/plan_map_chunks.py \
-  --bounding-polygon @data/polygons/uws_central_park_ues.geojson \
-  --max-chunks 9 \
+  --bounding-polygon @data/polygons/central_park.geojson \
+  --max-chunks 4 \
   --chunk-size-mm 235x235 \
-  --plan-id uws_central_park_ues
+  --plan-id central_park
 ```
 
-The output directory defaults to `output/plans/<plan-id>/`. Inspect `preview.svg`, `plan.json` and `validation.json`, then run:
+Inspect `output/plans/central_park/preview.svg`, `plan.json`, and
+`validation.json`, then run:
 
-```sh
-output/plans/uws_central_park_ues/commands.sh
+```bash
+output/plans/central_park/commands.sh
 ```
 
-`commands.sh` first revalidates the static plan, runs every exact generation command in deterministic order, and finally requires a post-generation seam audit. The last audit reads the generated field grids and 3MF archives; the script exits nonzero if any required chunk is missing or inconsistent.
+The script revalidates the static plan, runs each exact generation command in
+deterministic order, and requires a post-generation seam audit. It exits
+nonzero if a chunk is missing or inconsistent.
 
-### Two-metre Manhattan Island plan
+For a fixed-scale assembly, provide both a scale and, when repeatability of the
+layout matters, an orientation:
 
-The repository includes the Manhattan Island boundary extracted from the cached OSM relation. This verified command fixes the assembled north-south span at exactly 2,000 mm while keeping every frame at or below 235 x 235 mm:
-
-```sh
+```bash
 .venv/bin/python scripts/plan_map_chunks.py \
   --bounding-polygon @data/polygons/manhattan_island.geojson \
   --max-chunks 20 \
@@ -38,103 +62,135 @@ The repository includes the Manhattan Island boundary extracted from the cached 
   --plan-id manhattan_2m
 ```
 
-The fixed orientation is the closest tested street-grid alignment that keeps the 2,000 mm-tall envelope within two 235 mm columns. The checked result has a 470 x 2,000 mm print-space envelope, a 2 x 9 logical scaffold and 18 emitted Polygon jobs. `--max-chunks` is a ceiling, not a request to manufacture exactly that many pieces. The exact job count can differ from the number of occupied scaffold cells when a concave shoreline intersection has multiple Polygon components.
+`--max-chunks` is a ceiling, not a requested piece count. Concave shorelines
+and disconnected islands can produce more than one printable polygon from an
+occupied scaffold cell, and every emitted polygon counts toward the limit.
 
-## Boundary selection
+## How boundaries are chosen
 
-The search is performed in EPSG:2263 feet, while dimensions and cut locations are snapped to the shared print-space grid. Automatic orientation considers north, the requested polygon's minimum rotated envelope and the dominant cached roadbed orientation. It favors a street-aligned orientation when it costs no more than 3% map detail.
+The search runs in EPSG:2263 feet; print dimensions and cut locations are
+snapped to one shared print-space grid. Automatic orientation considers north,
+the polygon's minimum rotated envelope, and dominant cached road directions. It
+may prefer a street-aligned candidate within three percent of the most detailed
+feasible scale.
 
-The local cache is sufficiently complete for city-scale boundary decisions:
+Rectangles are printer envelopes, not necessarily chunk shapes. The planner
+first finds a feasible straight scaffold, then semantic mode can move shared
+junctions and route free-form boundaries through available frame slack.
+Neighbors reuse the same routed line, so bends do not create a gap or overlap.
+Each finished polygon receives its own tight rectangular print frame.
 
-| Cache | Relevant retained data |
-|---|---|
-| LiDAR | 296 canonical tiles derived from 1,894 LAZ sources; 0.5 m EPSG:2263 ground and upper surfaces in metres NAVD88. |
-| Vectors | 4,031,333 features, including 1,083,026 current building footprints, 104,961 roadbeds, 13,206 parks, 2,206 hydrography features, 2,247 transport structures and 4,681 retaining walls. |
-| OSM | 2,372,144 current cached features (2,403,527 tiled rows), used for named-road seam labels and current topology. |
-| CityGML | 1,083,433 building objects and 1,579,005 retained roof surfaces, used by generation after boundaries are selected. |
-| Land cover | One unquantized 310,844 × 314,414 native classification raster, used by generation for terrain/canopy materials. |
+The semantic router strongly avoids buildings, tall or long prominent objects,
+transport structures, retaining walls, and park structures. It keeps clearance
+from nearby buildings, favors wide roadbeds, trails, water, shorelines, parks,
+plazas, parking lots, and other open space, and penalizes unnecessarily complex
+paths and very short polyline sides. Building keep-out distance grows with roof
+height and footprint length; bridge-like transport structures receive
+length-aware protection. The route remains constrained by both neighboring
+print frames, the generator's minimum dimensions, and the maximum seam
+deviation.
 
-Current footprints are the decisive cut-avoidance layer because a split building creates the most obvious assembly defect. Roof heights increase the penalty for especially visible cuts. Roadbeds are the best positive seam signal: a joint can sit in an existing narrow, low-relief visual break, while named OSM centerlines make the result reviewable. Structures and retaining walls are treated as conflicts; parks and water are weaker fallbacks because they are visually simple but can still carry canopy, shoreline or inferred-level detail. LiDAR is used globally to choose one vertical normalization, while actual generated LiDAR-derived edge heights are compared after the jobs finish.
+Use `--seam-mode straight` for straight scaffold boundaries. Use
+`--geometric-only` to skip semantic layers during a fast layout check and
+`--skip-terrain-scan` to skip cached-ground normalization. Those two shortcuts
+are useful for smoke tests, not final production plans.
 
-Rectangles are only printer envelopes, not chunk shapes. Planning first finds a feasible straight scaffold, then routes each shared scaffold-edge segment as a free-form path through the frame slack. Segment endpoints meet at common junctions, while intermediate vertices remain on the shared manufacturing grid. Adjacent chunks reuse the identical routed line, so bends cannot introduce a gap or overlap. Each finished Polygon receives its own tight rectangular print frame, which may overlap a neighbor's frame even though their printable polygons never overlap.
-
-The semantic path router uses dynamic programming inside each safe deviation corridor. It is subject to the requested maximum frame dimensions, the 20 mm generator minimum and `--max-seam-deviation-mm`. Candidate path samples are scored in this order:
-
-1. Avoid cutting cached building footprints. Building count, crossing length and recorded roof height dominate the score.
-2. Avoid transport structures, retaining walls and park structures.
-3. Keep clearance from nearby buildings.
-4. Prefer seams running along roadbeds (including small streets), park trails, hydrography or shoreline, then parks/open areas, over seams through ordinary modeled surface.
-5. Prefer reasonably even chunk widths/heights when semantic scores are otherwise close.
-
-This produces arbitrary non-rectangular but manufacturable chunks. “Best” means the lowest score inside the explicit monotone path corridors, rather than an unconstrained cut that could make a chunk exceed its printer frame. Use `--seam-mode straight` for the legacy straight boundaries, `--orientation-deg` to require a particular global scaffold, or reduce `--path-step-mm` for denser route sampling.
-
-The UWS + Central Park + UES semantic-path smoke plan selected the Manhattan street grid at 28.665835° east of north and a 3 × 3 scaffold at 1:6,362.1. No selected seam cuts a building. Routed segments include boundaries that are almost entirely inside roadbed, one segment that follows a Central Park trail for 42% of its length and another that uses water for 45%. Every semantic fraction and conflict is stored per segment in `plan.json` and emitted in the structured log.
-
-## Inputs and important options
+## Important options
 
 | Argument | Default | Meaning |
-|---|---:|---|
-| `--bounding-polygon WKT\|GEOJSON\|PATH` | required | WGS84 Polygon/MultiPolygon. GeoJSON FeatureCollections are dissolved. Prefix paths with `@` when helpful. |
-| `--max-chunks` | required | Hard maximum number of emitted Polygon jobs, including disconnected pieces and islands. |
-| `--chunk-size-mm WIDTHxHEIGHT` | `235x235` | Maximum print frame for each chunk; each dimension must be 20–250 mm and a grid multiple. |
-| `--scale` | automatic | One shared denominator. Automatic mode chooses the most detailed feasible scale with seam-movement headroom. |
-| `--orientation-deg` | automatic | Shared model-Y bearing, degrees east of north. |
-| `--seam-mode` | `semantic-paths` | Route non-rectangular semantic boundaries; `straight` retains global straight cuts. |
-| `--seam-flex-percent` | `4` | Detail traded for a wider semantic seam-search corridor in automatic-scale mode. |
-| `--candidate-step-mm` | `0.5` | Candidate seam spacing; actual cuts remain on `--grid-step-mm`. |
-| `--path-step-mm` | `0.25` | Semantic path sampling interval; must be a manufacturing-grid multiple. |
-| `--max-seam-deviation-mm` | `20` | Maximum path departure from a scaffold edge, further reduced automatically by each neighboring frame's available slack. |
-| `--grid-step-mm` | `0.125` | Shared manufacturing-grid spacing. |
-| `--terrain-origin-m` | scanned | Shared NAVD88 datum. Automatic mode uses five metres below the exact cached minimum, rounded down. |
-| `--terrain-relief-factor` | scanned | Shared terrain-only relief factor. Automatic selection uses a stratified citywide sample of the request. |
-| `--skip-terrain-scan` | off | Fast planning smoke-test mode; uses `-50 m` and factor `1` unless explicitly supplied. Do not use for a final production plan. |
-| `--geometric-only` | off | Skip semantic seam scoring. Intended for performance/geometry smoke tests, not final boundary selection. |
-| `--offline` / `--no-offline` | offline | Whether emitted generator commands prohibit network access. Planning still requires completed local caches so all jobs share one frozen source snapshot. |
-| `--full-validation` | off | Add each 3MF's expensive cross-material Boolean audit. Static and seam validation are always present. |
-| `--slice` | off | Add an offline Bambu Studio slice to every generation command. |
-| `--log-level` | `INFO` | Structured JSON event verbosity written to stdout and `logs/planner.jsonl`. |
+| --- | ---: | --- |
+| `--bounding-polygon WKT\|GEOJSON\|PATH` | required | WGS84 Polygon/MultiPolygon; FeatureCollections are dissolved |
+| `--max-chunks` | required | Maximum emitted polygon jobs, including disconnected pieces |
+| `--chunk-size-mm WIDTHxHEIGHT` | `235x235` | Maximum frame; each dimension must be 20–250 mm and a grid multiple |
+| `--scale` | automatic | Shared scale denominator; automatic mode chooses the most detailed feasible value with seam headroom |
+| `--orientation-deg` | automatic | Shared model-Y bearing in degrees east of north |
+| `--seam-mode` | `semantic-paths` | Free-form semantic boundaries or `straight` scaffold cuts |
+| `--seam-flex-percent` | `4` | Automatic-scale detail reserved for movable seam corridors |
+| `--candidate-step-mm` | `0.5` | Candidate straight-cut spacing |
+| `--path-step-mm` | `0.25` | Semantic path sampling interval; must be a grid multiple |
+| `--max-seam-deviation-mm` | `20` | Maximum routed departure from a scaffold edge, further limited by frame slack |
+| `--junction-flex-mm` | up to `8` | Maximum two-dimensional movement of a shared internal junction; capped by maximum seam deviation |
+| `--minimum-seam-side-mm` | `2` | Polyline sides below this length receive a penalty |
+| `--seam-complexity-penalty` | `6` | Relative cost of extra and short seam sides |
+| `--grid-step-mm` | `0.125` | Shared manufacturing-grid spacing |
+| `--terrain-origin-m` | scanned | Shared NAVD88 datum; automatic mode uses 5 m below the exact cached minimum, rounded down |
+| `--terrain-relief-factor` | scanned | Shared ground-relief factor derived from a stratified sample |
+| `--preview-basemap` | on | Overlay cached NYC vector context in the SVG preview; failure falls back to a plain preview |
+| `--preview-width-px` | `1600` | Long dimension of the cached preview basemap |
+| `--offline` / `--no-offline` | offline | Whether emitted generation commands prohibit network access |
+| `--full-validation` | off | Add each 3MF's expensive cross-material audit |
+| `--slice` | off | Add an offline Bambu Studio slice to each generation command |
 
-Generator-compatible numeric constraints are checked before any plan is written. The planner also validates all cache manifests and every required semantic file, and parses every emitted argv through the real generator configuration builder.
+Run `scripts/plan_map_chunks.py --help` for every path, sampling, logging, and
+preview control. Numeric limits are checked before output is committed, and
+each emitted argv is parsed through the real generator configuration builder.
 
 ## Output contract
 
 ```text
 output/plans/<plan-id>/
-  plan.json                         # exact request, layout, seams, frames and argv
+  plan.json                         # request, layout, seams, frames, and argv
   validation.json                   # independent static validation report
   post_generation_validation.json  # written after all models exist
-  commands.sh                       # static check, jobs, required post-check
-  chunks.geojson                    # all chunk footprints for GIS inspection
+  commands.sh                       # static check, jobs, and required post-check
+  chunks.geojson                    # all printable footprints
   preview.svg                       # labeled plan view
-  logs/planner.jsonl                # structured planning stages and per-seam/per-command events
+  preview-map.png                   # optional cached-data background for preview.svg
+  logs/planner.jsonl                # structured planning events
   chunks/<chunk-id>.geojson         # one bare Polygon per generator job
-  frames/<chunk-id>.json            # explicit shared-grid print frame
+  frames/<chunk-id>.json            # one explicit shared-grid print frame
 ```
 
-The exact EPSG:2263 target is stored alongside the original normalized WGS84 request. This lets the validator detect a missing strip or hole independently; it does not define correctness as “the union of whatever chunk files happen to exist.” All paths and shell-safe argv are absolute in the plan.
+`preview-map.png` is omitted when basemap rendering is disabled or cannot be
+completed. It is rendered from cached hydrography, parks, plazas, parking lots,
+roadbeds, transport structures, and building footprints. Reusable basemap
+rasters default to `data/cache/nyc_map_preview/`; change that with
+`--preview-map-cache-dir`. Cache keys include the requested area, raster size,
+and relevant source-cache metadata.
 
-## Validation and errors
+`plan.json` records whether source-cache readiness was validated for the
+emitted generation commands. Normal CLI plans record `validated`. Programmatic
+data-free smoke plans record `not_checked`; static plan validation remains
+available, but that status is not evidence that the generation commands can run.
 
-[`scripts/validate_chunk_plan.py`](../scripts/validate_chunk_plan.py) emits structured issues with a stable code, severity, descriptive message and numeric/location context. Static validation covers:
+The plan stores both the normalized WGS84 request and an exact EPSG:2263 target,
+so validation does not define correctness as merely the union of whatever chunk
+files happen to exist. Plan paths and generated shell argv are absolute.
 
-- malformed/missing request, layout, frame, polygon or command data;
-- chunk count and disconnected-component limits;
-- gaps, coverage outside the request and pairwise/aggregate overlap;
-- broken expected seams, unplanned internal seams and disconnected adjacency;
-- shared scale, axes, grid phase, tight frame bounds and polygon containment;
-- exact free-form logical-cell geometry and routed-seam geometry;
-- polygon pieces with no manufacturing-grid cell center;
-- exact agreement of every common generator option/flag and `commands.sh`;
-- independent agreement between the WGS84 and EPSG:2263 request representations.
+## Validation
 
-After generation, `--check-generated --require-generated` additionally verifies every job configuration and field shape, the realized terrain origin/factor, actual AOI, hidden command metadata, and all neighboring field edges. Ground and visible-surface heights are extrapolated to the physical seam from the two nearest valid cell centers. By default, a seam fails above 0.24 mm p95 or 0.72 mm maximum mismatch; localized values above 0.24 mm warn. Material disagreement warns above 5% of paired cells and fails above 25%. Tolerances can be changed explicitly on the validator CLI.
+[`scripts/validate_chunk_plan.py`](../scripts/validate_chunk_plan.py) reports
+issues with a code, severity, message, and numeric or location context. Static
+validation checks:
 
-Examples of actionable diagnostics include `COVERAGE_GAP`, `CHUNK_INTERIOR_OVERLAP`, `BROKEN_INTERNAL_SEAM`, `FRAME_ORIGIN_OFF_SHARED_GRID`, `COMMAND_SHARED_OPTION_MISMATCH`, `CHUNK_HAS_NO_MANUFACTURING_CELLS`, `GENERATED_CONFIGURATION_MISMATCH`, `GENERATED_HEIGHT_SEAM_DISCONTINUITY` and `EMBEDDED_COMMAND_METADATA_MISMATCH`.
+- schema, request, layout, frame, polygon, seam, and command structure;
+- chunk/component limits, missing coverage, excess coverage, and overlaps;
+- expected seams, adjacency, grid phase, tight frames, and containment;
+- routed-seam and logical-cell agreement;
+- shared generator options and the contents of `commands.sh`;
+- agreement between the WGS84 and EPSG:2263 request representations.
 
-## Scaling to all NYC
+The default test suite uses the resolved-input boundary with geometric-only,
+skipped-terrain, and disabled-basemap modes. It must therefore pass in a clean
+checkout without any ignored NYC cache. Tests that consume full publisher data
+belong in a separately provisioned real-data integration workflow rather than
+the pull-request unit-test job.
 
-Planning memory is proportional to the cached vector features near movable seam corridors, not to the number of 3MF mesh triangles. Terrain normalization streams one cached LiDAR tile at a time. Chunk geometry, coverage and adjacency validation use spatial indexes.
+After generation, `--check-generated --require-generated` also inspects each job
+configuration, field shape, realized terrain normalization, actual area of
+interest, embedded command metadata, and neighboring field edges. By default,
+a height seam fails above 0.24 mm at the 95th percentile or 0.72 mm maximum.
+Material disagreement warns above 5 percent of paired cells and fails above 25
+percent. The validator CLI exposes explicit tolerance overrides.
 
-A rough NYC-wide bounding-box smoke test (`-74.26,40.49` to `-73.69,40.92`) completed as exactly 400 validated 235 × 235 mm chunks at 1:10,693.3. This is a geometry/scaling test, not a recommended city boundary: use an authoritative land/envelope polygon for production so ocean-only plates are not created. The same request with 300 chunks fails early with a descriptive capacity message because the required scale would exceed the per-job 30-million-cell elevation-grid limit.
+## Large plans
 
-For borough or city MultiPolygons, every disconnected printable piece counts toward `--max-chunks`. Sub-cell islands are never silently dropped: the request must use a more detailed scale/finer grid or explicitly simplify the source polygon. At full-city scale, first create a geometric-only smoke plan, then create the final semantic plan and keep its frozen cache manifests for every chunk.
+Planning memory follows semantic features near movable seam corridors rather
+than final mesh triangle count. Terrain normalization streams cached LiDAR tiles
+one at a time, and spatial indexes support coverage and adjacency checks.
+
+For borough- or city-scale work, create a geometric-only smoke plan first, then
+produce the semantic plan from frozen cache snapshots. Use an authoritative
+land or administrative polygon instead of a bounding box to avoid ocean-only
+plates. Sub-cell islands are not silently dropped: use a more detailed scale, a
+finer grid, or explicitly simplify the input polygon.

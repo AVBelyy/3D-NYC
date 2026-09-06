@@ -12,12 +12,14 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import json
 import logging
 import math
 import os
 import re
 import shlex
+import shutil
 import sys
 import time
 import traceback
@@ -33,9 +35,12 @@ import rasterio
 import shapely
 import structlog
 from rasterio.features import geometry_mask, geometry_window
+from rasterio.features import rasterize
+from rasterio.transform import from_bounds
 from rasterio.windows import Window
 from shapely.affinity import affine_transform
 from shapely.geometry import LineString, Polygon, box, shape
+from PIL import Image
 
 from download_data import ROOT
 from terrain_relief import choose_terrain_relief
@@ -48,7 +53,19 @@ MIN_FRAME_MM = 20.0
 MAX_FRAME_MM = 250.0
 MAX_ELEVATION_CELLS = 30_000_000
 ELEVATION_CELL_M = 0.5
-PLAN_VERSION = 3
+PLAN_VERSION = 4
+PREVIEW_MAP_VERSION = 1
+
+GENERATION_CACHE_COMPONENTS = {
+    "lidar": "nyc_lidar_2017",
+    "building_footprints": "nyc_building_footprints",
+    "planimetrics": "nyc_planimetrics_2022",
+    "parks_trails": "nyc_parks_trails",
+    "parks_structures": "nyc_parks_structures",
+    "land_cover": "nyc_land_cover_2017",
+    "openstreetmap": "new_york_osm",
+    "buildings_3d": "nyc_3d_buildings_2014",
+}
 
 
 def canonical(value) -> str:
@@ -147,6 +164,126 @@ def require_complete_manifest(component: Path, label: str) -> dict:
             + ", ".join(missing)
         )
     return manifest
+
+
+@dataclass(frozen=True)
+class PlannerInputs:
+    """Resolved external inputs supplied to the deterministic planning core.
+
+    The production CLI constructs this state only after validating every cache
+    needed by its emitted generation commands. Tests may explicitly provide a
+    data-free state, but only modes that do not consume semantic or terrain
+    data accept it.
+    """
+
+    cache_manifests: dict[str, dict]
+    relevant_lidar: gpd.GeoDataFrame | None
+    semantic_sources_ready: bool
+    preview_sources_ready: bool
+    generation_readiness: str
+
+    @classmethod
+    def data_free(cls) -> "PlannerInputs":
+        return cls(
+            cache_manifests={},
+            relevant_lidar=None,
+            semantic_sources_ready=False,
+            preview_sources_ready=False,
+            generation_readiness="not_checked",
+        )
+
+
+def planning_input_requirements(args: argparse.Namespace) -> dict[str, bool]:
+    """Describe which optional data capabilities the requested plan consumes."""
+    return {
+        "semantic_vectors": not args.geometric_only,
+        "terrain_rasters": not args.skip_terrain_scan,
+        "preview_basemap": bool(args.preview_basemap),
+    }
+
+
+def load_production_planner_inputs(
+    *,
+    aoi,
+    cache_dir: Path,
+    lidar: Path,
+    source_padding_m: float,
+) -> PlannerInputs:
+    """Validate inputs required for immediately runnable generation commands."""
+    components = {
+        name: lidar if name == "lidar" else cache_dir / component
+        for name, component in GENERATION_CACHE_COMPONENTS.items()
+    }
+    labels = {
+        "lidar": "LiDAR",
+        "building_footprints": "Building footprints",
+        "planimetrics": "Planimetrics",
+        "parks_trails": "Parks trails",
+        "parks_structures": "Parks structures",
+        "land_cover": "Land cover",
+        "openstreetmap": "OpenStreetMap",
+        "buildings_3d": "3D buildings",
+    }
+    cache_manifests = {
+        name: require_complete_manifest(component, labels[name])
+        for name, component in components.items()
+    }
+
+    lidar_catalog_path = lidar / "catalog.geojson"
+    if not lidar_catalog_path.is_file():
+        raise SystemExit(f"LiDAR cache catalog is missing: {lidar_catalog_path}")
+    try:
+        lidar_catalog = gpd.read_file(lidar_catalog_path)
+    except Exception as error:
+        raise SystemExit(f"LiDAR cache catalog is unreadable: {lidar_catalog_path}: {error}") from error
+    lidar_catalog = lidar_catalog.set_crs(2263) if lidar_catalog.crs is None else lidar_catalog.to_crs(2263)
+    relevant_lidar = lidar_catalog[lidar_catalog.intersects(aoi.buffer(source_padding_m / FT))]
+    if relevant_lidar.empty:
+        raise SystemExit(
+            f"LiDAR cache {lidar} has no tiles intersecting the requested polygon and source padding."
+        )
+    missing_lidar = []
+    for _, record in relevant_lidar.iterrows():
+        for column in ("ground", "upper"):
+            cached = lidar / str(record.get(column, ""))
+            if not cached.is_file():
+                missing_lidar.append(str(cached))
+                if len(missing_lidar) == 5:
+                    break
+        if len(missing_lidar) == 5:
+            break
+    if missing_lidar:
+        raise SystemExit(
+            "LiDAR cache catalog references missing raster tiles needed by this request: "
+            + ", ".join(missing_lidar)
+        )
+    return PlannerInputs(
+        cache_manifests=cache_manifests,
+        relevant_lidar=relevant_lidar,
+        semantic_sources_ready=True,
+        preview_sources_ready=True,
+        generation_readiness="validated",
+    )
+
+
+def validate_planner_inputs(args: argparse.Namespace, inputs: PlannerInputs) -> None:
+    """Reject an injected input state that cannot satisfy the selected modes."""
+    requirements = planning_input_requirements(args)
+    if requirements["semantic_vectors"] and not inputs.semantic_sources_ready:
+        raise ValueError("Semantic planning requires resolved semantic vector sources")
+    if requirements["terrain_rasters"] and inputs.relevant_lidar is None:
+        raise ValueError("Terrain scanning requires resolved LiDAR inputs")
+    if requirements["preview_basemap"] and not inputs.preview_sources_ready:
+        raise ValueError("Preview basemap rendering requires resolved preview vector sources")
+    if inputs.generation_readiness not in {"validated", "not_checked"}:
+        raise ValueError(f"Unknown generation readiness state: {inputs.generation_readiness!r}")
+    if inputs.generation_readiness == "validated":
+        missing = sorted(set(GENERATION_CACHE_COMPONENTS) - set(inputs.cache_manifests))
+        if missing:
+            raise ValueError(
+                "Generation readiness is validated but cache manifests are missing: "
+                + ", ".join(missing)
+            )
 
 
 def parse_size(text: str) -> tuple[float, float]:
@@ -594,7 +731,7 @@ class SeamScorer:
 
     def __init__(
         self, aoi, *, buildings, roads, parks, water, hard_layers,
-        trails=None, clearance_ft=12.0,
+        trails=None, open_spaces=None, long_objects=None, clearance_ft=12.0,
     ):
         self.aoi = aoi
         self.buildings = buildings
@@ -604,6 +741,19 @@ class SeamScorer:
         self.trails = (
             trails if trails is not None
             else gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs=2263), crs=2263)
+        )
+        self.open_spaces = (
+            open_spaces if open_spaces is not None
+            else gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs=2263), crs=2263)
+        )
+        self.long_objects = (
+            long_objects if long_objects is not None
+            else gpd.GeoDataFrame(geometry=gpd.GeoSeries([], crs=2263), crs=2263)
+        )
+        road_union = _union_geometry(self.roads)
+        self.wide_roads = (
+            shapely.buffer(shapely.buffer(road_union, -5.0), 2.0)
+            if not road_union.is_empty else Polygon()
         )
         self.hard_layers = hard_layers
         self.clearance_ft = float(clearance_ft)
@@ -635,8 +785,10 @@ class SeamScorer:
             return {
                 "score": 0.0, "seam_length_ft": 0.0, "buildings_cut": 0,
                 "building_crossing_ft": 0.0, "near_buildings": 0,
-                "hard_conflicts": 0, "road_fraction": 0.0,
-                "trail_fraction": 0.0, "park_fraction": 0.0, "water_fraction": 0.0,
+                "tall_objects_cut": 0, "long_objects_cut": 0,
+                "hard_conflicts": 0, "road_fraction": 0.0, "wide_road_fraction": 0.0,
+                "trail_fraction": 0.0, "park_fraction": 0.0, "open_space_fraction": 0.0,
+                "water_fraction": 0.0,
             }
         building_hits = self._hits(self.buildings, line)
         building_intersections = (
@@ -658,8 +810,18 @@ class SeamScorer:
         hard_conflicts = 0
         for frame in self.hard_layers:
             hard_conflicts += len(self._hits(frame, line))
+        tall_buildings, long_buildings = _prominent_object_counts(self.buildings, line)
+        _, long_structures = _prominent_object_counts(self.long_objects, line)
+        long_hits = self._hits(self.long_objects, line)
+        long_crossing_ft = float(
+            sum(item.length for item in shapely.intersection(long_hits.geometry.to_numpy(), line))
+        ) if len(long_hits) else 0.0
         water_line = self._covered_line(self.water, line)
         road_line = shapely.difference(self._covered_line(self.roads, line), water_line)
+        wide_road_line = (
+            shapely.intersection(road_line, self.wide_roads)
+            if not self.wide_roads.is_empty else LineString()
+        )
         trail_hits = self._hits(self.trails, line.buffer(6.0))
         trail_line = LineString()
         if len(trail_hits):
@@ -670,19 +832,28 @@ class SeamScorer:
         park_line = shapely.difference(
             self._covered_line(self.parks, line), shapely.union_all([water_line, road_line, trail_line])
         )
-        safe = shapely.union_all([water_line, road_line, trail_line, park_line])
+        open_line = shapely.difference(
+            self._covered_line(self.open_spaces, line),
+            shapely.union_all([water_line, road_line, trail_line, park_line]),
+        )
+        safe = shapely.union_all([water_line, road_line, trail_line, park_line, open_line])
         other_length = max(0.0, length - float(safe.length))
         surface_cost = (
             other_length
-            + 0.20 * float(road_line.length)
+            + 0.20 * float(shapely.difference(road_line, wide_road_line).length)
+            + 0.06 * float(wide_road_line.length)
             + 0.15 * float(trail_line.length)
             + 0.35 * float(water_line.length)
             + 0.60 * float(park_line.length)
+            + 0.45 * float(open_line.length)
         )
         score = (
             len(building_hits) * 1_000_000_000.0
             + building_length * 10_000_000.0
             + float(heights.sum()) * 100_000.0
+            + tall_buildings * 50_000_000.0
+            + (long_buildings + long_structures) * 25_000_000.0
+            + long_crossing_ft * 2_000_000.0
             + hard_conflicts * 1_000_000.0
             + near_penalty
             + surface_cost
@@ -693,10 +864,14 @@ class SeamScorer:
             "buildings_cut": int(len(building_hits)),
             "building_crossing_ft": building_length,
             "near_buildings": int(len(near_only)),
+            "tall_objects_cut": tall_buildings,
+            "long_objects_cut": long_buildings + long_structures,
             "hard_conflicts": int(hard_conflicts),
             "road_fraction": float(road_line.length) / length,
+            "wide_road_fraction": float(wide_road_line.length) / length,
             "trail_fraction": float(trail_line.length) / length,
             "park_fraction": float(park_line.length) / length,
+            "open_space_fraction": float(open_line.length) / length,
             "water_fraction": float(water_line.length) / length,
         }
 
@@ -810,18 +985,100 @@ def _union_geometry(frame: gpd.GeoDataFrame, *, buffer_ft: float = 0.0):
     return shapely.buffer(geometry, buffer_ft) if buffer_ft else geometry
 
 
-class SemanticRouteCost:
-    """Vectorized point costs used by monotone semantic seam routing."""
+def _adaptive_keepout(
+    frame: gpd.GeoDataFrame | None,
+    *,
+    sample_ft: float,
+    height_column: str | None = None,
+    base_buffer_ft: float = 1.0,
+    maximum_buffer_ft: float = 30.0,
+):
+    """Buffer prominent objects enough that a sampled route cannot nick them.
 
-    def __init__(self, aoi, *, buildings, roads, trails, parks, water, hard_layers, sample_ft: float):
+    The buffer grows with an object's longest plan dimension and, for building
+    footprints, its recorded roof height.  This makes a small shed cheap to
+    pass near while reserving substantially more clearance around towers and
+    bridge-like structures.  It is a keep-together guard, not a cosmetic
+    setback: a route inside it receives the same dominant penalty as a direct
+    object cut.
+    """
+    if frame is None or frame.empty:
+        return Polygon()
+    geometries = frame.geometry.to_numpy()
+    bounds = shapely.bounds(geometries)
+    longest = np.maximum(bounds[:, 2] - bounds[:, 0], bounds[:, 3] - bounds[:, 1])
+    prominence = longest * 0.025
+    if height_column and height_column in frame:
+        heights = pd.to_numeric(frame[height_column], errors="coerce").fillna(0.0).to_numpy()
+        prominence = np.maximum(prominence, heights * 0.03)
+    distances = np.clip(
+        np.maximum(base_buffer_ft, prominence) + max(0.25, sample_ft * 0.55),
+        base_buffer_ft,
+        maximum_buffer_ft,
+    )
+    return shapely.union_all(shapely.buffer(geometries, distances))
+
+
+def _prominent_object_counts(frame: gpd.GeoDataFrame | None, line) -> tuple[int, int]:
+    """Return counts of tall and long features hit by a seam."""
+    if frame is None or frame.empty or line.is_empty:
+        return 0, 0
+    hits = SeamScorer._hits(frame, line)
+    if hits.empty:
+        return 0, 0
+    bounds = shapely.bounds(hits.geometry.to_numpy())
+    longest = np.maximum(bounds[:, 2] - bounds[:, 0], bounds[:, 3] - bounds[:, 1])
+    heights = pd.to_numeric(
+        hits.get("height_roof", pd.Series(np.zeros(len(hits)), index=hits.index)),
+        errors="coerce",
+    ).fillna(0.0).to_numpy()
+    return int(np.count_nonzero(heights >= 75.0)), int(np.count_nonzero(longest >= 150.0))
+
+
+class SemanticRouteCost:
+    """Vectorized route costs with explicit low-rise and keep-together zones."""
+
+    def __init__(
+        self,
+        aoi,
+        *,
+        buildings,
+        roads,
+        trails,
+        parks,
+        water,
+        hard_layers,
+        sample_ft: float,
+        open_spaces=None,
+        long_objects=None,
+    ):
         self.aoi = aoi
         self.roads = _union_geometry(roads)
+        # Negative buffers identify the middle of genuinely wide roadbeds and
+        # rivers. They are more attractive than a brief perpendicular crossing
+        # of the same polygon, so routes naturally run along avenues/channels.
+        self.wide_roads = (
+            shapely.buffer(shapely.buffer(self.roads, -max(5.0, sample_ft)), max(2.0, sample_ft * 0.5))
+            if not self.roads.is_empty else Polygon()
+        )
         self.trails = _union_geometry(trails, buffer_ft=6.0)
         self.parks = _union_geometry(parks)
+        self.open_spaces = _union_geometry(open_spaces)
         self.water = _union_geometry(water)
+        self.wide_water = (
+            shapely.buffer(shapely.buffer(self.water, -max(12.0, sample_ft)), max(3.0, sample_ft * 0.5))
+            if not self.water.is_empty else Polygon()
+        )
         water_boundary = shapely.boundary(self.water) if not self.water.is_empty else LineString()
         self.water_boundary = shapely.buffer(water_boundary, max(3.0, sample_ft))
         self.buildings = _union_geometry(buildings, buffer_ft=max(sample_ft * 0.55, 0.25))
+        self.protected_buildings = _adaptive_keepout(
+            buildings, sample_ft=sample_ft, height_column="height_roof",
+            base_buffer_ft=1.0, maximum_buffer_ft=30.0,
+        )
+        self.protected_long_objects = _adaptive_keepout(
+            long_objects, sample_ft=sample_ft, base_buffer_ft=2.0, maximum_buffer_ft=35.0,
+        )
         self.near_buildings = _union_geometry(buildings, buffer_ft=12.0 + sample_ft * 0.55)
         hard = [_union_geometry(frame, buffer_ft=max(2.0, sample_ft * 0.25)) for frame in hard_layers]
         self.hard = shapely.union_all([item for item in hard if not item.is_empty]) if hard else Polygon()
@@ -838,15 +1095,23 @@ class SemanticRouteCost:
         # Lower values attract the route. The order intentionally lets a trail
         # or street inside a park beat generic open-space routing.
         result = np.where(inside & self._mask(self.parks, x_values, y_values), np.minimum(result, 55.0), result)
+        result = np.where(inside & self._mask(self.open_spaces, x_values, y_values), np.minimum(result, 38.0), result)
         result = np.where(inside & self._mask(self.water, x_values, y_values), np.minimum(result, 28.0), result)
         result = np.where(inside & self._mask(self.water_boundary, x_values, y_values), np.minimum(result, 18.0), result)
         result = np.where(inside & self._mask(self.roads, x_values, y_values), np.minimum(result, 5.0), result)
+        result = np.where(inside & self._mask(self.wide_water, x_values, y_values), np.minimum(result, 2.5), result)
+        result = np.where(inside & self._mask(self.wide_roads, x_values, y_values), np.minimum(result, 1.5), result)
         result = np.where(inside & self._mask(self.trails, x_values, y_values), np.minimum(result, 3.0), result)
         near = inside & self._mask(self.near_buildings, x_values, y_values)
         result = np.where(near, result + 2_500.0, result)
         hard = inside & self._mask(self.hard, x_values, y_values)
         result = np.where(hard, result + 250_000.0, result)
         building = inside & self._mask(self.buildings, x_values, y_values)
+        protected = inside & (
+            self._mask(self.protected_buildings, x_values, y_values)
+            | self._mask(self.protected_long_objects, x_values, y_values)
+        )
+        result = np.where(protected, result + 50_000_000.0, result)
         return np.where(building, result + 1_000_000_000.0, result)
 
 
@@ -855,6 +1120,112 @@ def _local_point(
     x_cells: float, y_cells: float, step_ft: float,
 ) -> np.ndarray:
     return origin + x_axis * (x_cells * step_ft) + y_axis * (y_cells * step_ft)
+
+
+def seam_complexity(line: LineString, *, feet_to_mm: float, minimum_segment_mm: float) -> dict:
+    coordinates = shapely.get_coordinates(line)
+    lengths_mm = (
+        np.linalg.norm(np.diff(coordinates, axis=0), axis=1) * feet_to_mm
+        if len(coordinates) > 1 else np.asarray([], dtype=float)
+    )
+    short = lengths_mm[lengths_mm < minimum_segment_mm - 1e-8]
+    return {
+        "path_vertices": int(len(coordinates)),
+        "path_sides": int(len(lengths_mm)),
+        "short_sides": int(len(short)),
+        "short_side_deficit_mm": float(np.maximum(0.0, minimum_segment_mm - short).sum()),
+        "minimum_side_mm": float(lengths_mm.min()) if len(lengths_mm) else 0.0,
+    }
+
+
+def regularize_semantic_line(
+    line: LineString,
+    *,
+    scorer: SeamScorer | None,
+    step_ft: float,
+    grid_step_mm: float,
+    minimum_segment_mm: float,
+    complexity_penalty: float,
+) -> tuple[LineString, dict]:
+    """Choose a simpler safe polyline and explicitly price tiny/many sides.
+
+    GEOS simplification retains a subset of the routed manufacturing-grid
+    vertices, so the selected polygon is still exactly reproducible on the
+    shared grid. Candidates that introduce a new object conflict are rejected.
+    """
+    raw_details = scorer.details(line) if scorer is not None else {}
+    raw_complexity = seam_complexity(
+        line, feet_to_mm=grid_step_mm / step_ft, minimum_segment_mm=minimum_segment_mm,
+    )
+    tolerances_mm = [
+        0.0,
+        grid_step_mm,
+        minimum_segment_mm * 0.25,
+        minimum_segment_mm * 0.5,
+        minimum_segment_mm,
+        minimum_segment_mm * 2.0,
+        minimum_segment_mm * 4.0,
+        minimum_segment_mm * 8.0,
+    ]
+    candidates: list[tuple[float, LineString, dict, dict]] = []
+    seen = set()
+    for tolerance_mm in sorted(set(max(0.0, value) for value in tolerances_mm)):
+        candidate = (
+            line if tolerance_mm == 0
+            else shapely.simplify(
+                line, tolerance=tolerance_mm * step_ft / grid_step_mm,
+                preserve_topology=True,
+            )
+        )
+        candidate = shapely.remove_repeated_points(candidate)
+        signature = shapely.to_wkb(candidate)
+        if signature in seen or candidate.geom_type != "LineString":
+            continue
+        seen.add(signature)
+        details = scorer.details(candidate) if scorer is not None else {}
+        if scorer is not None and any(
+            details.get(key, 0) > raw_details.get(key, 0)
+            for key in ("buildings_cut", "hard_conflicts", "tall_objects_cut", "long_objects_cut")
+        ):
+            continue
+        if scorer is not None:
+            preferred_keys = ("wide_road_fraction", "road_fraction", "trail_fraction", "water_fraction")
+            raw_preferred = min(1.0, sum(float(raw_details.get(key, 0.0)) for key in preferred_keys))
+            candidate_preferred = min(1.0, sum(float(details.get(key, 0.0)) for key in preferred_keys))
+            if candidate_preferred + 0.05 < raw_preferred:
+                continue
+        metrics = seam_complexity(
+            candidate, feet_to_mm=grid_step_mm / step_ft,
+            minimum_segment_mm=minimum_segment_mm,
+        )
+        complexity = complexity_penalty * (
+            metrics["path_sides"] + 8.0 * metrics["short_sides"]
+            + 4.0 * metrics["short_side_deficit_mm"] / max(minimum_segment_mm, grid_step_mm)
+        )
+        # The exact scorer uses billion-point sentinels to make object cuts
+        # dominate route discovery. Counts cannot increase here, so normalize
+        # that scale before trading small semantic changes against complexity.
+        # This makes a 0.25 mm zig-zag genuinely expensive without making it
+        # worthwhile to introduce even one additional building/bridge cut.
+        safe_fraction = min(1.0, sum(
+            float(details.get(key, 0.0))
+            for key in (
+                "wide_road_fraction", "road_fraction", "trail_fraction",
+                "water_fraction", "park_fraction", "open_space_fraction",
+            )
+        ))
+        semantic = (
+            float(details.get("score", 0.0)) / 1_000_000.0
+            + float(details.get("seam_length_ft", 0.0)) * (1.0 - 0.75 * safe_fraction)
+        )
+        candidates.append((semantic + complexity, candidate, details, metrics))
+    if not candidates:
+        return line, {**raw_complexity, "raw_path_vertices": raw_complexity["path_vertices"]}
+    _, selected, _, metrics = min(
+        candidates,
+        key=lambda item: (item[0], item[3]["short_sides"], item[3]["path_sides"]),
+    )
+    return selected, {**metrics, "raw_path_vertices": raw_complexity["path_vertices"]}
 
 
 def route_semantic_edge(
@@ -872,22 +1243,30 @@ def route_semantic_edge(
     step_ft: float,
     grid_step_mm: float,
     cost_surface: SemanticRouteCost,
+    start_deviation_cells: int = 0,
+    end_deviation_cells: int = 0,
+    scorer: SeamScorer | None = None,
+    minimum_segment_mm: float = 2.0,
+    complexity_penalty: float = 6.0,
 ) -> tuple[LineString, dict]:
-    """Route one grid-edge segment while pinning both grid-junction endpoints."""
+    """Route one mesh edge between shared, optionally moved junctions."""
     if axis not in {"x", "y"}:
         raise ValueError(f"Semantic route axis must be x or y, got {axis!r}")
     if major_end_cells <= major_start_cells:
         raise ValueError("Semantic route segment has non-positive length")
-    low = min(0, int(minimum_deviation_cells))
-    high = max(0, int(maximum_deviation_cells))
+    start_deviation_cells = int(start_deviation_cells)
+    end_deviation_cells = int(end_deviation_cells)
+    low = min(start_deviation_cells, end_deviation_cells, int(minimum_deviation_cells))
+    high = max(start_deviation_cells, end_deviation_cells, int(maximum_deviation_cells))
     sample = max(1, int(sample_every_cells))
     majors = list(range(major_start_cells, major_end_cells, sample))
     majors.append(major_end_cells)
     majors = np.asarray(sorted(set(majors)), dtype=int)
     states = list(range(low, high + 1, sample))
-    states.extend([low, 0, high])
+    states.extend([low, 0, high, start_deviation_cells, end_deviation_cells])
     states = np.asarray(sorted(set(states)), dtype=int)
-    zero_index = int(np.flatnonzero(states == 0)[0])
+    start_index = int(np.flatnonzero(states == start_deviation_cells)[0])
+    end_index = int(np.flatnonzero(states == end_deviation_cells)[0])
 
     major_grid, state_grid = np.meshgrid(majors, states, indexing="ij")
     if axis == "x":
@@ -902,7 +1281,7 @@ def route_semantic_edge(
 
     predecessors = np.full((len(majors), len(states)), -1, dtype=np.int32)
     previous = np.full(len(states), np.inf, dtype=float)
-    previous[zero_index] = point_cost[0, zero_index]
+    previous[start_index] = point_cost[0, start_index]
     for major_index in range(1, len(majors)):
         delta_major = int(majors[major_index] - majors[major_index - 1])
         maximum_lateral = max(sample, int(math.ceil(delta_major * 1.25)))
@@ -924,7 +1303,7 @@ def route_semantic_edge(
             )
             predecessors[major_index, state_index] = prior_index
         if major_index == len(majors) - 1:
-            current[np.arange(len(states)) != zero_index] = np.inf
+            current[np.arange(len(states)) != end_index] = np.inf
         if not np.isfinite(current).any():
             raise ValueError(
                 f"No connected semantic {axis}-seam route exists inside deviation range "
@@ -949,17 +1328,35 @@ def route_semantic_edge(
             points.append(_local_point(origin, x_axis, y_axis, major, anchor_cells + deviation, step_ft))
     # Dropping collinear samples keeps city-scale polygons compact while every
     # retained vertex stays exactly on the common manufacturing grid.
-    line = shapely.remove_repeated_points(LineString(points))
-    line = shapely.simplify(line, tolerance=step_ft * 1e-6, preserve_topology=True)
+    raw_line = shapely.remove_repeated_points(LineString(points))
+    raw_line = shapely.simplify(raw_line, tolerance=step_ft * 1e-6, preserve_topology=True)
+    if scorer is None:
+        line = raw_line
+        complexity = {
+            **seam_complexity(
+                line, feet_to_mm=grid_step_mm / step_ft,
+                minimum_segment_mm=minimum_segment_mm,
+            ),
+            "raw_path_vertices": int(len(shapely.get_coordinates(raw_line))),
+        }
+    else:
+        line, complexity = regularize_semantic_line(
+            raw_line,
+            scorer=scorer,
+            step_ft=step_ft,
+            grid_step_mm=grid_step_mm,
+            minimum_segment_mm=minimum_segment_mm,
+            complexity_penalty=complexity_penalty,
+        )
     deviations_mm = deviations.astype(float) * grid_step_mm
     return line, {
         "routing_mode": "semantic_path",
-        "path_vertices": int(len(shapely.get_coordinates(line))),
+        **complexity,
         "minimum_deviation_mm": float(deviations_mm.min()),
         "maximum_deviation_mm": float(deviations_mm.max()),
         "maximum_absolute_deviation_mm": float(np.abs(deviations_mm).max()),
         "mean_absolute_deviation_mm": float(np.abs(deviations_mm).mean()),
-        "routing_cost": float(previous[zero_index]),
+        "routing_cost": float(previous[end_index]),
     }
 
 
@@ -978,6 +1375,98 @@ def _cell_internal_sides(index: int, count: int) -> int:
     return int(index > 0) + int(index < count - 1)
 
 
+def _junction_axis_range(
+    cuts: list[int], boundary: int, maximum_cells: int, maximum_deviation_cells: int,
+) -> tuple[int, int]:
+    """Safe signed motion for an internal scaffold boundary."""
+    count = len(cuts) - 1
+    before = boundary - 1
+    after = boundary
+    before_span = cuts[before + 1] - cuts[before]
+    after_span = cuts[after + 1] - cuts[after]
+    before_slack = maximum_cells - before_span
+    after_slack = maximum_cells - after_span
+    low = -min(
+        maximum_deviation_cells,
+        after_slack // max(1, _cell_internal_sides(after, count)),
+        max(0, after_span // 3),
+    )
+    high = min(
+        maximum_deviation_cells,
+        before_slack // max(1, _cell_internal_sides(before, count)),
+        max(0, before_span // 3),
+    )
+    return int(low), int(high)
+
+
+def optimize_semantic_junctions(
+    *,
+    x_cuts: list[int],
+    y_cuts: list[int],
+    maximum_x_cells: int,
+    maximum_y_cells: int,
+    maximum_deviation_cells: int,
+    search_every_cells: int,
+    origin: np.ndarray,
+    x_axis: np.ndarray,
+    y_axis: np.ndarray,
+    step_ft: float,
+    grid_step_mm: float,
+    cost_surface: SemanticRouteCost,
+) -> tuple[dict[tuple[int, int], tuple[int, int]], list[dict]]:
+    """Move shared interior junctions to nearby low-cost map corridors.
+
+    All incident edges use the exact same integer-grid coordinate. Boundary
+    junctions remain fixed, preserving the outer frame and monotone topology.
+    """
+    columns, rows = len(x_cuts) - 1, len(y_cuts) - 1
+    junctions: dict[tuple[int, int], tuple[int, int]] = {}
+    reports: list[dict] = []
+    sample = max(1, int(search_every_cells))
+    for row in range(rows + 1):
+        for column in range(columns + 1):
+            nominal = (x_cuts[column], y_cuts[row])
+            if row in {0, rows} or column in {0, columns}:
+                junctions[(row, column)] = nominal
+                continue
+            x_low, x_high = _junction_axis_range(
+                x_cuts, column, maximum_x_cells, maximum_deviation_cells,
+            )
+            y_low, y_high = _junction_axis_range(
+                y_cuts, row, maximum_y_cells, maximum_deviation_cells,
+            )
+            x_values = list(range(x_low, x_high + 1, sample)) + [x_low, 0, x_high]
+            y_values = list(range(y_low, y_high + 1, sample)) + [y_low, 0, y_high]
+            dx, dy = np.meshgrid(
+                np.asarray(sorted(set(x_values)), dtype=int),
+                np.asarray(sorted(set(y_values)), dtype=int),
+            )
+            local_x = nominal[0] + dx
+            local_y = nominal[1] + dy
+            world_x = origin[0] + x_axis[0] * local_x * step_ft + y_axis[0] * local_y * step_ft
+            world_y = origin[1] + x_axis[1] * local_x * step_ft + y_axis[1] * local_y * step_ft
+            values = cost_surface.values(world_x, world_y)
+            # Mildly prefer a compact cell unless semantics make movement useful.
+            values = values + np.hypot(dx, dy) * grid_step_mm * 0.12
+            selected = np.unravel_index(int(np.argmin(values)), values.shape)
+            selected_dx = int(dx[selected])
+            selected_dy = int(dy[selected])
+            junctions[(row, column)] = (
+                nominal[0] + selected_dx,
+                nominal[1] + selected_dy,
+            )
+            reports.append({
+                "row_boundary": row,
+                "column_boundary": column,
+                "nominal_grid_cells": list(nominal),
+                "selected_grid_cells": list(junctions[(row, column)]),
+                "offset_mm": [selected_dx * grid_step_mm, selected_dy * grid_step_mm],
+                "search_x_mm": [x_low * grid_step_mm, x_high * grid_step_mm],
+                "search_y_mm": [y_low * grid_step_mm, y_high * grid_step_mm],
+            })
+    return junctions, reports
+
+
 def build_semantic_path_cells(
     *,
     aoi,
@@ -994,12 +1483,36 @@ def build_semantic_path_cells(
     grid_step_mm: float,
     scorer: SeamScorer,
     cost_surface: SemanticRouteCost,
-) -> tuple[list[dict], list[dict]]:
+    junction_search_cells: int | None = None,
+    maximum_junction_deviation_cells: int | None = None,
+    minimum_segment_mm: float = 2.0,
+    complexity_penalty: float = 6.0,
+) -> tuple[list[dict], list[dict], list[dict]]:
     """Build a topologically shared free-form grid from routed edge segments."""
     columns, rows = len(x_cuts) - 1, len(y_cuts) - 1
     horizontal: dict[tuple[int, int], LineString] = {}
     vertical: dict[tuple[int, int], LineString] = {}
     reports = []
+    junctions, junction_reports = optimize_semantic_junctions(
+        x_cuts=x_cuts,
+        y_cuts=y_cuts,
+        maximum_x_cells=maximum_x_cells,
+        maximum_y_cells=maximum_y_cells,
+        maximum_deviation_cells=(
+            maximum_deviation_cells
+            if maximum_junction_deviation_cells is None
+            else maximum_junction_deviation_cells
+        ),
+        search_every_cells=(
+            sample_every_cells if junction_search_cells is None else junction_search_cells
+        ),
+        origin=origin,
+        x_axis=x_axis,
+        y_axis=y_axis,
+        step_ft=step_ft,
+        grid_step_mm=grid_step_mm,
+        cost_surface=cost_surface,
+    )
 
     for boundary in range(1, rows):
         south = boundary - 1
@@ -1009,13 +1522,20 @@ def build_semantic_path_cells(
         low = -min(maximum_deviation_cells, north_slack // max(1, _cell_internal_sides(north, rows)))
         high = min(maximum_deviation_cells, south_slack // max(1, _cell_internal_sides(south, rows)))
         for column in range(columns):
+            start = junctions[(boundary, column)]
+            end = junctions[(boundary, column + 1)]
             line, route = route_semantic_edge(
                 axis="y", anchor_cells=y_cuts[boundary],
-                major_start_cells=x_cuts[column], major_end_cells=x_cuts[column + 1],
+                major_start_cells=start[0], major_end_cells=end[0],
                 minimum_deviation_cells=low, maximum_deviation_cells=high,
                 sample_every_cells=sample_every_cells, origin=origin,
                 x_axis=x_axis, y_axis=y_axis, step_ft=step_ft,
                 grid_step_mm=grid_step_mm, cost_surface=cost_surface,
+                start_deviation_cells=start[1] - y_cuts[boundary],
+                end_deviation_cells=end[1] - y_cuts[boundary],
+                scorer=scorer,
+                minimum_segment_mm=minimum_segment_mm,
+                complexity_penalty=complexity_penalty,
             )
             horizontal[(boundary, column)] = line
             details = scorer.details(line)
@@ -1031,13 +1551,20 @@ def build_semantic_path_cells(
         low = -min(maximum_deviation_cells, east_slack // max(1, _cell_internal_sides(east, columns)))
         high = min(maximum_deviation_cells, west_slack // max(1, _cell_internal_sides(west, columns)))
         for south_row in range(rows):
+            start = junctions[(south_row, boundary)]
+            end = junctions[(south_row + 1, boundary)]
             line, route = route_semantic_edge(
                 axis="x", anchor_cells=x_cuts[boundary],
-                major_start_cells=y_cuts[south_row], major_end_cells=y_cuts[south_row + 1],
+                major_start_cells=start[1], major_end_cells=end[1],
                 minimum_deviation_cells=low, maximum_deviation_cells=high,
                 sample_every_cells=sample_every_cells, origin=origin,
                 x_axis=x_axis, y_axis=y_axis, step_ft=step_ft,
                 grid_step_mm=grid_step_mm, cost_surface=cost_surface,
+                start_deviation_cells=start[0] - x_cuts[boundary],
+                end_deviation_cells=end[0] - x_cuts[boundary],
+                scorer=scorer,
+                minimum_segment_mm=minimum_segment_mm,
+                complexity_penalty=complexity_penalty,
             )
             vertical[(south_row, boundary)] = line
             details = scorer.details(line)
@@ -1098,7 +1625,7 @@ def build_semantic_path_cells(
             f"Semantic path topology is not a partition: gap={gap:.6g} sq ft, "
             f"overlap={overlap:.6g} sq ft, tolerance={tolerance:.6g}."
         )
-    return cells, reports
+    return cells, reports, junction_reports
 
 
 def tight_frame_grid_bounds(
@@ -1230,8 +1757,7 @@ def atomic_write(path: Path, text: str) -> None:
     os.replace(temporary, path)
 
 
-def write_preview(path: Path, aoi, chunks: list[dict], seams: list[dict]) -> None:
-    """Write a dependency-free plan-view SVG for quick visual inspection."""
+def _preview_canvas(aoi) -> tuple[float, float, float, float]:
     minx, miny, maxx, maxy = aoi.bounds
     span_x, span_y = max(maxx - minx, 1e-9), max(maxy - miny, 1e-9)
     if span_y >= span_x:
@@ -1240,6 +1766,175 @@ def write_preview(path: Path, aoi, chunks: list[dict], seams: list[dict]) -> Non
     else:
         width = 1000.0
         height = max(360.0, min(1000.0, 90.0 + 910.0 * span_y / span_x))
+    return width, height, span_x, span_y
+
+
+def _preview_source_signature(cache_dir: Path) -> dict:
+    signature = {"preview_map_version": PREVIEW_MAP_VERSION}
+    for name in ("nyc_planimetrics_2022", "nyc_building_footprints"):
+        path = cache_dir / name / "manifest.json"
+        try:
+            manifest = json.loads(path.read_text())
+            signature[name] = {
+                "cache_format_version": manifest.get("cache_format_version"),
+                "completed_at": manifest.get("completed_at"),
+                "output_bytes": manifest.get("output_bytes"),
+            }
+        except (OSError, json.JSONDecodeError):
+            signature[name] = None
+    return signature
+
+
+def _paint_preview_layer(
+    pixels: np.ndarray,
+    geometries,
+    color: tuple[int, int, int],
+    *,
+    transform,
+    all_touched: bool,
+) -> int:
+    usable = [geometry for geometry in geometries if geometry is not None and not geometry.is_empty]
+    if not usable:
+        return 0
+    mask = rasterize(
+        ((geometry, 1) for geometry in usable),
+        out_shape=pixels.shape[:2],
+        transform=transform,
+        fill=0,
+        all_touched=all_touched,
+        dtype="uint8",
+    ).astype(bool)
+    pixels[mask] = color
+    return int(mask.sum())
+
+
+def cached_preview_basemap(
+    *,
+    aoi,
+    cache_dir: Path,
+    preview_cache_dir: Path,
+    output_path: Path,
+    maximum_pixels: int,
+) -> dict:
+    """Render and reuse a real NYC vector basemap for the SVG preview."""
+    _, _, span_x, span_y = _preview_canvas(aoi)
+    if span_x >= span_y:
+        raster_width = maximum_pixels
+        raster_height = max(256, int(round(maximum_pixels * span_y / span_x)))
+    else:
+        raster_height = maximum_pixels
+        raster_width = max(256, int(round(maximum_pixels * span_x / span_y)))
+    request = {
+        "aoi_wkb_hex_epsg2263": shapely.to_wkb(shapely.normalize(aoi), hex=True),
+        "size": [raster_width, raster_height],
+        "sources": _preview_source_signature(cache_dir),
+    }
+    key = hashlib.sha256(canonical(request).encode()).hexdigest()[:24]
+    preview_cache_dir.mkdir(parents=True, exist_ok=True)
+    cached_png = preview_cache_dir / f"{key}.png"
+    cached_metadata = preview_cache_dir / f"{key}.json"
+    reused = cached_png.is_file() and cached_metadata.is_file()
+    if not reused:
+        minx, miny, maxx, maxy = aoi.bounds
+        query = box(minx, miny, maxx, maxy)
+        planimetrics = cache_dir / "nyc_planimetrics_2022"
+        frames = {
+            "water": read_vector(planimetrics / "HYDROGRAPHY.parquet", query.bounds, query),
+            "parks": read_vector(planimetrics / "PARK.parquet", query.bounds, query),
+            "plazas": read_vector(planimetrics / "PLAZA.parquet", query.bounds, query),
+            "parking": read_vector(planimetrics / "PARKING_LOT.parquet", query.bounds, query),
+            "roads": read_vector(planimetrics / "ROADBED.parquet", query.bounds, query),
+            "transport": read_vector(planimetrics / "TRANSPORT_STRUCTURE.parquet", query.bounds, query),
+            "buildings": load_tiled_buildings(
+                cache_dir / "nyc_building_footprints", query, clearance_ft=0.0,
+            ),
+        }
+        pixels = np.empty((raster_height, raster_width, 3), dtype=np.uint8)
+        pixels[:] = (247, 245, 239)
+        transform = from_bounds(minx, miny, maxx, maxy, raster_width, raster_height)
+        tolerance = max(span_x / raster_width, span_y / raster_height) * 0.28
+        colors = {
+            "water": (193, 221, 235),
+            "parks": (218, 232, 205),
+            "parking": (231, 226, 214),
+            "plazas": (236, 229, 210),
+            "roads": (252, 251, 247),
+            "road_edges": (194, 198, 196),
+            "buildings": (174, 177, 176),
+            "tall_buildings": (137, 142, 143),
+            "transport": (125, 135, 139),
+        }
+        painted = {}
+
+        def simplified(name: str):
+            frame = frames[name]
+            if frame.empty:
+                return []
+            values = shapely.intersection(frame.geometry.to_numpy(), query)
+            return shapely.simplify(values, tolerance=tolerance, preserve_topology=True)
+
+        for name in ("water", "parks", "parking", "plazas", "roads"):
+            painted[name] = _paint_preview_layer(
+                pixels, simplified(name), colors[name], transform=transform, all_touched=True,
+            )
+        road_geometry = simplified("roads")
+        painted["road_edges"] = _paint_preview_layer(
+            pixels, shapely.boundary(road_geometry), colors["road_edges"],
+            transform=transform, all_touched=True,
+        )
+        buildings = frames["buildings"]
+        painted["buildings"] = _paint_preview_layer(
+            pixels, simplified("buildings"), colors["buildings"],
+            transform=transform, all_touched=True,
+        )
+        if not buildings.empty and "height_roof" in buildings:
+            tall = buildings[pd.to_numeric(buildings.height_roof, errors="coerce").fillna(0) >= 75.0]
+            tall_geometry = shapely.simplify(
+                shapely.intersection(tall.geometry.to_numpy(), query),
+                tolerance=tolerance, preserve_topology=True,
+            )
+            painted["tall_buildings"] = _paint_preview_layer(
+                pixels, tall_geometry, colors["tall_buildings"],
+                transform=transform, all_touched=True,
+            )
+        painted["transport"] = _paint_preview_layer(
+            pixels, simplified("transport"), colors["transport"],
+            transform=transform, all_touched=True,
+        )
+        temporary = cached_png.with_name(cached_png.name + ".tmp")
+        Image.fromarray(pixels, mode="RGB").save(temporary, format="PNG", optimize=True)
+        os.replace(temporary, cached_png)
+        atomic_write(cached_metadata, json.dumps({
+            "schema_version": PREVIEW_MAP_VERSION,
+            "cache_key": key,
+            "request": request,
+            "feature_counts": {name: int(len(frame)) for name, frame in frames.items()},
+            "painted_pixels": painted,
+        }, indent=2) + "\n")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(cached_png, output_path)
+    metadata = json.loads(cached_metadata.read_text())
+    return {
+        "cache_key": key,
+        "cache_file": str(cached_png.resolve()),
+        "output_file": str(output_path.resolve()),
+        "reused": reused,
+        "raster_size_px": [raster_width, raster_height],
+        "feature_counts": metadata.get("feature_counts", {}),
+    }
+
+
+def write_preview(
+    path: Path,
+    aoi,
+    chunks: list[dict],
+    seams: list[dict],
+    *,
+    basemap_path: Path | None = None,
+) -> None:
+    """Write a labeled plan-view SVG over an optional cached NYC basemap."""
+    minx, miny, maxx, maxy = aoi.bounds
+    width, height, span_x, span_y = _preview_canvas(aoi)
     margin = 45.0
     scale = min((width - 2 * margin) / span_x, (height - 2 * margin) / span_y)
 
@@ -1262,11 +1957,17 @@ def write_preview(path: Path, aoi, chunks: list[dict], seams: list[dict]) -> Non
 
     palette = ["#d8e8f5", "#f6d7b0", "#d8efd2", "#ead6ef", "#f3e6a7"]
     body = []
+    if basemap_path is not None:
+        body.append(
+            f'<image href="{html.escape(basemap_path.name)}" x="{margin:.2f}" y="{margin:.2f}" '
+            f'width="{span_x * scale:.2f}" height="{span_y * scale:.2f}" '
+            'preserveAspectRatio="none"/>'
+        )
     for index, chunk in enumerate(chunks):
         for value in paths(chunk["geometry_2263"]):
             body.append(
                 f'<path d="{value}" fill="{palette[index % len(palette)]}" '
-                'fill-rule="evenodd" stroke="#334155" stroke-width="1.2"/>'
+                'fill-opacity="0.48" fill-rule="evenodd" stroke="#334155" stroke-width="1.2"/>'
             )
         center = chunk["geometry_2263"].representative_point()
         x, y = point(center.coords[0])
@@ -1315,6 +2016,18 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--candidate-step-mm", type=float, default=0.5, help="Spacing between exact-vector seam candidates")
     result.add_argument("--path-step-mm", type=float, default=0.25, help="Sampling interval for free-form semantic seam routing")
     result.add_argument("--max-seam-deviation-mm", type=float, default=20.0, help="Maximum routed departure from each straight scaffold edge")
+    result.add_argument(
+        "--junction-flex-mm", type=float,
+        help="Maximum two-dimensional movement of shared internal seam junctions; omitted uses up to 8 mm",
+    )
+    result.add_argument(
+        "--minimum-seam-side-mm", type=float, default=2.0,
+        help="Polyline sides shorter than this are penalized during route regularization",
+    )
+    result.add_argument(
+        "--seam-complexity-penalty", type=float, default=6.0,
+        help="Relative penalty for every seam side and especially for short sides",
+    )
     result.add_argument("--grid-step-mm", type=float, default=0.125)
     result.add_argument("--source-padding-m", type=float, default=20.0)
     result.add_argument("--vertical-exaggeration", type=float, default=1.0)
@@ -1334,6 +2047,15 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--data-dir", type=Path, default=ROOT / "data")
     result.add_argument("--cache-dir", type=Path, help="Dataset cache root; defaults to <data-dir>/cache")
+    result.add_argument(
+        "--preview-map-cache-dir", type=Path,
+        help="Cached raster basemaps; defaults to <cache-dir>/nyc_map_preview",
+    )
+    result.add_argument("--preview-width-px", type=int, default=1600)
+    result.add_argument(
+        "--preview-basemap", action=argparse.BooleanOptionalAction, default=True,
+        help="Render the SVG over a cached NYC vector-data basemap",
+    )
     result.add_argument("--lidar-cache-dir", type=Path)
     result.add_argument("--offline", action=argparse.BooleanOptionalAction, default=True)
     result.add_argument("--full-validation", action="store_true")
@@ -1342,8 +2064,16 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def main() -> None:
-    args = parser().parse_args()
+def run_planner(args: argparse.Namespace, *, inputs: PlannerInputs | None = None) -> dict:
+    """Plan chunks from parsed arguments and explicitly resolved external inputs.
+
+    Omitting ``inputs`` preserves the production CLI contract: every cache
+    needed by the emitted generation commands is validated before output is
+    written. Supplying inputs is the programmatic seam used by hermetic tests
+    and must still satisfy the capabilities selected by ``args``.
+    """
+    if args.junction_flex_mm is None:
+        args.junction_flex_mm = min(8.0, args.max_seam_deviation_mm)
     log, event_recorder = configure_logging(args.log_level)
     log = log.bind(plan_id=args.plan_id)
     log.info(
@@ -1375,6 +2105,16 @@ def main() -> None:
         raise SystemExit("--max-seam-deviation-mm must be between 0 and 100 mm")
     if abs(args.max_seam_deviation_mm / args.grid_step_mm - round(args.max_seam_deviation_mm / args.grid_step_mm)) > 1e-7:
         raise SystemExit("--max-seam-deviation-mm must be an exact multiple of --grid-step-mm")
+    if not math.isfinite(args.junction_flex_mm) or not (0 <= args.junction_flex_mm <= args.max_seam_deviation_mm):
+        raise SystemExit("--junction-flex-mm must be between 0 and --max-seam-deviation-mm")
+    if abs(args.junction_flex_mm / args.grid_step_mm - round(args.junction_flex_mm / args.grid_step_mm)) > 1e-7:
+        raise SystemExit("--junction-flex-mm must be an exact multiple of --grid-step-mm")
+    if not math.isfinite(args.minimum_seam_side_mm) or args.minimum_seam_side_mm < args.grid_step_mm:
+        raise SystemExit("--minimum-seam-side-mm must be at least --grid-step-mm")
+    if abs(args.minimum_seam_side_mm / args.grid_step_mm - round(args.minimum_seam_side_mm / args.grid_step_mm)) > 1e-7:
+        raise SystemExit("--minimum-seam-side-mm must be an exact multiple of --grid-step-mm")
+    if not math.isfinite(args.seam_complexity_penalty) or args.seam_complexity_penalty < 0:
+        raise SystemExit("--seam-complexity-penalty must be a non-negative finite number")
     if not (0 <= args.seam_flex_percent <= 25):
         raise SystemExit("--seam-flex-percent must be between 0 and 25")
     if args.terrain_sample_stride < 1:
@@ -1393,6 +2133,8 @@ def main() -> None:
         raise SystemExit("--terrain-origin-m must be finite")
     if args.terrain_relief_factor is not None and not (0.25 <= args.terrain_relief_factor <= 10.0):
         raise SystemExit("--terrain-relief-factor must be between 0.25 and 10.0")
+    if not (600 <= args.preview_width_px <= 4000):
+        raise SystemExit("--preview-width-px must be between 600 and 4000")
 
     data_dir = args.data_dir.resolve()
     cache_dir = args.cache_dir.resolve() if args.cache_dir else (data_dir / "cache").resolve()
@@ -1400,57 +2142,33 @@ def main() -> None:
         args.lidar_cache_dir.resolve() if args.lidar_cache_dir
         else (cache_dir / "nyc_lidar_2017").resolve()
     )
+    aoi_wgs = args.bounding_polygon
+    aoi = gpd.GeoSeries([aoi_wgs], crs=4326).to_crs(2263).iloc[0]
     stage_started = time.monotonic()
     log.info("stage_started", stage="validate_caches", data_dir=str(data_dir))
-    cache_manifests = {
-        "lidar": require_complete_manifest(lidar, "LiDAR"),
-        "building_footprints": require_complete_manifest(cache_dir / "nyc_building_footprints", "Building footprints"),
-        "planimetrics": require_complete_manifest(cache_dir / "nyc_planimetrics_2022", "Planimetrics"),
-        "parks_trails": require_complete_manifest(cache_dir / "nyc_parks_trails", "Parks trails"),
-        "parks_structures": require_complete_manifest(cache_dir / "nyc_parks_structures", "Parks structures"),
-        "land_cover": require_complete_manifest(cache_dir / "nyc_land_cover_2017", "Land cover"),
-        "openstreetmap": require_complete_manifest(cache_dir / "new_york_osm", "OpenStreetMap"),
-        "buildings_3d": require_complete_manifest(cache_dir / "nyc_3d_buildings_2014", "3D buildings"),
-    }
+    if inputs is None:
+        inputs = load_production_planner_inputs(
+            aoi=aoi,
+            cache_dir=cache_dir,
+            lidar=lidar,
+            source_padding_m=args.source_padding_m,
+        )
+    validate_planner_inputs(args, inputs)
+    cache_manifests = inputs.cache_manifests
+    relevant_lidar = inputs.relevant_lidar
     log.info(
         "stage_completed", stage="validate_caches",
         elapsed_seconds=time.monotonic() - stage_started,
+        generation_readiness=inputs.generation_readiness,
         caches={name: manifest.get("completed_at") for name, manifest in cache_manifests.items()},
     )
-    lidar_catalog_path = lidar / "catalog.geojson"
-    if not lidar_catalog_path.is_file():
-        raise SystemExit(f"LiDAR cache catalog is missing: {lidar_catalog_path}")
-    aoi_wgs = args.bounding_polygon
-    aoi = gpd.GeoSeries([aoi_wgs], crs=4326).to_crs(2263).iloc[0]
-    try:
-        lidar_catalog = gpd.read_file(lidar_catalog_path)
-    except Exception as error:
-        raise SystemExit(f"LiDAR cache catalog is unreadable: {lidar_catalog_path}: {error}") from error
-    lidar_catalog = lidar_catalog.set_crs(2263) if lidar_catalog.crs is None else lidar_catalog.to_crs(2263)
-    relevant_lidar = lidar_catalog[lidar_catalog.intersects(aoi.buffer(args.source_padding_m / FT))]
-    if relevant_lidar.empty:
-        raise SystemExit(
-            f"LiDAR cache {lidar} has no tiles intersecting the requested polygon and source padding."
+    if relevant_lidar is not None:
+        log.info(
+            "lidar_tiles_selected", tiles=int(len(relevant_lidar)),
+            source_padding_m=args.source_padding_m, lidar_cache=str(lidar),
         )
-    missing_lidar = []
-    for _, record in relevant_lidar.iterrows():
-        for column in ("ground", "upper"):
-            cached = lidar / str(record.get(column, ""))
-            if not cached.is_file():
-                missing_lidar.append(str(cached))
-                if len(missing_lidar) == 5:
-                    break
-        if len(missing_lidar) == 5:
-            break
-    if missing_lidar:
-        raise SystemExit(
-            "LiDAR cache catalog references missing raster tiles needed by this request: "
-            + ", ".join(missing_lidar)
-        )
-    log.info(
-        "lidar_tiles_selected", tiles=int(len(relevant_lidar)),
-        source_padding_m=args.source_padding_m, lidar_cache=str(lidar),
-    )
+    else:
+        log.info("lidar_selection_skipped", reason="terrain_scan_not_requested")
     request_components = len(polygon_parts(aoi))
     if request_components > args.max_chunks:
         raise SystemExit(
@@ -1472,6 +2190,8 @@ def main() -> None:
             road_path,
             planimetrics_root / "PARK.parquet",
             planimetrics_root / "HYDROGRAPHY.parquet",
+            planimetrics_root / "PLAZA.parquet",
+            planimetrics_root / "PARKING_LOT.parquet",
             planimetrics_root / "TRANSPORT_STRUCTURE.parquet",
             planimetrics_root / "RETAININGWALL.parquet",
             cache_dir / "nyc_parks_structures/data.parquet",
@@ -1562,6 +2282,11 @@ def main() -> None:
         trails = read_vector(cache_dir / "nyc_parks_trails/data.parquet", aoi.bounds, corridor_query)
         parks = read_vector(planimetrics_root / "PARK.parquet", aoi.bounds, corridor_query)
         water = read_vector(planimetrics_root / "HYDROGRAPHY.parquet", aoi.bounds, corridor_query)
+        plaza = read_vector(planimetrics_root / "PLAZA.parquet", aoi.bounds, corridor_query)
+        parking = read_vector(planimetrics_root / "PARKING_LOT.parquet", aoi.bounds, corridor_query)
+        open_spaces = gpd.GeoDataFrame(
+            pd.concat([plaza, parking], ignore_index=True), crs=2263,
+        )
         transport = read_vector(planimetrics_root / "TRANSPORT_STRUCTURE.parquet", aoi.bounds, corridor_query)
         walls = read_vector(planimetrics_root / "RETAININGWALL.parquet", aoi.bounds, corridor_query)
         park_structures = read_vector(cache_dir / "nyc_parks_structures/data.parquet", aoi.bounds, corridor_query)
@@ -1572,12 +2297,15 @@ def main() -> None:
             trails=trails,
             parks=parks,
             water=water,
+            open_spaces=open_spaces,
+            long_objects=transport,
             hard_layers=[transport, walls, park_structures],
             clearance_ft=clearance,
         )
         layer_counts = {
             "buildings": len(buildings), "roadbeds": len(roads), "trails": len(trails), "parks": len(parks),
-            "hydrography": len(water), "transport_structures": len(transport),
+            "hydrography": len(water), "open_spaces": len(open_spaces),
+            "transport_structures": len(transport),
             "retaining_walls": len(walls), "park_structures": len(park_structures),
         }
         log.info("semantic_layers_loaded", **layer_counts)
@@ -1606,6 +2334,7 @@ def main() -> None:
 
     partition_parts = []
     seam_geometries = []
+    junction_reports = []
     partition_mode = (
         "semantic_paths"
         if args.seam_mode == "semantic-paths" and scorer is not None and (columns > 1 or rows > 1)
@@ -1624,16 +2353,25 @@ def main() -> None:
         maximum_deviation_cells = int(round(args.max_seam_deviation_mm / args.grid_step_mm))
         cost_surface = SemanticRouteCost(
             aoi, buildings=buildings, roads=roads, trails=trails, parks=parks, water=water,
+            open_spaces=open_spaces, long_objects=transport,
             hard_layers=[transport, walls, park_structures], sample_ft=sample_every_cells * step_ft,
         )
         try:
-            routed_cells, seam_geometries = build_semantic_path_cells(
+            routed_cells, seam_geometries, junction_reports = build_semantic_path_cells(
                 aoi=aoi, x_cuts=x_cuts, y_cuts=y_cuts,
                 maximum_x_cells=maximum_x_cells, maximum_y_cells=maximum_y_cells,
                 maximum_deviation_cells=maximum_deviation_cells,
                 sample_every_cells=sample_every_cells, origin=origin,
                 x_axis=layout.x_axis, y_axis=layout.y_axis, step_ft=step_ft,
                 grid_step_mm=args.grid_step_mm, scorer=scorer, cost_surface=cost_surface,
+                junction_search_cells=max(
+                    1, int(round(args.path_step_mm / args.grid_step_mm))
+                ),
+                maximum_junction_deviation_cells=int(round(
+                    args.junction_flex_mm / args.grid_step_mm
+                )),
+                minimum_segment_mm=args.minimum_seam_side_mm,
+                complexity_penalty=args.seam_complexity_penalty,
             )
         except ValueError as error:
             raise SystemExit(f"Semantic seam routing failed: {error}") from error
@@ -1660,16 +2398,23 @@ def main() -> None:
             log.info(
                 "seam_segment_routed", axis=seam["axis"], index=seam["index"],
                 segment=seam["segment"], path_vertices=seam["path_vertices"],
+                short_sides=seam["short_sides"], minimum_side_mm=seam["minimum_side_mm"],
                 maximum_absolute_deviation_mm=seam["maximum_absolute_deviation_mm"],
                 buildings_cut=seam["buildings_cut"], hard_conflicts=seam["hard_conflicts"],
+                tall_objects_cut=seam["tall_objects_cut"], long_objects_cut=seam["long_objects_cut"],
                 road_fraction=seam["road_fraction"], trail_fraction=seam["trail_fraction"],
                 water_fraction=seam["water_fraction"], park_fraction=seam["park_fraction"],
             )
         log.info(
             "semantic_paths_routed", elapsed_seconds=time.monotonic() - route_started,
             routed_segments=len(seam_geometries), chunks_before_component_split=len(routed_cells),
+            moved_junctions=sum(
+                item["nominal_grid_cells"] != item["selected_grid_cells"] for item in junction_reports
+            ),
             maximum_allowed_deviation_mm=args.max_seam_deviation_mm,
             buildings_cut=sum(item["buildings_cut"] for item in seam_geometries),
+            tall_objects_cut=sum(item["tall_objects_cut"] for item in seam_geometries),
+            long_objects_cut=sum(item["long_objects_cut"] for item in seam_geometries),
             hard_conflicts=sum(item["hard_conflicts"] for item in seam_geometries),
         )
     else:
@@ -1777,6 +2522,9 @@ def main() -> None:
         "partition_mode": partition_mode,
         "path_step_mm": args.path_step_mm,
         "max_seam_deviation_mm": args.max_seam_deviation_mm,
+        "junction_flex_mm": args.junction_flex_mm,
+        "minimum_seam_side_mm": args.minimum_seam_side_mm,
+        "seam_complexity_penalty": args.seam_complexity_penalty,
     }
     suffix = hashlib.sha256(canonical(request_identity).encode()).hexdigest()[:10]
     plan_id = args.plan_id or f"nyc_chunks_{suffix}"
@@ -1990,7 +2738,47 @@ def main() -> None:
 
     commands_path = output_dir / "commands.sh"
     preview_path = output_dir / "preview.svg"
-    write_preview(preview_path, aoi, chunk_records, seam_geometries)
+    preview_basemap_path = output_dir / "preview-map.png"
+    preview_map_report = {"enabled": bool(args.preview_basemap), "result": "disabled"}
+    if args.preview_basemap:
+        preview_started = time.monotonic()
+        try:
+            preview_map_report = {
+                "enabled": True,
+                "result": "rendered",
+                **cached_preview_basemap(
+                    aoi=aoi,
+                    cache_dir=cache_dir,
+                    preview_cache_dir=(
+                        args.preview_map_cache_dir.resolve()
+                        if args.preview_map_cache_dir else cache_dir / "nyc_map_preview"
+                    ),
+                    output_path=preview_basemap_path,
+                    maximum_pixels=args.preview_width_px,
+                ),
+            }
+            log.info(
+                "preview_basemap_ready",
+                elapsed_seconds=time.monotonic() - preview_started,
+                cache_key=preview_map_report["cache_key"],
+                reused=preview_map_report["reused"],
+                raster_size_px=preview_map_report["raster_size_px"],
+                feature_counts=preview_map_report["feature_counts"],
+            )
+        except Exception as error:
+            preview_basemap_path = None
+            preview_map_report = {
+                "enabled": True,
+                "result": "fallback_without_basemap",
+                "error": f"{type(error).__name__}: {error}",
+            }
+            log.warning("preview_basemap_failed", error=preview_map_report["error"])
+    else:
+        preview_basemap_path = None
+    write_preview(
+        preview_path, aoi, chunk_records, seam_geometries,
+        basemap_path=preview_basemap_path,
+    )
 
     serializable_chunks = [
         {key: value for key, value in record.items() if not key.startswith("geometry_")}
@@ -2016,6 +2804,11 @@ def main() -> None:
     ]
     commands_text = (
         "#!/bin/sh\nset -eu\n\n"
+        + (
+            "# Source-cache readiness was not checked while creating this plan.\n"
+            "# Validate/provision the generated command inputs before running it.\n\n"
+            if inputs.generation_readiness == "not_checked" else ""
+        )
         + shlex.join(static_validation_argv)
         + "\n\n"
         + "\n\n".join(record["command"] for record in chunk_records)
@@ -2038,12 +2831,19 @@ def main() -> None:
             "seam_mode": args.seam_mode,
             "path_step_mm": args.path_step_mm,
             "max_seam_deviation_mm": args.max_seam_deviation_mm,
+            "junction_flex_mm": args.junction_flex_mm,
+            "minimum_seam_side_mm": args.minimum_seam_side_mm,
+            "seam_complexity_penalty": args.seam_complexity_penalty,
             "bounding_polygon_wgs84": json.loads(shapely.to_geojson(aoi_wgs)),
             "target_wkb_hex_epsg2263": shapely.to_wkb(aoi, hex=True),
         },
         "generation": {
             "python": str(root_python),
             "script": str(generator),
+            "readiness": {
+                "result": inputs.generation_readiness,
+                "requirements": planning_input_requirements(args),
+            },
             "shared_options": shared_options,
             "shared_flags": shared_flags,
             "static_validation_argv": static_validation_argv,
@@ -2069,9 +2869,11 @@ def main() -> None:
             "partition_mode": partition_mode,
             "grid": {"columns": columns, "rows": rows},
             "cut_grid_cells": {"x": x_cuts, "y": y_cuts},
+            "semantic_junctions": junction_reports,
             "orientation_candidates": orientation_report,
         },
         "semantic_layers_loaded": layer_counts,
+        "preview_map": preview_map_report,
         "terrain": terrain_report,
         "seams": serializable_seams,
         "coverage": {
@@ -2095,6 +2897,9 @@ def main() -> None:
             "commands": str(commands_path.resolve()),
             "overview_geojson": str(overview_path.resolve()),
             "preview_svg": str(preview_path.resolve()),
+            "preview_basemap": (
+                str(preview_basemap_path.resolve()) if preview_basemap_path is not None else None
+            ),
             "validation": str(validation_path.resolve()),
             "post_generation_validation": str(post_validation_path.resolve()),
             "planner_log": str((output_dir / "logs/planner.jsonl").resolve()),
@@ -2126,6 +2931,11 @@ def main() -> None:
         validation=str(validation_path.resolve()),
     )
     event_recorder.write(output_dir / "logs/planner.jsonl")
+    return plan
+
+
+def main() -> None:
+    run_planner(parser().parse_args())
 
 
 if __name__ == "__main__":
