@@ -3,7 +3,12 @@
 `scripts/generate_3mf.py` is the supported entry point. It selects cached NYC
 source data, extracts the requested area, builds printable material solids,
 packages Bambu project settings, validates the result, and records a
-reproducible job manifest.
+job provenance manifest.
+
+Run it from the repository root in the Python 3.12 environment described in the
+[project README](../README.md). Packaging always reads the installed Bambu Lab
+P2S 0.4 mm profiles. Preview rendering additionally uses `xcrun` and `clang++`;
+pass `--no-preview` when Xcode Command Line Tools are unavailable.
 
 ## Quick start
 
@@ -16,9 +21,10 @@ reproducible job manifest.
 ```
 
 If `--output` is omitted, the model is written to
-`output/models/<job-id>.3mf`. All intermediate fields, extracted subsets,
-logs, previews, validation reports, and stage records go to
-`output/jobs/<job-id>/`.
+`output/models/<job-id>.3mf`. The checksum and optional preview are written
+beside the model as `<model-stem>.sha256` and
+`<model-stem>_preview.png`. Intermediate fields, extracted subsets, logs,
+validation reports, and stage records go to `output/jobs/<job-id>/`.
 
 ## Crop forms
 
@@ -53,25 +59,36 @@ The cache directories are named for their exact source datasets. See
 
 ## Network and cache behavior
 
-By default, complete dataset caches are preferred. Missing source files may be
-downloaded into the matching `data/raw/X/` directory. Use `--offline` to
-forbid all network access and require the caches needed by the selected crop.
+The default `--lidar-source cache` requires a completed LiDAR raster cache that
+covers the crop plus source padding; the generator does not build that cache on
+demand. For every other dataset, a complete production-ready cache is
+preferred. If a cache is absent, an online run downloads the matching raw
+source and processes the crop. A present but incomplete or non-production-ready
+cache is an error rather than a signal to fall back silently.
 
-Address-based building colors use NYC Planning GeoSearch. Responses are
-cached under `data/cache/nyc_geosearch/`; repeated and offline runs reuse them.
+Use `--offline` to forbid all network access. Offline generation may use
+completed caches or already-downloaded raw sources, but the default LiDAR mode
+still requires its raster cache. `--lidar-source laz` instead uses raw LAZ tiles
+for the selected crop and is intended mainly for diagnostics.
 
-Elevation defaults to `--lidar-source cache`. `--lidar-source laz` uses raw
-LAZ tiles for the selected crop and is mainly useful for diagnostics.
+Address-based building colors use NYC Planning GeoSearch. Responses are cached
+under `data/cache/nyc_geosearch/`; repeated runs reuse them, and an offline run
+requires the exact address response to have been cached already. Coordinate,
+BIN, DoITT ID, and BBL selectors do not use GeoSearch.
 
 ## Useful controls
 
-- `--scale` or `--length-mm` controls map extent/printed size.
+- `--scale` sets the map-scale denominator. For polygon crops, `--length-mm`
+  derives a scale that makes the longer oriented side the requested size.
 - `--vertical-exaggeration` scales measured vertical relief.
 - `--terrain-relief-factor` explicitly scales ground relief; otherwise the
   generator enforces its minimum printable relief budget automatically.
 - `--layer-height` selects an installed P2S process layer height.
 - `--building-colors` assigns selected buildings to the four existing
   material colors using JSON identifiers.
+- `--prime-tower auto` enables the fixed tower only when the centered model and
+  both brim envelopes fit. It is off for a 200 x 200 mm square and can remain on
+  for sufficiently narrow models.
 - `--no-preview` skips preview rendering.
 - `--full-validation` enables expensive cross-material checks.
 - `--slice` performs an optional Bambu Studio validation slice.
@@ -79,10 +96,24 @@ LAZ tiles for the selected crop and is mainly useful for diagnostics.
 
 Run `scripts/generate_3mf.py --help` for the complete option reference.
 
+For example, select a visible building by BIN without calling GeoSearch:
+
+```bash
+.venv/bin/python scripts/generate_3mf.py \
+  --latitude 40.7127 \
+  --longitude -74.0060 \
+  --building-colors '[{"bin":"1079147","color":"green"}]'
+```
+
+This selects New York City Hall in the example crop. A selector that matches no
+visible footprint fails rather than being ignored.
+
 ## Reproducibility
 
 Each job records normalized configuration, cache identities, source subsets,
 stage completion records, structured logs, validation output, and the final
-checksum under `output/jobs/<job-id>/`. The 3MF also embeds its generation
-configuration. `output/` is disposable and Git-ignored; preserve or publish a
-specific model separately if it is a release artifact.
+checksum under `output/jobs/<job-id>/`. The 3MF embeds the shell-safe generation
+command and packaged Bambu project settings, but the full normalized generation
+configuration remains in the job directory. `output/` is disposable and
+Git-ignored; preserve the job directory together with a model when exact
+provenance matters.
