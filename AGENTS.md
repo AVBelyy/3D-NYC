@@ -4,7 +4,8 @@
 
 3D NYC converts public NYC geospatial datasets into four-material,
 Bambu-compatible 3MF maps. `scripts/generate_3mf.py` is the supported
-single-model entry point.
+single-model entry point, and `scripts/plan_map_chunks.py` splits a larger
+polygon into gap-free neighboring plates.
 
 Run commands from the repository root. Use Python 3.12 and install
 `scripts/requirements.txt` in `.venv`.
@@ -14,7 +15,8 @@ Run commands from the repository root. Use Python 3.12 and install
 - Keep the root `README.md` concise. It is a landing page with a short setup,
   representative commands, and links—not an exhaustive prerequisite, option,
   architecture, troubleshooting, or implementation reference.
-- Put generation details in `docs/generate_3mf.md` and cache procedures in
+- Put generation details in `docs/generate_3mf.md`, multi-plate planning in
+  `docs/plan_map_chunks.md`, and cache procedures in
   `docs/cache_source_datasets.md`.
 - Update the relevant guide whenever behavior, defaults, paths, required data,
   output contracts, or CLI options change.
@@ -31,8 +33,10 @@ Run commands from the repository root. Use Python 3.12 and install
 
 ## Code and data boundaries
 
-- Keep user-facing orchestration in `generate_3mf.py`; individual extraction,
-  field, mesh, render, package, and validation scripts are pipeline stages.
+- Keep user-facing orchestration in `generate_3mf.py` and `plan_map_chunks.py`;
+  individual extraction, field, mesh, render, package, and validation scripts
+  are pipeline stages. Modules that are not command-line entry points are
+  prefixed with `_`.
 - Dataset pairs follow `download_X.py` to `data/raw/X/` and `cache_X.py` to
   `data/cache/X/`, with documented exceptions such as streamed Building
   Footprints and region-selective LiDAR.

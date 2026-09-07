@@ -57,6 +57,12 @@ LiDAR options point at `nyc_lidar_2017` itself.
 
 For a cache-only offline generation run, cache all nine datasets in the table.
 
+To choose seams, `scripts/plan_map_chunks.py` reads complete, production-ready
+caches for LiDAR, Planimetrics, building footprints, and OpenStreetMap, and uses
+land cover when it is present. It does not read parks, 3D buildings, or MTA
+entrances. The generation commands it emits are ordinary `generate_3mf.py` runs,
+so those still need whatever the generator itself requires.
+
 `data/cache/nyc_geosearch` is different: the generator fills it lazily with
 NYC Planning GeoSearch responses only for address-selected building colors, so
 it has no download/cache script pair. An offline address selection succeeds

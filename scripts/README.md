@@ -19,6 +19,20 @@ Generate one printable map:
 packaging, validation, and optional slicing. Use its `--help` output and the
 [generation guide](../docs/generate_3mf.md) for supported options.
 
+Plan a map too large for one plate:
+
+```bash
+.venv/bin/python scripts/plan_map_chunks.py \
+  --bounding-polygon @data/polygons/manhattan_island.geojson \
+  --scale 10533 \
+  --max-chunks 30
+```
+
+`plan_map_chunks.py` partitions the polygon, chooses seams from cached
+elevation and land-cover evidence, and writes `generate_3mf.py` commands plus a
+preview under `output/plans/`. See the
+[planner guide](../docs/plan_map_chunks.md).
+
 ## Dataset scripts
 
 Durable dataset scripts follow this naming and destination convention:
@@ -51,9 +65,10 @@ packaging, 3MF validation, slicing, and bridge-validation scripts with a
 generated configuration and environment. Treat those stage scripts as pipeline
 internals unless you are debugging a specific stage.
 
-`cache_common.py`, `_datasets.py`, `_download_dataset.py`, and
-`_cache_vector_datasets.py` are shared implementation modules, not command-line
-entry points.
+`cache_common.py`, `_datasets.py`, `_download_dataset.py`,
+`_cache_vector_datasets.py`, `_chunk_geometry.py`, `_chunk_cost.py`, and
+`_chunk_preview.py` are shared implementation modules, not command-line entry
+points.
 
 Run the test suite with:
 
