@@ -13,7 +13,7 @@
 3D NYC combines LiDAR terrain, detailed buildings, land cover, streets, water,
 and transit entrances into printable material meshes for Bambu Studio.
 
-- Real terrain and canopy relief
+- Real terrain and smoothed measured canopy relief
 - Detailed buildings from official NYC datasets
 - Four explicit materials with built-in geometry validation
 

@@ -10,11 +10,14 @@ from affine import Affine
 from shapely.geometry import box,Polygon,Point
 from rasterio.features import geometry_mask,geometry_window,rasterize
 from rasterio.warp import Resampling
-from scipy.ndimage import distance_transform_edt,gaussian_filter,median_filter,binary_dilation,binary_closing,label
+from scipy.ndimage import distance_transform_edt,gaussian_filter,binary_dilation
 import mapbox_earcut
 from map_common import *
+from _canopy_relief import measured_canopy_relief
 from crossings import fit_linear_elevation_profile,minimum_crossing_length_mm,tunnel_surface_masks
+from _material_layers import surface_color_depth_mm,white_substrate_top
 from road_symbols import TRAIL_HIGHWAYS,parse_tags,trail_width_mm
+from _surface_styles import apply_street_palette
 from terrain_relief import absolute_elevation_to_mm,choose_terrain_relief
 
 def burn(shapes,dtype='float32',fill=0):
@@ -112,10 +115,12 @@ def main():
     city=read('citygml_buildings');roofs=read('citygml_surfaces');roofs=roofs[roofs.kind.eq('roof')].copy()
     osm=gpd.read_parquet(OUT/'osm_detail.parquet')
     ground_sigma=.65/(STEP*CFG['scale_denominator']/1000)
-    ground_halo_cells=max(2,int(math.ceil(4*ground_sigma)))
+    canopy_sigma=CFG.get('canopy_smoothing_m',1.)/(STEP*CFG['scale_denominator']/1000)
+    canopy_gap_cells=int(math.ceil(CFG.get('canopy_maximum_closed_gap_mm',.75)/(2*STEP)))+2
+    ground_halo_cells=max(2,int(math.ceil(4*ground_sigma)),int(math.ceil(4*canopy_sigma)),canopy_gap_cells)
     ground_halo=sample_raster_halo('ground_m',ground_halo_cells)
-    upper=sample_raster('upper_surface_m')
-    lc=sample_raster('landcover',Resampling.nearest)
+    upper_halo=sample_raster_halo('upper_surface_m',ground_halo_cells)
+    lc_halo=sample_raster_halo('landcover',ground_halo_cells,Resampling.nearest)
     valid_halo=np.isfinite(ground_halo)
     if not valid_halo.any():raise RuntimeError('Padded terrain sample contains no finite ground elevations')
     idx=distance_transform_edt(~valid_halo,return_distances=False,return_indices=True)
@@ -123,8 +128,10 @@ def main():
     ground_halo=gaussian_filter(ground_halo,ground_sigma)
     core=(slice(ground_halo_cells,ground_halo_cells+NY),slice(ground_halo_cells,ground_halo_cells+NX))
     ground=ground_halo[core].copy()
+    upper=upper_halo[core].copy()
+    lc=lc_halo[core].copy()
     valid=valid_halo[core]
-    del ground_halo,valid_halo
+    del valid_halo
     # No-data under buildings/water must be filled to create a solid. Source observation distances remain available.
     report['inferences'].append({'kind':'ground_fill','cells':int((~valid).sum()),'method':'nearest finite terrain for solid interior; water levels overridden separately'})
     report['inferences'].append({'kind':'ground_smoothing_halo','cells':ground_halo_cells,
@@ -185,54 +192,62 @@ def main():
             'surface':tags.get('surface'),'material':int(selected),'cells':int(mask.sum()),
             'method':'OSM semantic recreation green regardless of surface'})
     report['layers']['recreation_areas']=recreation_records
-    paved=[]
     roadbed=read('planimetrics_ROADBED')
-    for geom in roadbed.geometry:paved.append((geom,1))
+    roadbed=roadbed[roadbed.SUB_FEATURE_CODE.isin([350000,350010,350030])]
+    roadbed_mask=burn([(geom,1) for geom in roadbed.geometry],dtype='uint8')>0
+    sidewalks=read('planimetrics_SIDEWALK')
+    sidewalk_mask=burn([(geom,1) for geom in sidewalks.geometry],dtype='uint8')>0
+    tan_pavement=[]
     for name in ['PLAZA','PARKING_LOT']:
-        for geom in read('planimetrics_'+name).geometry:paved.append((geom,1))
-    city_paved_mask=burn(paved,dtype='uint8')>0
+        for geom in read('planimetrics_'+name).geometry:tan_pavement.append((geom,1))
+    tan_pavement_mask=burn(tan_pavement,dtype='uint8')>0
+    city_paved_mask=roadbed_mask|sidewalk_mask|tan_pavement_mask
     osm_parking_mask=burn([(r.geometry,1) for r,_ in osm_parking],dtype='uint8')>0
     osm_parking_fallback_mask=osm_parking_mask&~city_paved_mask
-    roadmask=city_paved_mask|osm_parking_fallback_mask
-    material[roadmask]=3;top[roadmask]=ground[roadmask]+mm_to_source(CFG['path_relief_mm'])
-    # The centerline symbol supplies a minimum printable tan casing where the
-    # measured roadbed is absent or narrower than the cartographic style.
-    road_outer_path=PROCESSED/'cased_road_outer.parquet'
-    symbol_outer_mask=np.zeros(SHAPE,dtype=bool)
-    if road_outer_path.exists() and CFG.get('ivory_roads',False):
-        road_outer=gpd.read_parquet(road_outer_path)
-        if len(road_outer):symbol_outer_mask=burn([(g,1) for g in road_outer.geometry],dtype='uint8')>0
-        symbol_outer_mask&=aoi_mask&~water_mask
-        roadmask|=symbol_outer_mask
-        material[symbol_outer_mask]=3
-        top[symbol_outer_mask]=ground[symbol_outer_mask]+mm_to_source(CFG['path_relief_mm'])
+    # Ivory is a fixed-width cartographic centerline, not the full roadbed.
+    # Outside parks, the remaining measured roadbed shares the tan sidewalk
+    # field; inside parks it retains green terrain, matching the reference map.
+    road_surface_path=PROCESSED/'ivory_road_surface.parquet'
+    symbol_road_mask=np.zeros(SHAPE,dtype=bool)
+    if road_surface_path.exists() and CFG.get('ivory_carriageways',False):
+        road_surfaces=gpd.read_parquet(road_surface_path)
+        if len(road_surfaces):symbol_road_mask=burn([(g,1) for g in road_surfaces.geometry],dtype='uint8')>0
+        symbol_road_mask&=aoi_mask&~water_mask
+    road_surface_mask=symbol_road_mask&aoi_mask&~water_mask
+    sidewalk_mask&=aoi_mask&~water_mask
+    tan_roadbed_mask=roadbed_mask&~park_mask
+    tan_pavement_mask=(tan_pavement_mask|osm_parking_fallback_mask|tan_roadbed_mask)&aoi_mask&~water_mask
+    street_report=apply_street_palette(material,top,ground,
+        sidewalk_mask=sidewalk_mask,tan_pavement_mask=tan_pavement_mask,
+        road_mask=road_surface_mask,relief_source=mm_to_source(CFG['path_relief_mm']))
+    roadmask=roadbed_mask|road_surface_mask|sidewalk_mask|tan_pavement_mask
+    report['layers']['street_palette']={**street_report,
+        'roadbed_polygons':len(roadbed),'sidewalk_polygons':len(sidewalks),
+        'ivory_ribbon_cells':int(road_surface_mask.sum()),
+        'tan_roadbed_cells':int(tan_roadbed_mask.sum()),
+        'style':'fixed-width ivory road ribbons; tan urban roadbeds and sidewalks; green park shoulders'}
     report['layers']['osm_surface_parking']={'polygons':len(osm_parking),
         'fallback_cells':int(osm_parking_fallback_mask.sum()),
-        'method':'tan open OSM parking only outside NYC Planimetrics paved coverage; measured canopy remains eligible'}
+        'method':'tan open OSM parking only outside NYC Planimetrics paved coverage'}
     route_path=PROCESSED/'road_symbol_routes.parquet'
     routes=gpd.read_parquet(route_path) if route_path.exists() else gpd.GeoDataFrame()
     route_by_id={int(r.osm_id):r for _,r in routes.iterrows()}
-    paths=[];tunnels=[];bridges=[];stairs=[];bridge_cores=[];pending_bridge_cores=[]
+    paths=[];tunnels=[];bridges=[];stairs=[];ivory_motor_bridges=[]
     bridge_surface_mask=np.zeros(SHAPE,dtype=bool)
     highway=osm[osm.highway.notna() & osm.geom_type.eq('LineString')]
     for _,r in highway.iterrows():
         tags=parse_tags(r.tags);is_tunnel=tags.get('tunnel') in ['yes','building_passage']
         semantic=route_by_id.get(int(r.osm_id))
         classification=str(semantic.classification) if semantic is not None else ('trail' if r.highway in TRAIL_HIGHWAYS else 'other')
-        core_eligible=bool(semantic.core_eligible) if semantic is not None else False
-        width=None
-        try:width=float(str(tags.get('width','')).replace(' m',''))
-        except ValueError:pass
+        ivory_eligible=bool(semantic.ivory_eligible) if semantic is not None else False
         if classification=='trail':
             width_mm=trail_width_mm(r.highway,tags,CFG)
         else:
-            width=width if width and 2<width<40 else 9
-            measured_width_mm=width*1000/CFG['scale_denominator']
-            width_mm=max(measured_width_mm,semantic_number(semantic,'outer_width_mm'))
+            width_mm=semantic_number(semantic,'surface_width_mm',CFG.get('road_line_width_mm',.5))
         geom=r.geometry.intersection(AOI)
-        if is_tunnel and core_eligible and geom.length*K>=minimum_crossing_length_mm(CFG):
+        if is_tunnel and ivory_eligible and geom.length*K>=minimum_crossing_length_mm(CFG):
             tunnels.append({'geometry':geom,'osm_id':int(r.osm_id),'width_mm':width_mm,'name':str(r['name']),
-                'core_eligible':True,'core_width_mm':semantic_number(semantic,'core_width_mm'),
+                'ivory_eligible':True,
                 'layer':str(tags.get('layer','-1'))})
             continue
         if is_tunnel:continue
@@ -241,8 +256,7 @@ def main():
             paths.append((shape,1))
         if tags.get('bridge') not in [None,'no'] and classification!='other' and geom.length*K>=minimum_crossing_length_mm(CFG):
             bridges.append({'geometry':geom,'osm_id':int(r.osm_id),'width_mm':width_mm,
-                'name':str(r['name']),'core_eligible':core_eligible,
-                'core_width_mm':semantic_number(semantic,'core_width_mm'),
+                'name':str(r['name']),'ivory_eligible':ivory_eligible,
                 'layer':str(tags.get('layer','1')),'bridge_tag':str(tags.get('bridge','yes'))})
         if r.highway=='steps':stairs.append({'geometry':geom,'width_mm':width_mm,'osm_id':int(r.osm_id)})
     # Use city trails only away from OSM path coverage, avoiding doubled parallel tracks.
@@ -290,7 +304,12 @@ def main():
             # far beyond this tile (long bridge decks are the common case).
             # Rasterization clips implicitly, but deck_geometry is also consumed
             # later as an explicit 3-D solid and therefore must be clipped here.
-            shape=shapely.union_all(shapely.make_valid(candidates.geometry)).intersection(AOI)
+            structure_shape=shapely.union_all(shapely.make_valid(candidates.geometry)).intersection(AOI)
+            # OSM bridge tagging can extend slightly beyond the surveyed
+            # transport-structure polygon. Include the complete printable road
+            # ribbon so neither approach loses its surface at a raster cell.
+            approach_ribbon=bridge['geometry'].buffer(bridge['width_mm']/2/K,quad_segs=4).intersection(AOI)
+            shape=structure_shape.union(approach_ribbon)
             xyz=shapely.get_coordinates(candidates.geometry,include_z=True)
             measured=float(np.nanmedian(xyz[:,2])*FT)
             support=bridge_spot_elev[bridge_spot_elev.intersects(shape.buffer(3/FT))]
@@ -316,36 +335,19 @@ def main():
         along=shapely.line_locate_point(bridge['geometry'],shapely.points(xx,yy),normalized=True)
         deck_source_values=np.interp(np.asarray(along,dtype=float),[0.,1.],[deck_start,deck_end])
         deck=float(np.median(deck_source_values));beneath=float(np.percentile(ground[mask],10))
-        top[rows,cols]=deck_source_values+mm_to_source(CFG['path_relief_mm']);material[mask]=0
+        top[rows,cols]=deck_source_values+mm_to_source(CFG['path_relief_mm'])
+        material[mask]=0 if bridge['ivory_eligible'] else 3
         absolute_terrain_surface_mask[mask]=True
-        inner=shape.buffer(-.18/K)
-        if not inner.is_empty:material[geom_mask(inner)]=3
         bridge.update({'deck_geometry':shape.wkt,'deck_elevation_m':deck,
             'deck_start_elevation_m':deck_start,'deck_end_elevation_m':deck_end,
             'deck_profile_samples':int(profile.samples),'deck_profile_rejected_outliers':int(profile.rejected_outliers),
             'beneath_elevation_m':beneath,'height_method':method,
-            'transport_structure_subtypes':json.dumps(sorted(map(int,candidates.SUB_FEATURE_CODE.unique()))) if len(candidates) else '[]'})
-        if CFG.get('ivory_roads',False) and bridge['core_eligible']:
-            core_width=float(bridge['core_width_mm'])
-            core=bridge['geometry'].buffer(core_width/(2*K),quad_segs=4).intersection(shape).intersection(AOI)
-            pending_bridge_cores.append((core,bridge,core_width))
-    # Apply all motor-road cores only after every overlapping deck has been
-    # painted. Brooklyn Bridge is split into many OSM ways which can select the
-    # same Planimetric deck; applying inside the loop lets a later tan deck
-    # erase an earlier ivory core.
-    for core,bridge,core_width in pending_bridge_cores:
-        core_mask=geom_mask(core)
-        if not core_mask.any():continue
-        rows,cols=np.where(core_mask);xx,yy=world_for_cells(rows,cols)
-        along=shapely.line_locate_point(bridge['geometry'],shapely.points(xx,yy),normalized=True)
-        deck_values=np.interp(np.asarray(along,dtype=float),[0.,1.],
-            [bridge['deck_start_elevation_m'],bridge['deck_end_elevation_m']])+mm_to_source(CFG['path_relief_mm'])
-        material[core_mask]=0
-        top[rows,cols]=deck_values
-        absolute_terrain_surface_mask[core_mask]=True
-        bridge_cores.append({'osm_id':bridge['osm_id'],'name':bridge['name'],
-            'width_mm':core_width,'cells':int(core_mask.sum()),
-            'method':'flush centerline core clipped to bridge deck; applied after all decks'})
+            'transport_structure_subtypes':json.dumps(sorted(map(int,candidates.SUB_FEATURE_CODE.unique()))) if len(candidates) else '[]',
+            'approach_ribbon_included':bool(len(candidates))})
+        if bridge['ivory_eligible']:
+            ivory_motor_bridges.append({'osm_id':bridge['osm_id'],'name':bridge['name'],
+                'width_mm':bridge['width_mm'],'cells':int(mask.sum()),
+                'method':'full measured bridge deck is ivory, matching the roadbed'})
     upper_tunnel_surface_mask=np.zeros(SHAPE,dtype=bool)
     for t in tunnels:
         mask=geom_mask(t['geometry'].buffer((t['width_mm']/2+.10)/K,quad_segs=4))
@@ -354,30 +356,19 @@ def main():
         # height reset must use exactly the same protected selection as the
         # material reset or it silently flattens a surviving upper road.
         restore,protected=tunnel_surface_masks(mask,park_mask,bridge_surface_mask,
-            symbol_outer_mask|pathmask)
+            symbol_road_mask|pathmask)
         upper_tunnel_surface_mask|=protected
         material[restore]=1;top[restore]=ground[restore]
     protected_transport_surface=bridge_surface_mask|upper_tunnel_surface_mask
-    # Classic cased road ribbon: a continuous centerline-derived ivory core,
-    # flush with its tan casing. It is not a polygon erosion, so narrow source
-    # roadbeds cannot create intermittent white patches.
-    road_core_path=PROCESSED/'ivory_road_core.parquet'
-    if road_core_path.exists() and CFG.get('ivory_roads',False):
-        road_core=gpd.read_parquet(road_core_path)
-        if len(road_core):
-            coremask=burn([(g,1) for g in road_core.geometry],dtype='uint8')>0
-            ordinary=coremask&symbol_outer_mask&(material==3)&(source_to_mm(top-ground)<.35)
-            top[ordinary]=ground[ordinary]+mm_to_source(CFG['path_relief_mm']);material[ordinary]=0
-        else:
-            ordinary=np.zeros(SHAPE,dtype=bool)
-        hard_trail_eligible=int(routes[routes.highway.isin(TRAIL_HIGHWAYS)&routes.core_eligible].shape[0]) if len(routes) else 0
-        if hard_trail_eligible:raise RuntimeError('A hard trail class was assigned an ivory road core')
-        report['layers']['ivory_roads']={'source_polygons':len(road_core),'cells':int(ordinary.sum()),
-            'outer_cells':int(symbol_outer_mask.sum()),'relief_above_tan_mm':0.,
-            'style':'centerline-derived classic cased ribbon','categorical_trails_eligible':hard_trail_eligible}
+    hard_trail_eligible=int(routes[routes.highway.isin(TRAIL_HIGHWAYS)&routes.ivory_eligible].shape[0]) if len(routes) else 0
+    if hard_trail_eligible:raise RuntimeError('A hard trail class was assigned an ivory road surface')
+    report['layers']['ivory_carriageways']={'cells':int(road_surface_mask.sum()),
+        'roadbed_cells':int(roadbed_mask.sum()),'centerline_symbol_cells':int(symbol_road_mask.sum()),
+        'relief_above_surroundings_mm':0.,'style':'fixed-width ivory cartographic road ribbon',
+        'categorical_trails_eligible':hard_trail_eligible}
     report['layers']['paths']={'osm_path_segments':len(paths),'supplementary_trail_segments':len(trail_add),'stairs':len(stairs),
         'mapped_bridge_segments':len(bridges),'mapped_road_tunnels':len(tunnels),'roadbed_polygons':len(roadbed),
-        'ivory_motor_bridge_cores':bridge_cores,
+        'ivory_motor_bridges':ivory_motor_bridges,
         'protected_surface_cells_over_tunnels':int(upper_tunnel_surface_mask.sum())}
     print('Paths and surface regions',flush=True)
     # Roof heights are absolute elevations, not ground-relative scalar heights.
@@ -445,32 +436,34 @@ def main():
     # authoritative coordinates and a precise, automatically joinable 3D asset.
     report['layers']['landmarks']=[]
     print('Monument augmentation disabled',flush=True)
-    # Canopy is a smoothed measured envelope. No procedural population of fictitious trees.
+    # Restore the varied measured canopy, while closing only narrow source gaps
+    # and keeping a print-scaled clear shoulder around mapped trails. Applying
+    # trail exclusion after gap closing prevents the closing operation from
+    # swallowing real paths.
     ch=upper-ground
     ordinary_canopy_surface=~roadmask&~np.isin(material,[2,3])
     parking_canopy_surface=osm_parking_fallback_mask&(material==3)
     canopy_surface=(ordinary_canopy_surface|recreation_green|parking_canopy_surface)&~protected_transport_surface
-    canopy_mask=aoi_mask&(lc==1)&~bmask&canopy_surface
-    good=canopy_mask&np.isfinite(ch)&(ch>1)&(ch<=CFG['canopy_max_height_m'])
-    idx=distance_transform_edt(~good,return_distances=False,return_indices=True)
-    filtered=np.zeros(SHAPE,np.float32);filtered[canopy_mask]=ch[tuple(idx[:,canopy_mask])];del idx
-    filtered=median_filter(filtered,size=3)
-    sigma=CFG['canopy_smoothing_m']/(STEP*CFG['scale_denominator']/1000)
-    weight=gaussian_filter(canopy_mask.astype(np.float32),sigma)
-    filtered=gaussian_filter(filtered*canopy_mask,sigma)/np.maximum(weight,.01)
-    # Roll crown edges down over 1 m rather than printing vertical needle-like edge returns.
-    roll_cells=max(1,int(math.ceil(1./(STEP*CFG['scale_denominator']/1000))))
-    padded_canopy=np.pad(canopy_mask,roll_cells,mode='edge')
-    distance=distance_transform_edt(padded_canopy)[
-        roll_cells:roll_cells+NY,roll_cells:roll_cells+NX
-    ]*STEP*CFG['scale_denominator']/1000
-    roll=np.clip(distance/1.,0,1)
-    canopy_height=np.clip(filtered,0,CFG['canopy_max_height_m'])*np.sqrt(roll)
+    trail_setback=float(CFG.get('canopy_trail_setback_mm',.30))
+    trail_clearance=(distance_transform_edt(~pathmask)*STEP<=trail_setback) if pathmask.any() else pathmask
+    canopy_eligible=aoi_mask&~bmask&canopy_surface&~trail_clearance
+    canopy_height,canopy_mask,canopy_report=measured_canopy_relief(
+        upper_halo-ground_halo,lc_halo==1,canopy_eligible,
+        grid_step_mm=STEP,scale_denominator=CFG['scale_denominator'],
+        smoothing_m=CFG.get('canopy_smoothing_m',1.),
+        maximum_gap_mm=CFG.get('canopy_maximum_closed_gap_mm',.75),
+        edge_roll_mm=CFG.get('canopy_edge_roll_mm',.50),
+        minimum_source_height_m=CFG.get('canopy_minimum_source_height_m',1.),
+        maximum_source_height_m=CFG['canopy_max_height_m'],core_slices=core)
     top[canopy_mask]=ground[canopy_mask]+canopy_height[canopy_mask];material[canopy_mask]=1
-    report['layers']['canopy']={'area_m2':float(canopy_mask.sum()*(STEP*CFG['scale_denominator']/1000)**2),
+    report['layers']['canopy']={**canopy_report,
+        'area_m2':float(canopy_mask.sum()*(STEP*CFG['scale_denominator']/1000)**2),
         'osm_parking_canopy_cells':int((canopy_mask&osm_parking_fallback_mask).sum()),
-        'rejected_or_missing_height_cells':int((canopy_mask&~good).sum()),'median_height_m':float(np.median(canopy_height[canopy_mask]))}
-    print('Canopy relief',flush=True)
+        'trail_canopy_setback_mm':trail_setback,
+        'trail_clearance_cells':int(trail_clearance.sum()),
+        'source_role':'LiDAR upper-surface heights define the varied printed canopy relief'}
+    del ground_halo,upper_halo,lc_halo
+    print('Smoothed measured canopy',canopy_report['printable_canopy_cells'],flush=True)
     # Measured rooftop tanks; cooling heights inferred only when later outlines lack usable LiDAR evidence.
     fixtures=[]
     for name in ['WATER_TANK','COOLING_TOWERS']:
@@ -627,13 +620,25 @@ def main():
         raise RuntimeError(
             f"Terrain origin {origin:g} m puts the model at or below its {CFG['base_mm']:g} mm base; "
             f"local minimum is {local_origin:g} m")
+    color_depth=surface_color_depth_mm(CFG['layer_height_mm'],CFG.get('minimum_surface_color_depth_mm',.24))
+    configured_depth=CFG.get('surface_color_depth_mm')
+    if configured_depth is not None and not math.isclose(float(configured_depth),color_depth,abs_tol=1e-9):
+        raise RuntimeError('Configured surface color depth is not aligned with the active layer height')
+    substrate_reference=np.minimum(gz,z)
+    substrate_top=white_substrate_top(substrate_reference,aoi_mask,
+        base_mm=CFG['base_mm'],color_depth_mm=color_depth)
+    if np.any(substrate_top[aoi_mask]>z[aoi_mask]+1e-6):
+        raise RuntimeError('White substrate rises above the visible map surface')
     report.update({'vertical_origin_m_navd88':origin,'local_minimum_elevation_m_navd88':local_origin,
         'z_range_mm':[float(z[aoi_mask].min()),float(z[aoi_mask].max())],
         'terrain_relief':terrain_relief.__dict__,
+        'material_layers':{'substrate_material':0,'substrate_color':'ivory',
+            'surface_color_depth_mm':color_depth,
+            'contract':'one continuous ivory substrate below all visible surface materials'},
         'material_cell_counts':[int((material==color).sum()) for color in range(4)],'diagonal_contact_cleanups':cleanups,
         'isolated_cell_cleanups':isolated_cleanups})
     np.savez_compressed(OUT/'map_fields.npz',height_mm=z.astype(np.float32),ground_mm=gz.astype(np.float32),material=material,
-        canopy_height_m=canopy_height.astype(np.float32),building_mask=bmask,aoi_mask=aoi_mask,
+        substrate_top_mm=substrate_top,canopy_height_m=canopy_height.astype(np.float32),building_mask=bmask,aoi_mask=aoi_mask,
         upper_tunnel_surface_mask=upper_tunnel_surface_mask)
     save_grid('map_top_mm',z);save_grid('map_material',material);save_grid('map_ground_mm',gz)
     for name,rows in [('tunnels',tunnels),('bridges',bridges),('stairs',stairs)]:

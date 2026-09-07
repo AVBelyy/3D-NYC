@@ -6,7 +6,8 @@ from shapely.geometry import Polygon,LineString,Point,box
 from shapely.ops import substring
 from scipy.ndimage import label,find_objects
 from map_common import *
-from crossings import constrain_deck_to_visible_surface,minimum_crossing_length_mm,printable_tunnel_profile
+from crossings import (constrain_deck_to_visible_surface,minimum_crossing_length_mm,
+    minimum_crossing_floor_mm,printable_tunnel_profile,structural_roof_thickness_mm)
 from mesh_precision import prepare_export_mesh
 from road_symbols import TRAIL_HIGHWAYS,trail_width_mm
 
@@ -15,7 +16,7 @@ INITIAL_SIMPLIFY_MM=.006
 # simplifying colors again after CSG can pull a tunnel approach's shared road
 # seam apart, leaving an enclosed wedge. Preserve the constructed interfaces.
 FINAL_SIMPLIFY_MM=0.
-MAXIMUM_BRIDGE_SPAN_NOZZLES=5.
+MAXIMUM_BRIDGE_SPAN_NOZZLES=3.
 OPENING_STATUSES={'cut','water bridge opening','road/path overpass opening'}
 
 def maximum_bridge_span_mm(nozzle_mm):
@@ -40,12 +41,12 @@ def printable_roof_span(requested_span_mm,nozzle_mm):
             f'requested roof span must be a finite positive number, got {requested_span_mm!r}')
     return min(requested,maximum_bridge_span_mm(nozzle_mm))
 
-def audit_layer_support(crossings,nozzle_mm):
+def audit_layer_support(crossings,nozzle_mm,layer_height_mm):
     """Reject openings whose roofs cannot be treated as short FDM bridges.
 
-    Every ordinary map cell and explicit reinforcement is a column descending
-    to the common base. The only deliberate exceptions are tunnel/underpass
-    roofs, so make their printable span an explicit, bounded invariant.
+    Ordinary colored surfaces and reinforcements sit on a continuous ivory
+    substrate. Tunnel and underpass roofs are the only deliberate horizontal
+    spans, so make their printable span and thickness bounded invariants.
     """
     openings=[item for item in crossings if item.get('status') in OPENING_STATUSES]
     missing=[int(item.get('osm_id',-1)) for item in openings if 'roof_span_mm' not in item]
@@ -59,6 +60,19 @@ def audit_layer_support(crossings,nozzle_mm):
             invalid.append((int(item.get('osm_id',-1)),item['roof_span_mm']))
     if invalid:
         raise RuntimeError(f'Opening records have invalid roof spans: {invalid}')
+    missing_thickness=[int(item.get('osm_id',-1)) for item in openings if 'roof_thickness_mm' not in item]
+    if missing_thickness:
+        raise RuntimeError(f'Opening records lack a structural roof thickness: {missing_thickness}')
+    minimum_thickness=structural_roof_thickness_mm(nozzle_mm,layer_height_mm)
+    thin=[]
+    for item in openings:
+        try:thickness=float(item['roof_thickness_mm'])
+        except (TypeError,ValueError):thickness=float('nan')
+        if not math.isfinite(thickness) or thickness+1e-9<minimum_thickness:
+            thin.append((int(item.get('osm_id',-1)),item['roof_thickness_mm']))
+    if thin:
+        raise RuntimeError(
+            f'Opening roofs are thinner than the {minimum_thickness:g} mm structural minimum: {thin}')
     limit=maximum_bridge_span_mm(nozzle_mm)
     excessive=[item for item in openings if float(item['roof_span_mm'])>limit+1e-9]
     if excessive:
@@ -66,10 +80,12 @@ def audit_layer_support(crossings,nozzle_mm):
         raise RuntimeError(f'Unsupported roof spans exceed {limit:g} mm: {details}')
     spans=[float(item['roof_span_mm']) for item in openings]
     return {
-        'result':'passed','ordinary_geometry':'vertical columns connected to the common base',
+        'result':'passed','ordinary_geometry':'colored surface solids seated on a continuous ivory substrate',
         'explicit_bridge_roofs':len(openings),'maximum_bridge_span_mm':max(spans,default=0.),
         'maximum_allowed_bridge_span_mm':limit,
         'maximum_allowed_bridge_span_nozzle_widths':MAXIMUM_BRIDGE_SPAN_NOZZLES,
+        'minimum_structural_roof_thickness_mm':minimum_thickness,
+        'minimum_structural_roof_layers':minimum_thickness/float(layer_height_mm),
     }
 
 def solid(mesh):
@@ -196,6 +212,30 @@ def partition_materials(materials):
         'maximum_expected_overlap_thickness_mm':maximum_expected_thickness,
         'parts':records}
 
+
+def seat_colored_surfaces(materials):
+    """Cut simplified colored skins out of ivory once, preserving exact support contacts."""
+    colored=[material for material in materials[1:] if material.num_tri()]
+    if not colored or not materials[0].num_tri():
+        return materials,{'removed_overlap_mm3':0.,'effective_overlap_thickness_mm':0.}
+    colors=md.Manifold.batch_boolean(colored,md.OpType.Add)
+    overlap,ivory=materials[0].split(colors)
+    if overlap.status()!=md.Error.NoError or ivory.status()!=md.Error.NoError:
+        raise RuntimeError('Failed to seat colored surface materials on the ivory substrate')
+    volume=abs(float(overlap.volume()));area=float(overlap.surface_area())
+    thickness=2*volume/area if area else 0.
+    # Independent raster-surface simplification can move either copy of a
+    # shared boundary. Anything approaching one whole manufacturing cell is a
+    # modeling error rather than numerical seating.
+    limit=float(CFG['grid_step_mm'])/2
+    if thickness>limit+1e-9:
+        raise RuntimeError(
+            f'Colored surfaces overlap the ivory substrate by approximately {thickness:g} mm; '
+            f'the seating limit is {limit:g} mm')
+    result=list(materials);result[0]=ivory
+    return result,{'removed_overlap_mm3':volume,'overlap_surface_area_mm2':area,
+        'effective_overlap_thickness_mm':thickness,'maximum_allowed_thickness_mm':limit}
+
 def stabilize_serialized_materials(folder,parts):
     """Resolve coincident CSG seams against the actual serialized geometry.
 
@@ -302,19 +342,39 @@ def clip_to_tile(m,color):
     print('Clipped material',color,'from XY bounds',bounds[:,:2].tolist(),'to polygon footprint',flush=True)
     return clipped
 
-def material_solid(h,mat,color,stride=1):
-    h=h[::stride,::stride];mask=mat[::stride,::stride]==color
-    if not mask.any():
-        print('Material',color,'empty',flush=True);return md.Manifold()
-    ny,nx=mask.shape;step=W/nx;base=float(np.float32(CFG['base_mm']))
-    n=np.zeros((ny+1,nx+1),np.uint8);total=np.zeros((ny+1,nx+1),np.float32)
-    weighted=np.where(mask,h,0)
-    for a,b in [(slice(0,ny),slice(0,nx)),(slice(1,ny+1),slice(0,nx)),(slice(0,ny),slice(1,nx+1)),(slice(1,ny+1),slice(1,nx+1))]:
-        n[a,b]+=mask;total[a,b]+=weighted
-    use=n>0;rr,cc=np.where(use);nv=len(rr)
-    top=np.column_stack([cc*step,H-rr*step,total[use]/n[use]]).astype(np.float32)
-    bottom=top.copy();bottom[:,2]=base
-    vertices=np.vstack([top,bottom]);del top,bottom,total
+def cell_vertex_heights(values,mask,reducer='mean'):
+    """Convert cell heights to corner heights with an explicit seam reducer."""
+    values=np.asarray(values);mask=np.asarray(mask,dtype=bool)
+    if values.shape!=mask.shape or values.ndim!=2:raise ValueError('Cell values and mask must be same-shaped 2-D arrays')
+    ny,nx=mask.shape;n=np.zeros((ny+1,nx+1),np.uint8)
+    if reducer=='mean':result=np.zeros((ny+1,nx+1),np.float32)
+    elif reducer=='minimum':result=np.full((ny+1,nx+1),np.inf,np.float32)
+    else:raise ValueError(f'Unknown cell-to-vertex reducer {reducer!r}')
+    weighted=np.where(mask,values,0)
+    for rows,cols in [(slice(0,ny),slice(0,nx)),(slice(1,ny+1),slice(0,nx)),
+                      (slice(0,ny),slice(1,nx+1)),(slice(1,ny+1),slice(1,nx+1))]:
+        n[rows,cols]+=mask
+        if reducer=='mean':result[rows,cols]+=weighted
+        else:
+            window=result[rows,cols];np.minimum(window,np.where(mask,values,np.inf),out=window)
+    use=n>0
+    if reducer=='mean':result[use]/=n[use]
+    result[~use]=np.nan
+    return result,use
+
+
+def raster_volume(top_cells,mask,bottom_vertices,step):
+    """Build one closed raster volume between a material top and shared lower surface."""
+    top_grid,use=cell_vertex_heights(top_cells,mask,'mean')
+    if not mask.any():return md.Manifold()
+    if bottom_vertices.shape!=top_grid.shape:raise ValueError('Bottom vertex grid does not match raster volume')
+    if not np.isfinite(bottom_vertices[use]).all():raise ValueError('Raster volume has an undefined lower surface')
+    ny,nx=mask.shape;rr,cc=np.where(use);nv=len(rr)
+    top=np.column_stack([cc*step,H-rr*step,top_grid[use]]).astype(np.float32)
+    bottom=top.copy();bottom[:,2]=bottom_vertices[use]
+    if np.any(bottom[:,2]>=top[:,2]-1e-6):
+        raise ValueError('Raster volume lower surface must stay below its material top')
+    vertices=np.vstack([top,bottom]);del top,bottom,top_grid
     ids=np.full((ny+1,nx+1),-1,np.int32);ids[use]=np.arange(nv)
     tl=ids[:-1,:-1][mask];tr=ids[:-1,1:][mask];bl=ids[1:,:-1][mask];br=ids[1:,1:][mask]
     faces=np.vstack([np.column_stack([tl,bl,tr]),np.column_stack([tr,bl,br])]).astype(np.uint32)
@@ -328,12 +388,28 @@ def material_solid(h,mat,color,stride=1):
         ia,ib=a[edge],b[edge]
         walls.extend([np.column_stack([ib,ia,ia+nv]),np.column_stack([ib,ia+nv,ib+nv])])
     faces=np.vstack([faces,faces[:,::-1]+nv,*walls]).astype(np.uint32)
-    del ids,use,n,weighted,walls,tl,tr,bl,br
-    print('Material',color,'initial',len(vertices),'vertices',len(faces),'triangles',flush=True)
+    del ids,use,walls,tl,tr,bl,br
     mesh=trimesh.Trimesh(vertices,faces,process=False)
     m=solid(mesh);del mesh,vertices,faces;gc.collect()
-    m=m.simplify(INITIAL_SIMPLIFY_MM)
-    if color==0:m=m+polygon_prism(MODEL_AOI,0,base)
+    return m.simplify(INITIAL_SIMPLIFY_MM)
+
+
+def material_solid(h,substrate,mat,aoi,color,stride=1):
+    h=h[::stride,::stride];substrate=substrate[::stride,::stride]
+    mat=mat[::stride,::stride];aoi=aoi[::stride,::stride].astype(bool)
+    mask=mat==color
+    if not mask.any() and color!=0:
+        print('Material',color,'empty',flush=True);return md.Manifold()
+    ny,nx=mask.shape;step=W/nx;base=float(np.float32(CFG['base_mm']))
+    substrate_vertices,substrate_use=cell_vertex_heights(substrate,aoi,'minimum')
+    base_vertices=np.full(substrate_vertices.shape,base,dtype=np.float32)
+    substrate_solid=md.Manifold()
+    if color==0:
+        substrate_solid=raster_volume(substrate,aoi,base_vertices,step)
+        substrate_solid=substrate_solid+polygon_prism(MODEL_AOI,0,base)
+    surface_solid=raster_volume(h,mask,substrate_vertices,step) if mask.any() else md.Manifold()
+    m=surface_solid if color else substrate_solid+surface_solid
+    print('Material',color,'initial substrate vertices',int(substrate_use.sum()),flush=True)
     print('Material',color,'simplified',m.num_tri(),'triangles',m.status(),flush=True)
     return m
 
@@ -421,12 +497,13 @@ def strengthen_top_peaks(materials,fields,folder):
         if any(math.hypot(x-sx,y-sy)<separation for sx,sy,_,_ in selected):continue
         selected.append((x,y,peak,material_index))
     for i,(x,y,peak,material_index) in enumerate(selected,1):
-        reinforcement=polygon_prism(Point(x,y).buffer(diameter/2,quad_segs=12),CFG['base_mm'],peak)
+        support=ground_at(fields['substrate_top_mm'],x,y,radius=.08)
+        reinforcement=polygon_prism(Point(x,y).buffer(diameter/2,quad_segs=12),support,peak)
         for color in range(4):
             materials[color]=materials[color]+reinforcement if color==material_index else materials[color]-reinforcement
         export(reinforcement,folder/f'peak_reinforcement_{i}.ply')
         records.append({'center_mm':[x,y],'top_mm':peak,'diameter_mm':diameter,
-            'minimum_separation_mm':separation,'material':material_index,
+            'minimum_separation_mm':separation,'material':material_index,'substrate_top_mm':support,
             'reason':'preserve measured peak height after the initial slicer omitted narrow top islands'})
     print('Strengthened top peaks',len(records),flush=True)
     return materials,records
@@ -435,6 +512,12 @@ def underpasses(materials,fields,folder):
     # Match the raster-solid base exactly. Mixing float32(1.8) and float64(1.8)
     # leaves a nanometre gap beneath narrow approach strips after exact CSG.
     report=[];ground=fields['ground_mm'];base=float(np.float32(CFG['base_mm']))
+    structural_minimum=structural_roof_thickness_mm(CFG['nozzle_mm'],CFG['layer_height_mm'])
+    tunnel_roof=max(structural_minimum,float(CFG['minimum_tunnel_cover_mm']))
+    bridge_roof=max(structural_minimum,float(CFG['minimum_bridge_deck_thickness_mm']))
+    color_depth=float(CFG.get('surface_color_depth_mm',CFG.get('minimum_surface_color_depth_mm',.24)))
+    minimum_floor=minimum_crossing_floor_mm(base,CFG['layer_height_mm'])
+    minimum_colored_floor=minimum_crossing_floor_mm(base,CFG['layer_height_mm'],color_depth)
     field_report=json.loads((OUT/'field_build_report.json').read_text())
     origin=field_report['vertical_origin_m_navd88']
     terrain_factor=float(field_report.get('terrain_relief',{}).get('factor',1.))
@@ -461,7 +544,7 @@ def underpasses(materials,fields,folder):
             baseline_road=np.linspace(floor0,floor1,steps+1);ds=np.linspace(0,line.length,steps+1)
             surface=np.array([ground_at(ground,line.interpolate(d).x,line.interpolate(d).y,radius=.08) for d in ds])
             profile=printable_tunnel_profile(surface,baseline_road,
-                minimum_cover_mm=CFG['minimum_tunnel_cover_mm'],
+                minimum_cover_mm=tunnel_roof,
                 minimum_clearance_mm=CFG['minimum_tunnel_clearance_mm'],
                 minimum_evidence_mm=CFG.get('minimum_tunnel_evidence_mm',.08),
                 maximum_clearance_mm=CFG.get('maximum_tunnel_clearance_mm',1.40),
@@ -469,6 +552,10 @@ def underpasses(materials,fields,folder):
             if not profile.accepted:
                 report.append({'osm_id':int(row.osm_id),'status':'not cut: '+profile.reason,
                     'maximum_geographic_separation_mm':profile.maximum_geographic_separation_mm});continue
+            if float(profile.road.min())<minimum_floor-1e-9:
+                report.append({'osm_id':int(row.osm_id),'status':'not cut: lower road would enter the model base',
+                    'minimum_inferred_road_mm':float(profile.road.min()),
+                    'minimum_printable_floor_mm':minimum_floor});continue
             road=profile.road
             # Cutting only the covered interior leaves sealed chambers behind
             # the portal caps. Extend the floor into the exposed approach road,
@@ -494,21 +581,15 @@ def underpasses(materials,fields,folder):
             void=md.Manifold.batch_boolean([void,*open_portals],md.OpType.Add)
             for i in range(4):
                 materials[i]=materials[i]-void
-                if i!=3:materials[i]=materials[i]-floor_shape
-            materials[3]=materials[3]+floor_shape
-            ivory_width=None
-            if CFG.get('ivory_roads',False) and bool(row.get('core_eligible',False)):
-                ivory_width=float(row.core_width_mm)
-                ivory_top=ext_road
-                ivory_floor=strip_solid(extended,ivory_width,np.full(len(ext_ds),base),ivory_top,ext_steps)
-                for i in range(4):materials[i]=materials[i]-ivory_floor
-                materials[0]=materials[0]+ivory_floor
+                if i!=0:materials[i]=materials[i]-floor_shape
+            materials[0]=materials[0]+floor_shape
             export(void,folder/f'tunnel_{int(row.osm_id)}_void.ply')
             cut_tunnels.append({'osm_id':int(row.osm_id),'corridor':line.buffer(roof_span/2),
                 'void':void,'road':road,'line':line})
             report.append({'osm_id':int(row.osm_id),'status':'cut','name':row['name'],'length_mm':line.length,
                 'source_road_width_mm':float(row.width_mm),'requested_roof_span_mm':requested_roof_span,
                 'roof_span_mm':roof_span,'roof_span_reduction_mm':requested_roof_span-roof_span,
+                'roof_thickness_mm':tunnel_roof,
                 'road_end_heights_mm':[floor0,floor1],'maximum_clearance_mm':float((ceiling-low).max()),
                 'maximum_geographic_separation_mm':profile.maximum_geographic_separation_mm,
                 'maximum_hidden_floor_adjustment_mm':profile.maximum_hidden_floor_adjustment_mm,
@@ -516,8 +597,8 @@ def underpasses(materials,fields,folder):
                 'source_road_profile_method':str(row.get('road_profile_method','LiDAR ground at mapped portal')),
                 'portal_structure_count':int(row.get('portal_structure_count',0)),
                 'portal_approach_extensions_mm':[reach0,reach1],
-                'ivory_road_core_width_mm':ivory_width,
-                'method':'source-anchored linear hidden road profile; local print-only floor adjustment; both portals remain connected'})
+                'road_material':'ivory','road_surface_width_mm':float(row.width_mm),
+                'method':'source-anchored linear hidden road profile; permanent structural roof; full-width ivory floor; both portals remain connected'})
             print('Tunnel',row.osm_id,'cut',float((ceiling-low).max()),flush=True)
     if (OUT/'bridges.parquet').exists():
         tile=MODEL_AOI
@@ -586,7 +667,7 @@ def underpasses(materials,fields,folder):
                 if is_trail:
                     width=trail_width_mm(candidate.highway,tags,CFG)
                 else:
-                    width=float(semantic.outer_width_mm) if semantic is not None and np.isfinite(semantic.outer_width_mm) else max(.5,float(row.width_mm))
+                    width=float(semantic.surface_width_mm) if semantic is not None and np.isfinite(semantic.surface_width_mm) else max(.5,float(row.width_mm))
                 choices.append((lower_layer,-cross,int(candidate.osm_id),candidate,line,width,semantic))
             return min(choices,key=lambda item:item[:3]) if choices else None
 
@@ -607,21 +688,34 @@ def underpasses(materials,fields,folder):
                 points=shapely.points(shapely.get_coordinates(shape));requested_roof_span=float(np.max(shapely.distance(points,line))*2)+.3
                 roof_span=printable_roof_span(requested_roof_span,CFG['nozzle_mm'])
                 aperture=central.buffer(roof_span/2,quad_segs=4)
-                minimum_under=deck-.24-CFG.get('minimum_bridge_clearance_mm',CFG['minimum_tunnel_clearance_mm'])
+                minimum_under=deck-bridge_roof-CFG.get('minimum_bridge_clearance_mm',CFG['minimum_tunnel_clearance_mm'])
                 printable_lower=min(lower,minimum_under)
-                void=polygon_prism(aperture,printable_lower+.005,deck-.24)
-                substrate=polygon_prism(water_part,base,printable_lower)
+                if printable_lower<minimum_colored_floor-1e-9:
+                    report.append({'osm_id':int(row.osm_id),
+                        'status':'bridge deck retained: water opening would enter the model base',
+                        'printed_lower_surface_mm':printable_lower,
+                        'minimum_printable_floor_mm':minimum_colored_floor,'deck_top_mm':deck,
+                        'method':row.height_method});continue
+                void=polygon_prism(aperture,printable_lower+.005,deck-bridge_roof)
+                skin_bottom=max(base,printable_lower-color_depth)
+                substrate=polygon_prism(water_part,base,skin_bottom)
+                water_skin=polygon_prism(water_part,skin_bottom,printable_lower)
                 for i in range(4):
                     materials[i]=materials[i]-void
-                    if i!=2:materials[i]=materials[i]-substrate
-                materials[2]=materials[2]+substrate
+                    if i!=0:materials[i]=materials[i]-substrate
+                    if i!=2:materials[i]=materials[i]-water_skin
+                materials[0]=materials[0]+substrate
+                materials[2]=materials[2]+water_skin
                 export(void,folder/f'bridge_{int(row.osm_id)}_void.ply')
                 report.append({'osm_id':int(row.osm_id),'status':'water bridge opening','deck_top_mm':deck,
                     'requested_roof_span_mm':requested_roof_span,'roof_span_mm':roof_span,
                     'roof_span_reduction_mm':requested_roof_span-roof_span,
+                    'roof_thickness_mm':bridge_roof,
                     'geographic_lower_surface_mm':lower,'printed_lower_surface_mm':printable_lower,
                     'hidden_lowering_mm':max(0.,lower-printable_lower),
-                    'clearance_mm':deck-.24-printable_lower,'deck_thickness_mm':.24,'method':row.height_method})
+                    'clearance_mm':deck-bridge_roof-printable_lower,'deck_thickness_mm':bridge_roof,
+                    'support':'grounded ivory shoulders and substrate; bounded central aperture',
+                    'method':row.height_method})
                 print('Water bridge',row.osm_id,'cut',flush=True);continue
 
             overlapping=[item for item in cut_tunnels if item['corridor'].intersects(shape)]
@@ -661,7 +755,7 @@ def underpasses(materials,fields,folder):
             surface,visible_protected=constrain_deck_to_visible_surface(surface,visible_surface)
             protected=np.asarray(protected)|visible_protected
             profile=printable_tunnel_profile(surface,baseline,
-                minimum_cover_mm=.24,
+                minimum_cover_mm=bridge_roof,
                 minimum_clearance_mm=CFG.get('minimum_bridge_clearance_mm',CFG['minimum_tunnel_clearance_mm']),
                 minimum_evidence_mm=CFG.get('minimum_bridge_evidence_mm',.08),
                 maximum_clearance_mm=CFG.get('maximum_bridge_clearance_mm',1.40),
@@ -669,29 +763,43 @@ def underpasses(materials,fields,folder):
             if not profile.accepted:
                 report.append({'osm_id':int(row.osm_id),'status':'bridge deck retained: '+profile.reason,
                     'lower_osm_id':lower_id,'maximum_geographic_separation_mm':profile.maximum_geographic_separation_mm});continue
-            floor=strip_solid(segment,width,np.full(steps+1,base),profile.road,steps)
+            road_color=3 if (candidate.highway in TRAIL_HIGHWAYS or
+                (semantic is not None and str(semantic.classification)=='trail')) else 0
+            route_floor=minimum_colored_floor if road_color==3 else minimum_floor
+            if float(profile.road.min())<route_floor-1e-9:
+                report.append({'osm_id':int(row.osm_id),
+                    'status':'bridge deck retained: lower route would enter the model base',
+                    'lower_osm_id':lower_id,'minimum_inferred_road_mm':float(profile.road.min()),
+                    'minimum_printable_floor_mm':route_floor,'deck_top_mm':deck,
+                    'method':row.height_method});continue
+            if road_color==3:
+                colored_bottom=np.maximum(base,profile.road-color_depth)
+                floor_support=strip_solid(segment,width,np.full(steps+1,base),colored_bottom,steps)
+                floor=strip_solid(segment,width,colored_bottom,profile.road,steps)
+            else:
+                floor_support=md.Manifold()
+                floor=strip_solid(segment,width,np.full(steps+1,base),profile.road,steps)
             requested_roof_span=width+.10
             roof_span=printable_roof_span(requested_roof_span,CFG['nozzle_mm'])
             void=strip_solid(segment,roof_span,profile.road+.005,profile.ceiling,steps,arch_rise=.08)
             for i in range(4):
                 materials[i]=materials[i]-void
-                if i!=3:materials[i]=materials[i]-floor
-            materials[3]=materials[3]+floor
-            ivory_width=None
-            if semantic is not None and bool(semantic.core_eligible):
-                ivory_width=float(semantic.core_width_mm)
-                ivory=strip_solid(segment,ivory_width,np.full(steps+1,base),profile.road,steps)
-                for i in range(4):materials[i]=materials[i]-ivory
-                materials[0]=materials[0]+ivory
+                if i!=road_color:materials[i]=materials[i]-floor
+                if road_color==3 and i!=0:materials[i]=materials[i]-floor_support
+            materials[road_color]=materials[road_color]+floor
+            if road_color==3:materials[0]=materials[0]+floor_support
             export(void,folder/f'bridge_{int(row.osm_id)}_void.ply')
             report.append({'osm_id':int(row.osm_id),'status':'road/path overpass opening','lower_osm_id':lower_id,
                 'lower_name':str(candidate['name']),'deck_top_mm':deck,
                 'source_road_width_mm':width,'requested_roof_span_mm':requested_roof_span,
                 'roof_span_mm':roof_span,'roof_span_reduction_mm':requested_roof_span-roof_span,
+                'roof_thickness_mm':bridge_roof,
                 'maximum_geographic_separation_mm':profile.maximum_geographic_separation_mm,
                 'maximum_hidden_floor_adjustment_mm':profile.maximum_hidden_floor_adjustment_mm,
                 'clearance_mm':float((profile.ceiling-profile.road).max()),
-                'ivory_lower_road_core_width_mm':ivory_width,'method':row.height_method})
+                'lower_road_material':'tan' if road_color==3 else 'ivory',
+                'support':'grounded shoulders beside a bounded central aperture',
+                'method':row.height_method})
             print('Land overpass',row.osm_id,'over',lower_id,'cut',flush=True)
     return materials,report
 
@@ -699,15 +807,21 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--stride',type=int,default=1);p.add_argument('--reuse-base',action='store_true');a=p.parse_args()
     folder=OUT/('mesh' if a.stride==1 else f'mesh_draft_{a.stride}');folder.mkdir(exist_ok=True)
     fields=np.load(OUT/'map_fields.npz');mats=[];report={'stride':a.stride,'parts':{}}
+    if 'substrate_top_mm' not in fields:
+        raise RuntimeError('Map fields lack the required continuous ivory substrate surface')
     for i in range(4):
         path=folder/f'material_{i}_base.ply'
         if a.reuse_base and path.exists():m=solid(trimesh.load(path,process=False))
         else:
-            m=material_solid(fields['height_mm'],fields['material'],i,a.stride)
+            m=material_solid(fields['height_mm'],fields['substrate_top_mm'],fields['material'],
+                fields['aoi_mask'],i,a.stride)
             export(m,path)
         mats.append(m)
+    mats,seating=seat_colored_surfaces(mats);report['surface_seating']=seating
     mats,cuts=underpasses(mats,fields,folder);report['crossings']=cuts
-    report['layer_support']=audit_layer_support(cuts,CFG['nozzle_mm'])
+    report['layer_support']=audit_layer_support(cuts,CFG['nozzle_mm'],CFG['layer_height_mm'])
+    report['material_layers']={'substrate_material':0,'substrate_color':'ivory',
+        'surface_color_depth_mm':float(CFG.get('surface_color_depth_mm',CFG.get('minimum_surface_color_depth_mm',.24)))}
     mats,peaks=strengthen_top_peaks(mats,fields,folder);report['top_peak_reinforcements']=peaks
     report['measured_landmarks']=[]
     for i,m in enumerate(mats):

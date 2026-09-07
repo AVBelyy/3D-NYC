@@ -13,7 +13,7 @@ from road_symbols import (  # noqa: E402
     trail_width_mm,
     build_road_symbols,
     classify_highway,
-    printable_widths,
+    printable_road_width,
     sample_roadbed_widths_m,
 )
 
@@ -61,21 +61,17 @@ class RoadClassificationTests(unittest.TestCase):
                 }, 1.0)
                 self.assertEqual(result[0], "other")
 
-    def test_print_widths_are_grid_aligned_and_have_two_casings(self):
+    def test_print_widths_are_grid_aligned_and_printable(self):
         for major in [False, True]:
-            widths = printable_widths(CFG, major)
-            self.assertAlmostEqual(widths.core_mm / 0.125, round(widths.core_mm / 0.125))
-            self.assertAlmostEqual(widths.outer_mm / 0.125, round(widths.outer_mm / 0.125))
-            self.assertGreaterEqual(widths.core_mm, 0.45)
-            self.assertGreaterEqual((widths.outer_mm - widths.core_mm) / 2, 0.34)
+            width = printable_road_width(CFG, major).surface_mm
+            self.assertAlmostEqual(width / 0.125, round(width / 0.125))
+            self.assertGreaterEqual(width, 0.45)
 
-    def test_widths_expand_with_scale_and_preserve_core_fraction(self):
-        small_scale = printable_widths(CFG, physical_width_m=9.0, scale_denominator=16_621)
-        large_scale = printable_widths(CFG, physical_width_m=9.0, scale_denominator=3_144)
-        self.assertEqual(small_scale, printable_widths(CFG))
-        self.assertGreater(large_scale.outer_mm, small_scale.outer_mm)
-        self.assertGreater(large_scale.core_mm, small_scale.core_mm)
-        self.assertAlmostEqual(large_scale.core_mm / large_scale.outer_mm, 0.40, delta=0.03)
+    def test_road_ribbon_does_not_expand_to_physical_roadbed_width(self):
+        small_scale = printable_road_width(CFG, physical_width_m=9.0, scale_denominator=50_000)
+        large_scale = printable_road_width(CFG, physical_width_m=9.0, scale_denominator=3_144)
+        self.assertEqual(small_scale, printable_road_width(CFG))
+        self.assertEqual(large_scale.surface_mm, small_scale.surface_mm)
 
     def test_cross_section_width_estimator_rejects_intersection_flare(self):
         # Source coordinates are EPSG:2263 US survey feet. A 10 m street has a
@@ -99,7 +95,7 @@ class RoadGeometryTests(unittest.TestCase):
             return gpd.GeoDataFrame({"geometry": gpd.GeoSeries([], crs=2263)}, geometry="geometry", crs=2263)
         return gpd.GeoDataFrame(rows, geometry="geometry", crs=2263)
 
-    def test_core_is_continuous_across_split_road_and_never_follows_trail(self):
+    def test_surface_is_continuous_across_split_road_and_never_follows_trail(self):
         osm = self.frame([
             {"osm_id": 1, "highway": "residential", "tags": '{"highway":"residential","name":"Main"}',
              "geometry": LineString([(10, 50), (50, 50)])},
@@ -109,16 +105,14 @@ class RoadGeometryTests(unittest.TestCase):
              "geometry": LineString([(50, 10), (50, 90)])},
         ])
         roadbed = self.frame([{"geometry": box(8, 46, 92, 54), "SUB_FEATURE_CODE": 350000}])
-        routes, outer, core, report = build_road_symbols(osm, roadbed, self.aoi, self.scale, CFG)
+        routes, roads, report = build_road_symbols(osm, roadbed, self.aoi, self.scale, CFG)
         self.assertEqual(report["categorical_trails_eligible"], 0)
-        self.assertFalse(bool(routes.loc[routes.osm_id.eq(3), "core_eligible"].iloc[0]))
-        core_union = core.geometry.union_all()
-        outer_union = outer.geometry.union_all()
-        self.assertTrue(core_union.covers(LineString([(10, 50), (90, 50)])))
-        self.assertTrue(outer_union.covers(core_union))
-        # The trail crosses the road symbol once, but no ivory branch extends
+        self.assertFalse(bool(routes.loc[routes.osm_id.eq(3), "ivory_eligible"].iloc[0]))
+        road_union = roads.geometry.union_all()
+        self.assertTrue(road_union.covers(LineString([(10, 50), (90, 50)])))
+        # The trail crosses the road surface once, but no ivory branch extends
         # north or south along it.
-        self.assertFalse(core_union.intersects(LineString([(50, 60), (50, 90)])))
+        self.assertFalse(road_union.intersects(LineString([(50, 70), (50, 90)])))
 
     def test_centerline_fallback_works_without_roadbed(self):
         osm = self.frame([{
@@ -126,10 +120,10 @@ class RoadGeometryTests(unittest.TestCase):
             "geometry": LineString([(10, 20), (90, 20)]),
         }])
         roadbed = self.frame([])
-        routes, outer, core, _ = build_road_symbols(osm, roadbed, self.aoi, self.scale, CFG)
-        self.assertTrue(bool(routes.core_eligible.iloc[0]))
-        self.assertGreater(outer.area.sum(), core.area.sum())
-        self.assertTrue(core.geometry.union_all().covers(osm.geometry.iloc[0]))
+        routes, roads, _ = build_road_symbols(osm, roadbed, self.aoi, self.scale, CFG)
+        self.assertTrue(bool(routes.ivory_eligible.iloc[0]))
+        self.assertGreater(roads.area.sum(), 0)
+        self.assertTrue(roads.geometry.union_all().covers(osm.geometry.iloc[0]))
 
     def test_bridge_and_tunnel_do_not_leak_into_surface_polygons(self):
         osm = self.frame([
@@ -139,12 +133,11 @@ class RoadGeometryTests(unittest.TestCase):
              "geometry": LineString([(10, 70), (90, 70)])},
         ])
         roadbed = self.frame([])
-        routes, outer, core, _ = build_road_symbols(osm, roadbed, self.aoi, self.scale, CFG)
-        self.assertTrue(routes.core_eligible.all())
+        routes, roads, _ = build_road_symbols(osm, roadbed, self.aoi, self.scale, CFG)
+        self.assertTrue(routes.ivory_eligible.all())
         self.assertTrue(routes.bridge.any())
         self.assertTrue(routes.tunnel.any())
-        self.assertEqual(len(outer), 0)
-        self.assertEqual(len(core), 0)
+        self.assertEqual(len(roads), 0)
 
 
 if __name__ == "__main__":

@@ -15,10 +15,10 @@ CORE='http://schemas.microsoft.com/3dmanufacturing/core/2015/02'
 PROD='http://schemas.microsoft.com/3dmanufacturing/production/2015/06'
 MAT='http://schemas.microsoft.com/3dmanufacturing/material/2015/02'
 ID='1 0 0 0 1 0 0 0 1 0 0 0'
-NAMES=['Ivory - base, default buildings, roof fixtures and bridge edges',
-    'Green - terrain, recreation, gardens, grass, measured canopy and selected buildings',
+NAMES=['Ivory - continuous substrate, road ribbons, default buildings and structural bridge roofs',
+    'Green - terrain, recreation, gardens, grass, measured canopy relief and selected buildings',
     'Blue - level water surfaces and selected buildings',
-    'Tan - streets, paths, plazas, surface parking, lower tunnel roads and selected buildings']
+    'Tan - sidewalks, paths, plazas, surface parking and selected buildings']
 
 
 def validate_generation_metadata(generation,source='generation metadata'):

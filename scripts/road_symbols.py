@@ -1,10 +1,11 @@
-"""Scale-aware, semantic road symbols for the four-colour map.
+"""Scale-aware, semantic ivory road surfaces for the four-colour map.
 
-The ivory road colour is a cartographic symbol, not an erosion of the source
-roadbed polygon.  This module deliberately separates the questions:
+The ivory road colour is a cartographic fallback where the measured NYC
+roadbed is absent or narrower than a printable line. This module deliberately
+separates the questions:
 
 * is this linear feature physically a carriageway or a trail?
-* how wide must its tan casing and ivory centre be to print reliably?
+* how wide must its ivory surface be to print reliably?
 
 All widths below are model-space millimetres.  OSM access restrictions are not
 used as a proxy for physical form: a car-free former drive may still be a
@@ -65,9 +66,8 @@ DEFAULT_ROAD_WIDTH_M = {
 
 
 @dataclass(frozen=True)
-class SymbolWidths:
-    core_mm: float
-    outer_mm: float
+class RoadWidth:
+    surface_mm: float
 
 
 def trail_width_mm(highway: str, tags: dict, config: dict) -> float:
@@ -88,42 +88,24 @@ def _ceil_to(value: float, increment: float) -> float:
     return math.ceil((value - 1e-9) / increment) * increment
 
 
-def _round_to(value: float, increment: float) -> float:
-    return math.floor(value / increment + 0.5) * increment
-
-
-def printable_widths(
+def printable_road_width(
     config: dict,
     major: bool = False,
     physical_width_m: float | None = None,
     scale_denominator: float | None = None,
-) -> SymbolWidths:
-    """Return scale-adaptive widths which remain printable.
+) -> RoadWidth:
+    """Return a fixed printable cartographic road-ribbon width.
 
-    The minimum symbol is used at small scales. Once the measured road becomes
-    wider than that minimum in model space, the ivory core grows with it while
-    retaining the configured tan-to-ivory ratio.
+    Physical road width is retained in route metadata for auditing and crossing
+    decisions, but it must not turn the visible ivory symbol into a roadbed-wide
+    stripe. This intentionally matches the line treatment of the reference map.
     """
     grid = float(config.get("grid_step_mm", 0.125))
     nozzle = float(config.get("nozzle_mm", 0.4))
-    minimum_bead = nozzle * float(config.get("road_minimum_bead_ratio", 0.85))
-    minimum_core = _ceil_to(max(nozzle * 1.125, grid * 4), grid)
-    casing = _ceil_to(max(minimum_bead, grid * 3), grid)
-    minimum_outer = minimum_core + 2 * casing
+    minimum = float(config.get("road_line_width_mm", max(nozzle * 1.25, grid * 4)))
     if major:
-        minimum_core = _ceil_to(max(minimum_core, grid * 5), grid)
-        minimum_outer = _ceil_to(max(minimum_outer, grid * 12), grid)
-        casing = (minimum_outer - minimum_core) / 2
-    scaled_outer = 0.0
-    if physical_width_m is not None and scale_denominator:
-        scaled_outer = float(physical_width_m) * 1000 / float(scale_denominator)
-    outer = _ceil_to(max(minimum_outer, scaled_outer), grid)
-    fraction = float(config.get("road_core_fraction", 0.40))
-    if not 0.20 <= fraction <= 0.70:
-        raise ValueError("road_core_fraction must be between 0.20 and 0.70")
-    target_core = max(minimum_core, outer * fraction)
-    core = min(max(minimum_core, _round_to(target_core, grid)), outer - 2 * casing)
-    return SymbolWidths(core_mm=core, outer_mm=outer)
+        minimum = float(config.get("major_road_line_width_mm", max(minimum, grid * 5)))
+    return RoadWidth(surface_mm=_ceil_to(max(minimum, nozzle), grid))
 
 
 def _numeric_tag(value) -> float | None:
@@ -247,7 +229,7 @@ def roadbed_support(line, roadbed_union, tolerance_source: float = 0.0) -> float
 def classify_highway(highway: str, tags: dict, support: float) -> tuple[str, str]:
     """Classify one OSM way by physical form, conservatively.
 
-    ``trail`` means tan-only. ``carriageway`` may receive an ivory core.
+    ``trail`` means tan-only. ``carriageway`` receives an ivory surface.
     ``other`` is ignored by the surface symbolizer.
     """
     highway = str(highway or "").strip().lower()
@@ -310,8 +292,8 @@ def build_road_symbols(
     aoi,
     scale_denominator: float,
     config: dict,
-) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, gpd.GeoDataFrame, dict]:
-    """Build normalized routes, minimum tan casings, and flush ivory cores."""
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame, dict]:
+    """Build normalized routes and printable ivory carriageway surfaces."""
     crs = osm.crs or roadbed.crs or 2263
     k = 0.3048006096012192 * 1000 / float(scale_denominator)
     tolerance_source = float(config.get("road_surface_match_tolerance_mm", 0.20)) / k
@@ -341,7 +323,7 @@ def build_road_symbols(
             "osm_id": int(row.osm_id), "highway": highway,
             "name": str(tags.get("name") or ""), "route_key": route_key,
             "classification": classification, "classification_reason": reason,
-            "core_eligible": bool(eligible), "grade_key": grade,
+            "ivory_eligible": bool(eligible), "grade_key": grade,
             "bridge": grade.startswith("bridge:"), "tunnel": grade.startswith("tunnel:"),
             "surface_support_ratio": support,
             "_tags": tags, "_major": highway in MAJOR_CARRIAGEWAYS,
@@ -354,7 +336,7 @@ def build_road_symbols(
     # ways. Unnamed ways retain their stable OSM-id route key.
     groups: dict[str, list[dict]] = {}
     for record in rows:
-        if record["core_eligible"]:
+        if record["ivory_eligible"]:
             groups.setdefault(record["route_key"], []).append(record)
     percentile = float(config.get("road_width_percentile", 30.0))
     if not 10 <= percentile <= 50:
@@ -380,7 +362,7 @@ def build_road_symbols(
             physical_width_m = _default_width_m([record["highway"] for record in group])
             method = "road-class physical-width fallback"
         physical_width_m = float(np.clip(physical_width_m, 2.5, maximum_width_m))
-        widths = printable_widths(
+        width = printable_road_width(
             config, major=any(record["_major"] for record in group),
             physical_width_m=physical_width_m, scale_denominator=scale_denominator,
         )
@@ -389,67 +371,50 @@ def build_road_symbols(
                 "estimated_road_width_m": physical_width_m,
                 "width_estimation_method": method,
                 "width_sample_count": len(samples),
-                "core_width_mm": widths.core_mm,
-                "outer_width_mm": widths.outer_mm,
-                "core_fraction": widths.core_mm / widths.outer_mm,
+                "surface_width_mm": width.surface_mm,
             })
 
     eligible_buffers = []
-    core_buffers = []
     for record in rows:
-        if record["core_eligible"] and record["grade_key"] == "surface:0":
-            eligible_buffers.append(record["geometry"].buffer(record["outer_width_mm"] / (2 * k), quad_segs=6))
-            core_buffers.append(record["geometry"].buffer(record["core_width_mm"] / (2 * k), quad_segs=6))
+        if record["ivory_eligible"] and record["grade_key"] == "surface:0":
+            eligible_buffers.append(record["geometry"].buffer(record["surface_width_mm"] / (2 * k), quad_segs=6))
         record.pop("_tags", None)
         record.pop("_major", None)
 
-    outer_union = shapely.union_all(eligible_buffers).intersection(aoi) if eligible_buffers else Polygon()
-    core_union = shapely.union_all(core_buffers).intersection(outer_union).intersection(aoi) if core_buffers else Polygon()
-    outer_parts = _polygon_parts(outer_union)
-    core_parts = _polygon_parts(core_union)
-    outer = _gdf([
-        {"source": "OSM carriageway centerlines", "style": "minimum tan casing", "geometry": part}
-        for part in outer_parts
-    ], crs)
-    core = _gdf([
-        {"source": "OSM carriageway centerlines", "style": "flush ivory core", "geometry": part}
-        for part in core_parts
+    surface_union = shapely.union_all(eligible_buffers).intersection(aoi) if eligible_buffers else Polygon()
+    surface_parts = _polygon_parts(surface_union)
+    surfaces = _gdf([
+        {"source": "OSM carriageway centerlines", "style": "ivory road surface", "geometry": part}
+        for part in surface_parts
     ], crs)
     routes = _gdf(rows, crs)
 
     forbidden_eligible = routes[
-        routes.get("core_eligible", pd.Series(dtype=bool)).fillna(False)
+        routes.get("ivory_eligible", pd.Series(dtype=bool)).fillna(False)
         & routes.get("highway", pd.Series(dtype=object)).isin(TRAIL_HIGHWAYS)
     ] if len(routes) else routes
     if len(forbidden_eligible):
-        raise RuntimeError("Categorical trail classes were incorrectly made ivory-core eligible")
-    outside = core_union.difference(outer_union)
-    if not outside.is_empty and outside.area * k * k > 1e-6:
-        raise RuntimeError("Ivory road core escapes its tan casing")
+        raise RuntimeError("Categorical trail classes were incorrectly made ivory-road eligible")
 
-    eligible_routes = routes[routes.core_eligible] if len(routes) else routes
+    eligible_routes = routes[routes.ivory_eligible] if len(routes) else routes
     estimated_widths = eligible_routes.estimated_road_width_m.to_numpy() if len(eligible_routes) else np.array([])
-    core_fractions = eligible_routes.core_fraction.to_numpy() if len(eligible_routes) else np.array([])
     report = {
-        "algorithm": "centerline-derived classic cased ribbon",
+        "algorithm": "fixed-width ivory cartographic ribbons on classified carriageway centerlines",
         "scale_denominator": float(scale_denominator),
         "classification_counts": counts,
         "candidate_routes": int(len(routes)),
         "eligible_routes": int(len(eligible_routes)),
         "categorical_trails_eligible": int(len(forbidden_eligible)),
-        "surface_eligible_routes": int(sum(bool(r["core_eligible"]) and r["grade_key"] == "surface:0" for r in rows)),
-        "outer_polygons": len(outer), "core_polygons": len(core),
-        "outer_area_mm2": float(outer.area.sum() * k * k) if len(outer) else 0.0,
-        "core_area_mm2": float(core.area.sum() * k * k) if len(core) else 0.0,
+        "surface_eligible_routes": int(sum(bool(r["ivory_eligible"]) and r["grade_key"] == "surface:0" for r in rows)),
+        "surface_polygons": len(surfaces),
+        "surface_area_mm2": float(surfaces.area.sum() * k * k) if len(surfaces) else 0.0,
         "minimum_print_widths_mm": {
-            "ordinary": printable_widths(config).__dict__,
-            "major": printable_widths(config, major=True).__dict__,
+            "ordinary": printable_road_width(config).surface_mm,
+            "major": printable_road_width(config, major=True).surface_mm,
         },
-        "target_core_fraction": float(config.get("road_core_fraction", 0.40)),
         "estimated_physical_width_m_range": [float(estimated_widths.min()), float(estimated_widths.max())] if len(estimated_widths) else None,
-        "actual_core_fraction_range": [float(core_fractions.min()), float(core_fractions.max())] if len(core_fractions) else None,
         "surface_match_tolerance_mm": float(config.get("road_surface_match_tolerance_mm", 0.20)),
-        "height_relationship": "ivory core is flush with tan casing",
+        "height_relationship": "ivory road ribbon is flush with its surrounding road surface",
         "trail_policy": "footway/path/steps/bridleway/cycleway/track and Parks trails are tan-only",
     }
-    return routes, outer, core, report
+    return routes, surfaces, report

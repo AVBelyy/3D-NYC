@@ -84,12 +84,11 @@ def main():
         roadbed.intersects(AOI) & roadbed.SUB_FEATURE_CODE.isin([350000, 350010, 350030])
     ].copy()
     osm = gpd.read_parquet(OUT / "osm_detail.parquet")
-    routes, outer, cores, road_report = build_road_symbols(
+    routes, road_surfaces, road_report = build_road_symbols(
         osm, roadbed, AOI, float(CFG["scale_denominator"]), CFG
     )
     routes.to_parquet(processed / "road_symbol_routes.parquet")
-    outer.to_parquet(processed / "cased_road_outer.parquet")
-    cores.to_parquet(processed / "ivory_road_core.parquet")
+    road_surfaces.to_parquet(processed / "ivory_road_surface.parquet")
 
     detail_layers = {}
     for name in ["CURB", "CURB_CUT", "MEDIAN", "PAVEMENT_EDGE", "ROADBED", "SIDEWALK", "SIDEWALK_LINE"]:
@@ -102,8 +101,8 @@ def main():
         "region": {
             "parks_structures": len(structures),
             "mta_entrances": len(entrances),
-            "ivory_road_core_polygons": len(cores),
-            "ivory_road_core_area_mm2": float(cores.area.sum() * K * K),
+            "ivory_road_surface_polygons": len(road_surfaces),
+            "ivory_road_surface_area_mm2": float(road_surfaces.area.sum() * K * K),
             "road_symbols": road_report,
         },
         "existing_planimetric_detail_features": detail_layers,

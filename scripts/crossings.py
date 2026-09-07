@@ -8,9 +8,38 @@ anchors and make any hidden-only print adjustment explicit and auditable.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 import shapely
+
+
+def structural_roof_thickness_mm(nozzle_mm: float, layer_height_mm: float) -> float:
+    """Return a layer-aligned permanent roof at least three layers/1.5 nozzles thick."""
+    nozzle = float(nozzle_mm)
+    layer = float(layer_height_mm)
+    if not math.isfinite(nozzle) or nozzle <= 0:
+        raise ValueError("nozzle width must be finite and positive")
+    if not math.isfinite(layer) or layer <= 0:
+        raise ValueError("layer height must be finite and positive")
+    requested = max(1.5 * nozzle, 3.0 * layer)
+    return round(math.ceil((requested - 1e-9) / layer) * layer, 10)
+
+
+def minimum_crossing_floor_mm(
+    base_mm: float, layer_height_mm: float, surface_color_depth_mm: float = 0.0
+) -> float:
+    """Keep a lower route and any color skin above one complete white base layer."""
+    base = float(base_mm)
+    layer = float(layer_height_mm)
+    color = float(surface_color_depth_mm)
+    if not math.isfinite(base) or base < 0:
+        raise ValueError("base height must be finite and non-negative")
+    if not math.isfinite(layer) or layer <= 0:
+        raise ValueError("layer height must be finite and positive")
+    if not math.isfinite(color) or color < 0:
+        raise ValueError("surface color depth must be finite and non-negative")
+    return base + layer + color
 
 
 @dataclass(frozen=True)

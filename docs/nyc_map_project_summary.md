@@ -14,17 +14,19 @@ substitute for a representative physical test.
 
 | Material | Modeled content |
 | --- | --- |
-| Ivory | Continuous base, default buildings, roof fixtures, bridge edges, and flush road cores |
-| Green | Vegetated terrain, recreation areas, gardens, grass, measured canopy, and selected buildings |
+| Ivory | Continuous substrate, road ribbons, default buildings, roof fixtures, and structural bridge roofs |
+| Green | Vegetated terrain, recreation areas, gardens, grass, smoothed measured canopy, and selected buildings |
 | Blue | Level water surfaces and selected buildings |
-| Tan | Streets, paths, plazas, surface parking, lower tunnel roads, and selected buildings |
+| Tan | Sidewalks, paths, plazas, surface parking, and selected buildings |
 
 The generator retains detailed 2014 CityGML roofs where available, supplements
 them with maintained building footprints and Planimetrics fixtures, and uses
 LiDAR for ground and upper-surface measurements. Roads, paths, land use,
 bridges, tunnels, and current semantic context combine NYC sources with
-OpenStreetMap. Thin features are widened or separated where needed for the
-configured 0.4 mm nozzle.
+OpenStreetMap. Classified carriageway centerlines become fixed-width ivory
+ribbons; measured urban roadbeds and sidewalk polygons are tan, while park-road
+shoulders remain green. Thin features are widened or separated where needed for
+the configured 0.4 mm nozzle.
 
 Building-color overrides reuse the four installed materials; they do not add a
 fifth material. Address selectors use NYC Planning GeoSearch, while coordinate,
@@ -64,19 +66,22 @@ place. The cache scripts make a run rebuildable, but only retained cache and
 job manifests identify the exact snapshot used for a particular output.
 
 The default elevation path uses canonical 0.5 m cache rasters: mean class-2
-ground and maximum class 1/2/17/25 upper surface. The canopy is continuous
-measured relief rather than a collection of individual tree models. Hidden
-tunnel profiles, unmeasured fixture heights, and some water levels are explicit
-inferences rather than underground or architectural surveys.
+ground and maximum class 1/2/17/25 upper surface. The measured upper surface
+defines varied canopy relief; narrow source gaps are closed and remaining edges
+are rolled down, while mapped trails retain a print-scaled canopy setback.
+Hidden tunnel profiles, unmeasured fixture heights, and some water levels are
+explicit inferences rather than underground or architectural surveys.
 
 ## Validation guarantees
 
 The generation pipeline checks source cardinalities against independent
 context, rejects out-of-bounds or degenerate geometry, and requires each
 material mesh to be watertight, consistently wound, and positive-volume.
-Materials are made mutually exclusive after simplification and manufacturing-
-grid snapping. Full validation adds more expensive pairwise intersection
-checks.
+Colored surface solids are seated into a continuous ivory substrate, then all
+materials are made mutually exclusive after simplification and manufacturing-
+grid snapping. Crossing validation also requires layer-aligned permanent roofs
+at least three layers thick and limits unsupported apertures to three nozzle
+widths. Full validation adds more expensive pairwise intersection checks.
 
 The 3MF embeds a shell-safe generation command and the packaged Bambu project
 settings. The full normalized configuration remains in the job directory. An

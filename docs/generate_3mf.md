@@ -108,6 +108,38 @@ For example, select a visible building by BIN without calling GeoSearch:
 This selects New York City Hall in the example crop. A selector that matches no
 visible footprint fails rather than being ignored.
 
+## Print styling and support
+
+The four materials are arranged around a continuous ivory substrate. Green,
+blue, and tan surface regions begin only near the visible surface, while
+buildings and raised tree crowns retain their selected color above that
+substrate. This keeps the lower tile edge ivory and ensures that shallow tan
+sidewalk regions are made from solid shell layers rather than exposing sparse
+infill. Adjacent chunks must still use the shared print frame and terrain origin
+emitted by the chunk planner so their edge geometry agrees.
+
+Roads use printable ivory centerline ribbons: 0.5 mm for ordinary streets and
+0.625 mm for major roads. Physical roadbed width is retained as source metadata
+but does not widen the visible symbol. Outside parks, measured roadbeds and
+authoritative sidewalks form the tan street field; inside parks, road shoulders
+remain green. Park paths, plazas, and surface parking are tan, and categorical
+trails never become ivory roads.
+
+LiDAR upper-surface heights define the varied canopy relief. The generator
+closes only narrow gaps in the canopy classification, smooths measured heights
+using a source halo, and rolls remaining canopy edges down over a print-scaled
+distance. Mapped trails are applied after gap closing and receive a clear canopy
+setback, so paths remain distinct instead of becoming dark fissures between
+near-vertical tree masses.
+
+Tunnel and underpass openings retain a full-width lower route, but their hidden
+apertures are narrowed to at most three nozzle widths, leaving grounded
+shoulders. Permanent bridge roofs are layer-aligned, at least three layers and
+1.5 nozzle widths thick. These are modeled supports rather than removable
+slicer support. A lower route must also retain at least one complete printed
+layer above the base; an opening that cannot satisfy all three constraints is
+left solid.
+
 ## Reproducibility
 
 Each job records normalized configuration, cache identities, source subsets,

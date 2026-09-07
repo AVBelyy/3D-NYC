@@ -47,12 +47,14 @@ from shapely.geometry import Point, Polygon, box, shape
 from _datasets import DATASETS
 from download_data import MIN_FREE, ROOT, download
 from cache_common import read_tiled_geoparquet
+from crossings import structural_roof_thickness_mm
+from _material_layers import surface_color_depth_mm
 from road_symbols import TRAIL_HIGHWAYS
 
 
-PIPELINE_VERSION = 20
-MESH_PIPELINE_VERSION = 18
-PACKAGE_PIPELINE_VERSION = 3
+PIPELINE_VERSION = 24
+MESH_PIPELINE_VERSION = 19
+PACKAGE_PIPELINE_VERSION = 6
 VALIDATION_PIPELINE_VERSION = 4
 SLICE_PIPELINE_VERSION = 2
 FT = 0.3048006096012192
@@ -1489,8 +1491,7 @@ class Pipeline:
             "extract_osm", [str(python), str(SCRIPT_DIR / "extract_osm.py")]
         ), variant={"cache": self.cache_identity("new_york_osm")})
         self.stage("prepare_details", [
-            self.processed / "ivory_road_core.parquet",
-            self.processed / "cased_road_outer.parquet",
+            self.processed / "ivory_road_surface.parquet",
             self.processed / "road_symbol_routes.parquet",
             self.processed / "parks_structures.parquet",
             self.processed / "mta_subway_entrances.parquet",
@@ -2141,6 +2142,8 @@ def build_config(args) -> tuple[dict, str, Path]:
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", slug)
     output = (args.output or args.output_dir / "models" / f"{slug}.3mf").resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+    structural_roof=structural_roof_thickness_mm(0.4,args.layer_height)
+    color_depth=surface_color_depth_mm(args.layer_height,.24)
     config = {
         "pipeline_version": PIPELINE_VERSION,
         "name": (
@@ -2158,20 +2161,24 @@ def build_config(args) -> tuple[dict, str, Path]:
         "terrain_relief_factor": args.terrain_relief_factor,
         "minimum_terrain_relief_levels": args.minimum_terrain_levels,
         "maximum_terrain_relief_factor": 3.0, "minimum_terrain_source_span_m": 0.5,
-        "base_mm": 1.8, "minimum_terrain_mm": 2.4, "minimum_path_width_mm": 0.5,
+        "base_mm": 1.8, "minimum_terrain_mm": 2.4, "minimum_path_width_mm": 0.625,
         "path_relief_mm": 0.16, "minimum_fixture_width_mm": 0.45,
         "minimum_top_peak_diameter_mm": 1.0, "top_peak_minimum_separation_mm": 1.0,
         "top_peak_reinforcement_band_mm": 2.0,
         "top_peak_reinforcement_step_mm": 0.16, "inferred_cooling_height_mm": 0.2,
-        "canopy_max_height_m": 36.0, "canopy_smoothing_m": 1.0,
+        "canopy_max_height_m": 36.0, "canopy_minimum_source_height_m": 1.0,
+        "canopy_smoothing_m": 1.0, "canopy_maximum_closed_gap_mm": 0.75,
+        "canopy_edge_roll_mm": 0.50, "canopy_trail_setback_mm": 0.30,
         "infer_hidden_road_profiles": args.infer_hidden_road_profiles, "minimum_tunnel_clearance_mm": 0.48,
-        "minimum_tunnel_cover_mm": 0.32, "minimum_tunnel_evidence_mm": 0.08,
+        "minimum_tunnel_cover_mm": structural_roof, "minimum_tunnel_evidence_mm": 0.08,
         "maximum_tunnel_clearance_mm": 1.40, "tunnel_portal_transition_fraction": 0.15,
         "minimum_bridge_clearance_mm": 0.48, "minimum_bridge_evidence_mm": 0.08,
+        "minimum_bridge_deck_thickness_mm": structural_roof,
         "maximum_bridge_clearance_mm": 1.40, "minimum_crossing_length_mm": 0.80,
-        "ivory_roads": True,
-        "road_minimum_bead_ratio": 0.85, "road_surface_match_tolerance_mm": 0.20,
-        "road_core_fraction": 0.40, "road_width_percentile": 30.0,
+        "ivory_carriageways": True,
+        "road_line_width_mm": 0.50, "major_road_line_width_mm": 0.625,
+        "road_surface_match_tolerance_mm": 0.20,
+        "road_width_percentile": 30.0,
         "road_width_sample_interval_m": 15.0, "road_maximum_physical_width_m": 60.0,
         "subway_entrances": True, "minimum_entrance_width_mm": 0.5,
         "entrance_relief_mm": 0.2,
@@ -2181,6 +2188,7 @@ def build_config(args) -> tuple[dict, str, Path]:
         "layer_height_mm": args.layer_height, "process_preset": PROCESS_PRESETS[args.layer_height],
         "wall_loops": 2, "infill_percent": 5, "bottom_shell_layers": 3,
         "top_shell_layers": 4, "brim_width_mm": brim_width, "brim_gap_mm": MODEL_BRIM_GAP_MM,
+        "minimum_surface_color_depth_mm": 0.24, "surface_color_depth_mm": color_depth,
         "export_snap_denominator": 65536,
         "prime_tower": prime, "prime_tower_width_mm": PRIME_TOWER_WIDTH_MM,
         "prime_tower_brim_width_mm": PRIME_TOWER_BRIM_MM,

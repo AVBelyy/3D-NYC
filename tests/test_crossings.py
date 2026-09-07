@@ -10,8 +10,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from crossings import (  # noqa: E402
     constrain_deck_to_visible_surface,
     fit_linear_elevation_profile,
+    minimum_crossing_floor_mm,
     minimum_crossing_length_mm,
     printable_tunnel_profile,
+    structural_roof_thickness_mm,
     tunnel_surface_masks,
 )
 
@@ -39,6 +41,14 @@ class ElevationProfileTests(unittest.TestCase):
 
 
 class PrintableCrossingTests(unittest.TestCase):
+    def test_structural_roof_is_layer_aligned_and_at_least_three_layers(self):
+        self.assertAlmostEqual(structural_roof_thickness_mm(.4,.24),.72)
+        self.assertAlmostEqual(structural_roof_thickness_mm(.4,.08),.64)
+
+    def test_crossing_floor_retains_one_layer_above_base(self):
+        self.assertAlmostEqual(minimum_crossing_floor_mm(1.8,.24),2.04)
+        self.assertAlmostEqual(minimum_crossing_floor_mm(1.8,.24,.48),2.52)
+
     def test_untagged_surface_road_over_tunnel_is_not_repainted_green(self):
         tunnel=np.ones((3,3),dtype=bool)
         park=np.ones_like(tunnel)
