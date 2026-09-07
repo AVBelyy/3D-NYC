@@ -168,6 +168,32 @@ def snap_for_export(m):
     # Remove such redundant edges at 0.1 micrometre tolerance before export.
     return result.simplify(max(.00001,2/denominator))
 
+def maximum_seam_thickness_mm():
+    """Bound the overlap two independently simplified copies of one wall can make.
+
+    Each closed solid is simplified once before crossing construction and its
+    exported vertices are snapped to the export grid, so either copy of a
+    shared surface can move by that much.  Twice the per-surface motion is the
+    thickest purely numerical seam the pipeline can produce; anything thicker
+    is a modeling collision.  ``validate_3mf.py`` reads this value back from
+    the mesh report, so keep every seam decision on this one definition.
+    """
+    denominator=CFG.get('export_snap_denominator',16384)
+    return 2*(INITIAL_SIMPLIFY_MM+FINAL_SIMPLIFY_MM+max(.00001,2/denominator))
+
+def serialized_seams_acceptable(intersections,thicknesses,tolerance,maximum_thickness):
+    """Apply the material-overlap rule that the strict 3MF validator applies.
+
+    A pair is stable when its accumulated volume stays under the nozzle-volume
+    threshold or when the overlap is thinner than the vertex motion the
+    simplify and export passes are allowed to introduce.  Both measures are
+    needed: a coincident seam that follows every road and building edge of a
+    dense tile covers thousands of mm2, so it can pass the volume threshold
+    while remaining hundreds of times thinner than one printed layer.
+    """
+    return all(volume<tolerance or thicknesses.get(key,float('inf'))<=maximum_thickness
+        for key,volume in intersections.items())
+
 def partition_materials(materials):
     """Make independently simplified color solids mutually exclusive.
 
@@ -182,9 +208,7 @@ def partition_materials(materials):
     by the maximum relative motion allowed by the two independent simplify
     passes and export-grid cleanup; a thicker intersection remains an error.
     """
-    denominator=CFG.get('export_snap_denominator',16384)
-    per_surface_motion=INITIAL_SIMPLIFY_MM+FINAL_SIMPLIFY_MM+max(.00001,2/denominator)
-    maximum_expected_thickness=2*per_surface_motion
+    maximum_expected_thickness=maximum_seam_thickness_mm()
     claimed=md.Manifold();cleaned=[];records=[]
     for color,material in enumerate(materials):
         overlap_volume=0.;overlap_area=0.;effective_thickness=0.
@@ -267,16 +291,14 @@ def stabilize_serialized_materials(folder,parts):
         'roundtrip_intersection_effective_thickness_mm':[initial_thickness],
         'cutter_translation_mm':[0.,0.,0.]}
     print('Serialized seam audit',0,initial,'effective thickness',initial_thickness,flush=True)
-    maximum_thickness=2*(INITIAL_SIMPLIFY_MM+FINAL_SIMPLIFY_MM+
-        max(.00001,2/CFG.get('export_snap_denominator',16384)))
+    maximum_thickness=maximum_seam_thickness_mm()
+    report['maximum_seam_thickness_mm']=maximum_thickness
     # Volume accumulates along long seams. A seam thinner than the allowed
     # relative vertex motion cannot create a printable overlap, even when its
     # total volume exceeds the nozzle-volume threshold. Treat it as already
     # stable; repeated coincident-face subtraction can make it worse.
     if max(initial.values(),default=0.)<tolerance:return parts,report
     affected={i:[j for j in range(i) if initial.get(f'{j}-{i}',0.)>=tolerance] for i in range(4)}
-    maximum_thickness=2*(INITIAL_SIMPLIFY_MM+FINAL_SIMPLIFY_MM+
-        max(.00001,2/CFG.get('export_snap_denominator',16384)))
     failures=[]
     for offset in ((1e-5,7.31e-6,0.),(-1e-5,-7.31e-6,0.),(7.31e-6,-1e-5,0.)):
         trial=list(materials);trial_parts=dict(parts)
@@ -300,8 +322,7 @@ def stabilize_serialized_materials(folder,parts):
                 report['roundtrip_intersection_effective_thickness_mm'].append(thicknesses)
                 print('Serialized seam audit offset',offset,intersections,
                     'effective thickness',thicknesses,flush=True)
-                if (max(intersections.values(),default=0.)>=tolerance and
-                        not all(thickness<=maximum_thickness for thickness in thicknesses.values())):continue
+                if not serialized_seams_acceptable(intersections,thicknesses,tolerance,maximum_thickness):continue
                 report['accepted_by_thickness']=max(intersections.values(),default=0.)>=tolerance
             except (RuntimeError,AssertionError) as error:
                 failures.append(str(error))
@@ -315,8 +336,23 @@ def stabilize_serialized_materials(folder,parts):
             report['cutter_translation_mm']=list(offset)
             report['rejected_candidates']=failures
             return trial_parts,report
-    raise RuntimeError(f'Serialized seams could not be repaired below {tolerance:g} mm3; '
-        f'audits={history}; rejected candidates={failures}')
+    # Every cutter translation failed.  Subtracting a reconstructed coincident
+    # face can create slivers faster than the bounded export cleanup absorbs
+    # them, and that gets likelier as a tile carries more shared boundary.  The
+    # repair is an improvement, not a requirement: it is only fatal when the
+    # geometry already on disk is unacceptable.  Keep the untouched originals
+    # whenever they satisfy the same rule the packaged 3MF is validated by.
+    if serialized_seams_acceptable(initial,initial_thickness,tolerance,maximum_thickness):
+        report['accepted_by_thickness']=True
+        report['accepted_serialized_originals']=True
+        report['rejected_candidates']=failures
+        print('Serialized seam repair unavailable; kept the exported geometry, whose seams '
+            f'stay within {maximum_thickness:g} mm',flush=True)
+        return parts,report
+    raise RuntimeError(f'Serialized seams could not be repaired below {tolerance:g} mm3 or '
+        f'{maximum_thickness:g} mm effective thickness; audits={history}; '
+        f'effective thickness={report["roundtrip_intersection_effective_thickness_mm"]}; '
+        f'rejected candidates={failures}')
 
 def clip_to_tile(m,color):
     """Constrain explicit additions to the requested model footprint.

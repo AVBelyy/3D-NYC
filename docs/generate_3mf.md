@@ -118,12 +118,32 @@ sidewalk regions are made from solid shell layers rather than exposing sparse
 infill. Adjacent chunks must still use the shared print frame and terrain origin
 emitted by the chunk planner so their edge geometry agrees.
 
+Green ground comes from mapped park polygons and from the land-cover survey.
+The survey records bare soil wherever a field is worn, shaded, seasonal, or
+freshly graded, so a lawn arrives as vegetation stippled with unvegetated
+ground. Bare soil that is continuous with a mostly vegetated region is treated
+as the same field and prints green; ground that is predominantly unvegetated —
+a construction site, a dirt lot, a beach — stays ivory even where it abuts a
+lawn. This matters most outside mapped parks, where land cover is the only
+evidence the model has for green.
+
 Roads use printable ivory centerline ribbons: 0.5 mm for ordinary streets and
 0.625 mm for major roads. Physical roadbed width is retained as source metadata
 but does not widen the visible symbol. Outside parks, measured roadbeds and
 authoritative sidewalks form the tan street field; inside parks, road shoulders
 remain green. Park paths, plazas, and surface parking are tan, and categorical
 trails never become ivory roads.
+
+A surveyed transport structure is claimed by proximity, so every way on a
+viaduct matches the same deck polygon: the roadway, and the footway or cycleway
+OSM maps beside it. Each structure is attributed to the way it carries — a
+trail keeps a structure only where it runs further along it than any
+carriageway does — so a viaduct sidewalk yields the deck to the road it flanks
+while a genuine footbridge keeps its own. Every matched structure still
+supplies elevation evidence regardless of who claims its surface. Where decks
+still overlap, the carriageway color wins, matching the road-over-tan priority
+already applied at kerbs; bridge decks are therefore ranked by class rather
+than by OSM source order.
 
 LiDAR upper-surface heights define the varied canopy relief. The generator
 closes only narrow gaps in the canopy classification, smooths measured heights

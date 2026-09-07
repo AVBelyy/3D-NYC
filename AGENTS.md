@@ -54,6 +54,36 @@ Run commands from the repository root. Use Python 3.12 and install
 - Preserve the distinction between EPSG:2263 source geometry, metre-valued
   NAVD88 elevations, and millimetre-valued print geometry.
 
+## Fixing generation failures
+
+A generation failure always arrives as one chunk, one scale, and one seed, but
+it is never a fact about that chunk. Fix the rule, not the instance.
+
+- Diagnose the invariant the failing stage was defending and decide whether the
+  geometry actually violates it. Failures that surface only at map scale are
+  usually a threshold applied to the wrong measure, not corrupt data.
+- Prefer fixes derived from print physics and the pipeline's own numerical
+  bounds — nozzle width, layer height, simplify and export-grid motion — over
+  tuned constants. A constant chosen to clear one chunk will fail the next.
+- Keep a single definition of any bound that more than one stage tests, and
+  make every stage that judges the same quantity agree.
+- Never special-case a chunk id, bounding polygon, OSM id, plan, or borough,
+  and never widen a tolerance merely to get past one plate. Loosening a real
+  safety bound is a modeling decision, not a fix; say so and stop.
+- Repairs that only improve geometry must degrade to keeping the input when
+  they cannot run. Reserve hard failures for output that is actually
+  unacceptable, judged by the same rule the validator applies.
+- Cover the fix with a hermetic test that reproduces the failing measurements,
+  and confirm the symmetric case — a genuine defect of the same shape must
+  still be rejected. Reproducing on the original chunk is evidence, not proof.
+- Stage caching in `generate_3mf.py` keys on the config hash and the stage
+  `variant` only; it never hashes the code that produced the outputs. Changing
+  what a stage builds therefore requires bumping that stage's version constant,
+  or existing jobs silently reuse stale outputs and appear to ignore the fix.
+  Confirm a rerun really re-executed the stage — check the log for
+  `stage_started`, not `stage_skipped`, and look for a field the new code
+  writes — before concluding anything about whether a fix worked.
+
 ## Validation
 
 Run the smallest relevant tests while iterating, then run the full suite before

@@ -53,6 +53,9 @@ from road_symbols import TRAIL_HIGHWAYS
 
 
 PIPELINE_VERSION = 24
+DETAIL_PIPELINE_VERSION = 1
+FIELD_PIPELINE_VERSION = 2
+CROSSING_VALIDATION_VERSION = 1
 MESH_PIPELINE_VERSION = 19
 PACKAGE_PIPELINE_VERSION = 6
 VALIDATION_PIPELINE_VERSION = 4
@@ -1496,7 +1499,7 @@ class Pipeline:
             self.processed / "parks_structures.parquet",
             self.processed / "mta_subway_entrances.parquet",
         ], lambda: self.run_command("prepare_details", [str(python), str(SCRIPT_DIR / "prepare_details.py")]),
-            variant={"caches": {
+            variant={"detail_pipeline_version": DETAIL_PIPELINE_VERSION, "caches": {
                 name: self.cache_identity(name) for name in (
                     "nyc_parks_structures", "mta_subway_entrances_2024",
                 )
@@ -1505,13 +1508,15 @@ class Pipeline:
             "build_fields",
             [self.work / "map_fields.npz", self.work / "field_build_report.json"],
             lambda: self.build_fields(python),
-            variant={"details": "parks structures and subway entrances"},
+            variant={"field_pipeline_version": FIELD_PIPELINE_VERSION,
+                "details": "parks structures and subway entrances"},
         )
         self.stage("validate_crossing_fields", [self.work / "crossing_field_validation.json"],
             lambda: self.run_command("validate_crossing_fields", [
                 str(python), str(SCRIPT_DIR / "validate_bridge_surfaces.py"), "--fields-only",
                 "--report", str(self.work / "crossing_field_validation.json"),
-            ]), variant={"coverage": "tagged_bridges_and_surface_routes_over_tunnels"})
+            ]), variant={"crossing_validation_version": CROSSING_VALIDATION_VERSION,
+                "coverage": "tagged_bridges_and_surface_routes_over_tunnels"})
         mesh_variant = {"mesh_pipeline_version": MESH_PIPELINE_VERSION}
         self.stage("build_meshes", [self.work / "mesh/mesh_report.json"], lambda: self.run_command(
             "build_meshes", [str(python), str(SCRIPT_DIR / "build_map_meshes.py")]

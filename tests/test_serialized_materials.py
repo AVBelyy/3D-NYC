@@ -60,13 +60,49 @@ class SerializedMaterialTests(unittest.TestCase):
         self.assertFalse(list(self.folder.glob('.seam-*')))
 
     def test_failed_export_never_replaces_original_files(self):
+        # An unrepairable seam is only fatal when the geometry already on disk
+        # is unacceptable. Here it is a sub-micron seam the validator accepts,
+        # so every candidate failing must leave the originals in place and
+        # report the attempts rather than fail the build.
         parts = self.write_parts(1e-5)
         before = self.fingerprint()
         with patch.object(build, 'export', side_effect=RuntimeError('export rejected')):
-            with self.assertRaisesRegex(RuntimeError, 'export rejected'):
-                build.stabilize_serialized_materials(self.folder, parts)
+            kept, report = build.stabilize_serialized_materials(self.folder, parts)
+        self.assertEqual(kept, parts)
+        self.assertTrue(report['accepted_serialized_originals'])
+        self.assertEqual(report['cutter_translation_mm'], [0., 0., 0.])
+        self.assertEqual(len(report['rejected_candidates']), 3)
+        self.assertTrue(all('export rejected' in f for f in report['rejected_candidates']))
         self.assertEqual(before, self.fingerprint())
         self.assertFalse(list(self.folder.glob('.seam-*')))
+
+    def test_unrepairable_thick_seam_still_fails(self):
+        parts = self.write_parts(1.)
+        before = self.fingerprint()
+        with patch.object(build, 'export', side_effect=RuntimeError('export rejected')):
+            with self.assertRaisesRegex(RuntimeError, 'could not be repaired'):
+                build.stabilize_serialized_materials(self.folder, parts)
+        self.assertEqual(before, self.fingerprint())
+
+    def test_long_thin_seam_outranks_its_accumulated_volume(self):
+        # A coincident seam that follows every road and building edge of a
+        # dense tile covers thousands of mm2, so its volume passes the
+        # nozzle-volume threshold while staying far below one printed layer.
+        maximum = build.maximum_seam_thickness_mm()
+        self.assertTrue(build.serialized_seams_acceptable(
+            {'0-1': 2.06e-3, '0-3': 1.169}, {'0-1': 1.27e-6, '0-3': 2.83e-4}, .0768, maximum))
+        # The same volume spread over a genuinely thick collision is rejected.
+        self.assertFalse(build.serialized_seams_acceptable(
+            {'0-3': 1.169}, {'0-3': .5}, .0768, maximum))
+        # Below the volume threshold the validator's volume rule still applies.
+        self.assertTrue(build.serialized_seams_acceptable(
+            {'0-3': 1e-3}, {'0-3': .5}, .0768, maximum))
+
+    def test_seam_thickness_bound_matches_the_partition_report(self):
+        materials = [md.Manifold.cube([10, 10, 10]), md.Manifold(), md.Manifold(), md.Manifold()]
+        _, partition = build.partition_materials(materials)
+        self.assertEqual(partition['maximum_expected_overlap_thickness_mm'],
+                         build.maximum_seam_thickness_mm())
 
 
 if __name__ == '__main__':

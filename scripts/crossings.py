@@ -223,3 +223,26 @@ def tunnel_surface_masks(tunnel_mask, park_mask, bridge_mask, surface_route_mask
         raise ValueError("crossing masks must have matching shapes")
     protected=tunnel&(bridge|surface)
     return tunnel&park&~protected,protected
+
+
+def carried_structures(structures, way_geometry, carriageway_geometry, *, is_carriageway: bool):
+    """Select the surveyed transport structures one mapped bridge way may claim.
+
+    OSM maps a road viaduct's footway and cycleway as their own ``bridge=yes``
+    ways alongside the carriageway. Proximity alone therefore lets a few metres
+    of sidewalk adopt the entire surveyed deck of the road beside it and then
+    restyle it as a footpath. Attribute each structure to the way it actually
+    carries: a trail keeps a structure only where it runs further along that
+    structure than any carriageway does. A genuine footbridge still keeps its
+    own deck, while a viaduct sidewalk yields to the roadway it flanks.
+    """
+    geometries = [shapely.make_valid(geometry) for geometry in structures]
+    keep = np.ones(len(geometries), dtype=bool)
+    if is_carriageway or not geometries:
+        return keep
+    if carriageway_geometry is None or carriageway_geometry.is_empty:
+        return keep
+    for index, structure in enumerate(geometries):
+        carried = shapely.intersection(carriageway_geometry, structure).length
+        keep[index] = shapely.intersection(way_geometry, structure).length > carried
+    return keep

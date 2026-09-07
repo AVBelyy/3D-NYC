@@ -3,11 +3,12 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Polygon, box
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from crossings import (  # noqa: E402
+    carried_structures,
     constrain_deck_to_visible_surface,
     fit_linear_elevation_profile,
     minimum_crossing_floor_mm,
@@ -116,6 +117,64 @@ class PrintableCrossingTests(unittest.TestCase):
     def test_short_real_crossing_uses_two_nozzle_minimum(self):
         self.assertEqual(minimum_crossing_length_mm({"nozzle_mm": 0.4}), 0.8)
         self.assertEqual(minimum_crossing_length_mm({"nozzle_mm": 0.4, "minimum_crossing_length_mm": 1.2}), 1.2)
+
+
+class CarriedStructureTests(unittest.TestCase):
+    """Which surveyed transport structure belongs to which mapped bridge way.
+
+    The fixture is the Riverside Drive Viaduct shape: one long surveyed deck
+    carrying a roadway, with the sidewalks OSM maps as their own bridge ways
+    running along it.
+    """
+
+    VIADUCT = box(0, 0, 400, 80)
+    ROADWAY = LineString([(0, 40), (400, 40)])
+    SIDEWALK = LineString([(20, 74), (380, 74)])
+    CROSSING_STUB = LineString([(200, 6), (200, 74)])
+
+    def test_a_viaduct_sidewalk_yields_the_deck_to_the_roadway_it_flanks(self):
+        keep = carried_structures([self.VIADUCT], self.SIDEWALK, self.ROADWAY,
+                                  is_carriageway=False)
+        self.assertFalse(bool(keep[0]))
+
+    def test_a_short_crossing_stub_cannot_claim_the_whole_viaduct(self):
+        # 1097594161 in manhattan_2m_A5: 48 ft of footway claiming a 149,746
+        # square-foot deck, then repainting the Riverside Drive Viaduct tan.
+        keep = carried_structures([self.VIADUCT], self.CROSSING_STUB, self.ROADWAY,
+                                  is_carriageway=False)
+        self.assertFalse(bool(keep[0]))
+
+    def test_a_footbridge_keeps_the_structure_it_actually_carries(self):
+        # The symmetric case: a pedestrian span over a road. The carriageway
+        # only crosses this structure, so the footway still owns its own deck.
+        overpass_structure = box(190, 0, 210, 120)
+        overpass = LineString([(200, 0), (200, 120)])
+        road_beneath = LineString([(0, 60), (400, 60)])
+        keep = carried_structures([overpass_structure], overpass, road_beneath,
+                                  is_carriageway=False)
+        self.assertTrue(bool(keep[0]))
+
+    def test_a_carriageway_always_keeps_every_structure_it_matches(self):
+        keep = carried_structures([self.VIADUCT], self.CROSSING_STUB, self.ROADWAY,
+                                  is_carriageway=True)
+        self.assertTrue(bool(keep[0]))
+
+    def test_a_trail_keeps_its_deck_when_no_carriageway_bridge_exists(self):
+        for other in (None, Polygon()):
+            keep = carried_structures([self.VIADUCT], self.SIDEWALK, other,
+                                      is_carriageway=False)
+            self.assertTrue(bool(keep[0]))
+
+    def test_each_structure_is_judged_on_its_own(self):
+        own = box(420, 0, 440, 120)
+        keep = carried_structures([self.VIADUCT, own],
+                                  LineString([(20, 74), (430, 74)]),
+                                  self.ROADWAY, is_carriageway=False)
+        self.assertEqual(list(map(bool, keep)), [False, True])
+
+    def test_no_structures_selects_nothing(self):
+        self.assertEqual(len(carried_structures([], self.SIDEWALK, self.ROADWAY,
+                                                is_carriageway=False)), 0)
 
 
 if __name__ == "__main__":

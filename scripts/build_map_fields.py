@@ -14,10 +14,10 @@ from scipy.ndimage import distance_transform_edt,gaussian_filter,binary_dilation
 import mapbox_earcut
 from map_common import *
 from _canopy_relief import measured_canopy_relief
-from crossings import fit_linear_elevation_profile,minimum_crossing_length_mm,tunnel_surface_masks
+from crossings import carried_structures,fit_linear_elevation_profile,minimum_crossing_length_mm,tunnel_surface_masks
 from _material_layers import surface_color_depth_mm,white_substrate_top
-from road_symbols import TRAIL_HIGHWAYS,parse_tags,trail_width_mm
-from _surface_styles import apply_street_palette
+from road_symbols import TRAIL_HIGHWAYS,drawn_route_classification,parse_tags,trail_width_mm
+from _surface_styles import LAND_COVER_BARE_SOIL,apply_street_palette,paint_bridge_decks,paint_trail_ribbons,vegetated_ground_mask
 from terrain_relief import absolute_elevation_to_mm,choose_terrain_relief
 
 def burn(shapes,dtype='float32',fill=0):
@@ -56,16 +56,30 @@ def sample_raster_halo(name,padding_cells,resampling=Resampling.bilinear):
             dst_transform=halo_transform,dst_crs=2263,resampling=resampling,dst_nodata=np.nan)
     return out
 
+# Open space the city neither owns as a park nor resurveys often: institutional
+# lawns and quadrangles.  The 2017 land cover calls many of them impervious, and
+# they carry no planimetric PARK polygon, so without a semantic fallback they
+# reach the ivory grid default and print as blank slabs at ground level.
+GREEN_FALLBACK_LEISURE=['garden','dog_park','park']
+GREEN_FALLBACK_LANDUSE=['grass','recreation_ground']
+
+def tag_values(tags,key):
+    """Split one OSM tag into its semicolon-separated alternative values."""
+    value=tags.get(key)
+    return [part.strip() for part in value.split(';') if part.strip()] if isinstance(value,str) else []
+
 def recreation_material(tags):
     """Return the semantic material for an explicitly mapped recreation area."""
-    leisure=tags.get('leisure')
-    if leisure in ['playground','pitch','track']:return 1
+    for leisure in tag_values(tags,'leisure'):
+        if leisure in ['playground','pitch','track']:return 1
     return None
 
 def green_fallback_kind(tags):
     """Identify mapped green/open space that supplements stale land cover."""
-    if tags.get('leisure') in ['garden','dog_park']:return tags['leisure']
-    if tags.get('landuse')=='grass':return 'grass'
+    for leisure in tag_values(tags,'leisure'):
+        if leisure in GREEN_FALLBACK_LEISURE:return leisure
+    for landuse in tag_values(tags,'landuse'):
+        if landuse in GREEN_FALLBACK_LANDUSE:return landuse
     return None
 
 def is_surface_parking(tags):
@@ -139,7 +153,13 @@ def main():
         'method':'four-sigma padded sampling keeps adjacent shared-grid filters consistent'})
     parks=read('planimetrics_PARK');park_mask=burn([(g,1) for g in parks.geometry],dtype='uint8')>0
     material=np.zeros(SHAPE,np.uint8)
-    material[aoi_mask&(park_mask|np.isin(lc,[1,2]))]=1
+    # Classify on the padded sample so a field straddling the tile edge is
+    # judged on the same evidence in both neighbouring chunks.
+    green_ground=vegetated_ground_mask(lc_halo)[core]
+    material[aoi_mask&(park_mask|green_ground)]=1
+    report['inferences'].append({'kind':'bare_soil_in_vegetated_ground',
+        'cells':int((aoi_mask&green_ground&(lc==LAND_COVER_BARE_SOIL)).sum()),
+        'method':'unvegetated ground continuous with a mostly vegetated land-cover region is the same field'})
     top=ground.copy()
     # Most surface treatments are ground-relative and must retain their fixed
     # printable height. Bridges and stairs instead follow an absolute surveyed
@@ -232,13 +252,13 @@ def main():
     route_path=PROCESSED/'road_symbol_routes.parquet'
     routes=gpd.read_parquet(route_path) if route_path.exists() else gpd.GeoDataFrame()
     route_by_id={int(r.osm_id):r for _,r in routes.iterrows()}
-    paths=[];tunnels=[];bridges=[];stairs=[];ivory_motor_bridges=[]
+    paths=[];tunnels=[];bridges=[];stairs=[];ivory_motor_bridges=[];ivory_deck_records=[]
     bridge_surface_mask=np.zeros(SHAPE,dtype=bool)
     highway=osm[osm.highway.notna() & osm.geom_type.eq('LineString')]
     for _,r in highway.iterrows():
         tags=parse_tags(r.tags);is_tunnel=tags.get('tunnel') in ['yes','building_passage']
         semantic=route_by_id.get(int(r.osm_id))
-        classification=str(semantic.classification) if semantic is not None else ('trail' if r.highway in TRAIL_HIGHWAYS else 'other')
+        classification=drawn_route_classification(semantic,r.highway)
         ivory_eligible=bool(semantic.ivory_eligible) if semantic is not None else False
         if classification=='trail':
             width_mm=trail_width_mm(r.highway,tags,CFG)
@@ -266,7 +286,8 @@ def main():
         part=geom.intersection(AOI).difference(existing.buffer(.1/K))
         if part.length*K>.6:trail_add.append((part.buffer(CFG['minimum_path_width_mm']/2/K,quad_segs=4),1))
     pathmask=burn(paths+trail_add,dtype='uint8')>0
-    material[pathmask]=3;top[pathmask]=ground[pathmask]+mm_to_source(CFG['path_relief_mm'])
+    trail_report=paint_trail_ribbons(material,top,ground,trail_mask=pathmask,
+        road_mask=road_surface_mask,relief_source=mm_to_source(CFG['path_relief_mm']))
     transport=read('planimetrics_TRANSPORT_STRUCTURE')
 
     def endpoint_road_elevation(point):
@@ -297,22 +318,36 @@ def main():
             'portal_structure_count':int(len(portals)),
             'portal_roof_elevation_m':float(np.nanmedian(portal_z)) if len(portal_z) else np.nan})
 
+    # A surveyed structure is claimed by proximity, so every way on a viaduct
+    # matches the same deck polygon. Judge trail claims against the carriageway
+    # bridges that could be carried by the same structure.
+    carriageway_bridge_routes=routes[routes.ivory_eligible&routes.bridge] if len(routes) else routes
+    carriageway_bridge_geometry=(shapely.union_all(carriageway_bridge_routes.geometry.values)
+        if len(carriageway_bridge_routes) else Polygon())
+    deck_paint=[]
     for bridge in bridges:
         candidates=transport[transport.SUB_FEATURE_CODE.isin([230000,233000,235000]) & transport.intersects(bridge['geometry'].buffer(2/FT))]
+        # OSM bridge tagging can extend slightly beyond the surveyed
+        # transport-structure polygon. Include the complete printable road
+        # ribbon so neither approach loses its surface at a raster cell.
+        approach_ribbon=bridge['geometry'].buffer(bridge['width_mm']/2/K,quad_segs=4).intersection(AOI)
+        carried=carried_structures(candidates.geometry,bridge['geometry'],
+            carriageway_bridge_geometry,is_carriageway=bridge['ivory_eligible'])
         if len(candidates):
             # Selection uses intersection, so a matched city feature may extend
             # far beyond this tile (long bridge decks are the common case).
             # Rasterization clips implicitly, but deck_geometry is also consumed
             # later as an explicit 3-D solid and therefore must be clipped here.
             structure_shape=shapely.union_all(shapely.make_valid(candidates.geometry)).intersection(AOI)
-            # OSM bridge tagging can extend slightly beyond the surveyed
-            # transport-structure polygon. Include the complete printable road
-            # ribbon so neither approach loses its surface at a raster cell.
-            approach_ribbon=bridge['geometry'].buffer(bridge['width_mm']/2/K,quad_segs=4).intersection(AOI)
-            shape=structure_shape.union(approach_ribbon)
+            # Every structure the way runs on is elevation evidence, but only
+            # the ones it carries are its surface. A viaduct sidewalk sits at
+            # the measured deck height while the roadway keeps the deck itself.
+            claimed=(shapely.union_all(shapely.make_valid(candidates.geometry[carried])).intersection(AOI)
+                if carried.any() else Polygon())
+            shape=claimed.union(approach_ribbon)
             xyz=shapely.get_coordinates(candidates.geometry,include_z=True)
             measured=float(np.nanmedian(xyz[:,2])*FT)
-            support=bridge_spot_elev[bridge_spot_elev.intersects(shape.buffer(3/FT))]
+            support=bridge_spot_elev[bridge_spot_elev.intersects(structure_shape.union(approach_ribbon).buffer(3/FT))]
             if len(support)>=2:
                 profile=fit_linear_elevation_profile(bridge['geometry'],shapely.get_coordinates(support.geometry),
                     pd.to_numeric(support.ELEVATION,errors='coerce').to_numpy()*FT,measured,
@@ -322,7 +357,7 @@ def main():
                     'planimetric transport-structure polygon Z')
             method=profile.method
         else:
-            shape=bridge['geometry'].buffer(bridge['width_mm']/2/K,quad_segs=4)
+            shape=approach_ribbon
             samples=near_values(shape,ground);measured=float(np.percentile(samples,80)) if len(samples) else float(np.median(ground))
             profile=fit_linear_elevation_profile(bridge['geometry'],[],[],measured,'inferred from approach terrain')
             method='inferred from approach terrain'
@@ -335,19 +370,26 @@ def main():
         along=shapely.line_locate_point(bridge['geometry'],shapely.points(xx,yy),normalized=True)
         deck_source_values=np.interp(np.asarray(along,dtype=float),[0.,1.],[deck_start,deck_end])
         deck=float(np.median(deck_source_values));beneath=float(np.percentile(ground[mask],10))
-        top[rows,cols]=deck_source_values+mm_to_source(CFG['path_relief_mm'])
-        material[mask]=0 if bridge['ivory_eligible'] else 3
+        deck_paint.append({'rows':rows,'cols':cols,
+            'values':deck_source_values,'ivory':bridge['ivory_eligible']})
         absolute_terrain_surface_mask[mask]=True
         bridge.update({'deck_geometry':shape.wkt,'deck_elevation_m':deck,
             'deck_start_elevation_m':deck_start,'deck_end_elevation_m':deck_end,
             'deck_profile_samples':int(profile.samples),'deck_profile_rejected_outliers':int(profile.rejected_outliers),
             'beneath_elevation_m':beneath,'height_method':method,
             'transport_structure_subtypes':json.dumps(sorted(map(int,candidates.SUB_FEATURE_CODE.unique()))) if len(candidates) else '[]',
-            'approach_ribbon_included':bool(len(candidates))})
+            'carried_structure_count':int(carried.sum()),
+            'approach_ribbon_included':bool(carried.any())})
         if bridge['ivory_eligible']:
             ivory_motor_bridges.append({'osm_id':bridge['osm_id'],'name':bridge['name'],
-                'width_mm':bridge['width_mm'],'cells':int(mask.sum()),
+                'width_mm':bridge['width_mm'],'deck_cells':int(mask.sum()),
                 'method':'full measured bridge deck is ivory, matching the roadbed'})
+            ivory_deck_records.append((ivory_motor_bridges[-1],deck_paint[-1]))
+    deck_report=paint_bridge_decks(material,top,deck_paint,relief_source=mm_to_source(CFG['path_relief_mm']))
+    # Report the ivory a deck actually keeps, not the cells it asked for: a
+    # claim measured before the other decks are painted cannot detect a loss.
+    for record,entry in ivory_deck_records:
+        record['cells']=int((material[entry['rows'],entry['cols']]==0).sum())
     upper_tunnel_surface_mask=np.zeros(SHAPE,dtype=bool)
     for t in tunnels:
         mask=geom_mask(t['geometry'].buffer((t['width_mm']/2+.10)/K,quad_segs=4))
@@ -368,7 +410,8 @@ def main():
         'categorical_trails_eligible':hard_trail_eligible}
     report['layers']['paths']={'osm_path_segments':len(paths),'supplementary_trail_segments':len(trail_add),'stairs':len(stairs),
         'mapped_bridge_segments':len(bridges),'mapped_road_tunnels':len(tunnels),'roadbed_polygons':len(roadbed),
-        'ivory_motor_bridges':ivory_motor_bridges,
+        'ivory_motor_bridges':ivory_motor_bridges,'bridge_deck_painting':deck_report,
+        'trail_ribbon_painting':trail_report,
         'protected_surface_cells_over_tunnels':int(upper_tunnel_surface_mask.sum())}
     print('Paths and surface regions',flush=True)
     # Roof heights are absolute elevations, not ground-relative scalar heights.

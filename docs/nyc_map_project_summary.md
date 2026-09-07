@@ -15,7 +15,7 @@ substitute for a representative physical test.
 | Material | Modeled content |
 | --- | --- |
 | Ivory | Continuous substrate, road ribbons, default buildings, roof fixtures, and structural bridge roofs |
-| Green | Vegetated terrain, recreation areas, gardens, grass, smoothed measured canopy, and selected buildings |
+| Green | Vegetated terrain, recreation areas, parks, institutional lawns and commons, gardens, grass, smoothed measured canopy, and selected buildings |
 | Blue | Level water surfaces and selected buildings |
 | Tan | Sidewalks, paths, plazas, surface parking, and selected buildings |
 

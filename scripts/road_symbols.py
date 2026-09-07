@@ -273,6 +273,21 @@ def classify_highway(highway: str, tags: dict, support: float) -> tuple[str, str
     return "other", f"unsupported highway={highway}"
 
 
+def drawn_route_classification(semantic, highway) -> str:
+    """Return how the surface symbolizer draws one OSM way.
+
+    ``road_symbol_routes.parquet`` is the authority here: it records the
+    decision ``build_road_symbols`` made for every way the symbolizer
+    considered.  A way missing from it was never offered to the symbolizer, so
+    fall back to its categorical class.  ``other`` means the map deliberately
+    draws nothing for the way, and every stage that reasons about drawn routes
+    has to agree on that or it will judge features the model never claims.
+    """
+    if semantic is not None:
+        return str(semantic.classification)
+    return "trail" if str(highway or "").strip().lower() in TRAIL_HIGHWAYS else "other"
+
+
 def _polygon_parts(geometry) -> list:
     if geometry.is_empty:
         return []
