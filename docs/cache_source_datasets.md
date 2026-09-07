@@ -56,12 +56,6 @@ LiDAR cache builder and the resulting dataset directory as
 LiDAR options point at `nyc_lidar_2017` itself.
 
 For a cache-only offline generation run, cache all nine datasets in the table.
-The chunk planner requires complete, production-ready caches for building
-footprints, Planimetrics, parks trails and structures, land cover,
-OpenStreetMap, and 3D buildings, plus LiDAR coverage for the requested polygon
-and source padding. Its emitted offline generation commands also need the MTA
-entrance cache (or the corresponding raw CSV) even though MTA data is not used
-to choose seams.
 
 `data/cache/nyc_geosearch` is different: the generator fills it lazily with
 NYC Planning GeoSearch responses only for address-selected building colors, so

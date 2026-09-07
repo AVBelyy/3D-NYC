@@ -4,8 +4,7 @@
 
 3D NYC converts public NYC geospatial datasets into four-material,
 Bambu-compatible 3MF maps. `scripts/generate_3mf.py` is the supported
-single-model entry point. `scripts/plan_map_chunks.py` plans neighboring plates,
-and `scripts/validate_chunk_plan.py` validates those plans and generated seams.
+single-model entry point.
 
 Run commands from the repository root. Use Python 3.12 and install
 `scripts/requirements.txt` in `.venv`.
@@ -15,9 +14,8 @@ Run commands from the repository root. Use Python 3.12 and install
 - Keep the root `README.md` concise. It is a landing page with a short setup,
   representative commands, and links—not an exhaustive prerequisite, option,
   architecture, troubleshooting, or implementation reference.
-- Put generation details in `docs/generate_3mf.md`, cache procedures in
-  `docs/cache_source_datasets.md` or the LiDAR guide, chunk-planning details in
-  `docs/plan_map_chunks.md`, and durable design context in the project summary.
+- Put generation details in `docs/generate_3mf.md` and cache procedures in
+  `docs/cache_source_datasets.md`.
 - Update the relevant guide whenever behavior, defaults, paths, required data,
   output contracts, or CLI options change.
 - Verify example commands against current `--help` output and repository paths.

@@ -49,8 +49,7 @@ Because `output/` is ignored by Git, preserve the job directory with any model
 that is published as a release artifact.
 
 For exact commands and prerequisites, use the
-[generation guide](generate_3mf.md). For larger assemblies, use the
-[chunk-planning guide](plan_map_chunks.md).
+[generation guide](generate_3mf.md).
 
 ## Data and reproducibility
 

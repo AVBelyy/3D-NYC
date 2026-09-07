@@ -19,11 +19,6 @@ Generate one printable map:
 packaging, validation, and optional slicing. Use its `--help` output and the
 [generation guide](../docs/generate_3mf.md) for supported options.
 
-For a multi-plate polygon, `plan_map_chunks.py` writes a validated plan and
-exact generator commands under `output/plans/`. `validate_chunk_plan.py`
-rechecks a plan statically or audits generated neighbors. See the
-[chunk-planning guide](../docs/plan_map_chunks.md).
-
 ## Dataset scripts
 
 Durable dataset scripts follow this naming and destination convention:
