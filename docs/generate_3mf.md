@@ -37,6 +37,9 @@ An arbitrary WGS84 polygon uses WKT, inline GeoJSON, a path, or `@path`:
   --length-mm 250
 ```
 
+Use `scripts/plan_map_chunks.py` for a map that must be split across multiple
+build plates; see [the planner guide](plan_map_chunks.md).
+
 ## Data and output roots
 
 | Option | Default | Purpose |

@@ -57,6 +57,21 @@ Open the resulting 3MF in Bambu Studio, review the plate, and slice it. See the
 [generation guide](docs/generate_3mf.md) for scale, relief, colors, offline
 operation, and validation options.
 
+## Plan a wall-sized map
+
+Split a larger area into gap-free neighboring plates:
+
+```bash
+python scripts/plan_map_chunks.py \
+  --bounding-polygon @data/polygons/manhattan_island.geojson \
+  --scale 10533 \
+  --max-chunks 30
+```
+
+This writes a preview and the exact per-plate generation commands. Seams are
+routed over streets, water, and open ground, and never through a building or
+bridge. See the [planner guide](docs/plan_map_chunks.md).
+
 ## License and data
 
 The code is [MIT licensed](LICENSE). See [data sources and attribution](ATTRIBUTION.md)
