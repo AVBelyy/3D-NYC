@@ -48,15 +48,15 @@ from _datasets import DATASETS
 from download_data import MIN_FREE, ROOT, download
 from cache_common import read_tiled_geoparquet
 from crossings import structural_roof_thickness_mm
-from _material_layers import surface_color_depth_mm
+from _material_layers import DRAWN_LINE_RELIEF_MM, surface_color_depth_mm
 from road_symbols import TRAIL_HIGHWAYS
 
 
 PIPELINE_VERSION = 24
-DETAIL_PIPELINE_VERSION = 1
-FIELD_PIPELINE_VERSION = 2
+DETAIL_PIPELINE_VERSION = 2
+FIELD_PIPELINE_VERSION = 4
 CROSSING_VALIDATION_VERSION = 1
-MESH_PIPELINE_VERSION = 19
+MESH_PIPELINE_VERSION = 20
 PACKAGE_PIPELINE_VERSION = 6
 VALIDATION_PIPELINE_VERSION = 4
 SLICE_PIPELINE_VERSION = 2
@@ -2181,7 +2181,8 @@ def build_config(args) -> tuple[dict, str, Path]:
         "minimum_bridge_deck_thickness_mm": structural_roof,
         "maximum_bridge_clearance_mm": 1.40, "minimum_crossing_length_mm": 0.80,
         "ivory_carriageways": True,
-        "road_line_width_mm": 0.50, "major_road_line_width_mm": 0.625,
+        "road_line_width_mm": 0.875, "major_road_line_width_mm": 1.00,
+        "road_line_relief_mm": DRAWN_LINE_RELIEF_MM,
         "road_surface_match_tolerance_mm": 0.20,
         "road_width_percentile": 30.0,
         "road_width_sample_interval_m": 15.0, "road_maximum_physical_width_m": 60.0,

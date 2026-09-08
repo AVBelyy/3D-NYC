@@ -8,10 +8,44 @@ from scipy.ndimage import label,find_objects
 from map_common import *
 from crossings import (constrain_deck_to_visible_surface,minimum_crossing_length_mm,
     minimum_crossing_floor_mm,printable_tunnel_profile,structural_roof_thickness_mm)
+from _material_layers import drawn_line_relief_mm
 from mesh_precision import prepare_export_mesh
 from road_symbols import TRAIL_HIGHWAYS,trail_width_mm
 
-INITIAL_SIMPLIFY_MM=.006
+# Every road height this module builds -- a tunnel floor, a bridge deck, the
+# baseline of the route running under one -- is the top of a drawn road line,
+# not the pavement pad beside it. It has to be the height build_map_fields
+# painted that same line at, or a crossing is cut against a surface the visible
+# model never had.
+LINE_RELIEF_MM=drawn_line_relief_mm(CFG)
+
+class Phases:
+    """Record wall-clock per construction phase into the mesh report.
+
+    A chunk takes minutes and the phases differ by orders of magnitude, so
+    attributing a slowdown without timings is guesswork. Boolean cost tracks
+    the number of intersecting faces between operands, not their triangle
+    count, which is why a change that adds 4% triangles can move the total a
+    long way and a change that adds many more can be free.
+    """
+    def __init__(self):self.records={}
+    def __call__(self,name):
+        phases=self
+        class Scope:
+            def __enter__(self):self.t=time.monotonic();return self
+            def __exit__(self,*exc):
+                phases.records[name]=round(phases.records.get(name,0.)+time.monotonic()-self.t,3)
+                print('Phase',name,f'{phases.records[name]:.1f}s',flush=True)
+        return Scope()
+
+# Vertex motion allowed when each material solid is simplified. Every boolean
+# in the build costs by intersecting-face count, so this is the one constant
+# that moves the whole pipeline. It is not a free dial: two materials sharing a
+# wall are simplified independently, so raising it lets their two copies drift
+# further apart -- which is exactly the drift the partition passes then have to
+# repair. maximum_seam_thickness_mm() derives the repair bound from this value,
+# so the tolerance and the defect it admits stay in step.
+INITIAL_SIMPLIFY_MM=float(CFG.get('mesh_simplify_mm',.006))
 # Base rasters are simplified before crossing construction. Independently
 # simplifying colors again after CSG can pull a tunnel approach's shared road
 # seam apart, leaving an enclosed wedge. Preserve the constructed interfaces.
@@ -572,11 +606,11 @@ def underpasses(materials,fields,folder):
                     'length_mm':float(line.length),'minimum_length_mm':minimum_length});continue
             steps=max(12,int(line.length/.25));p0=line.interpolate(0);p1=line.interpolate(line.length)
             if np.isfinite(row.get('road_start_elevation_m',np.nan)):
-                floor0=to_z(float(row.road_start_elevation_m))+CFG['path_relief_mm']
-            else:floor0=ground_at(ground,p0.x,p0.y)+CFG['path_relief_mm']
+                floor0=to_z(float(row.road_start_elevation_m))+LINE_RELIEF_MM
+            else:floor0=ground_at(ground,p0.x,p0.y)+LINE_RELIEF_MM
             if np.isfinite(row.get('road_end_elevation_m',np.nan)):
-                floor1=to_z(float(row.road_end_elevation_m))+CFG['path_relief_mm']
-            else:floor1=ground_at(ground,p1.x,p1.y)+CFG['path_relief_mm']
+                floor1=to_z(float(row.road_end_elevation_m))+LINE_RELIEF_MM
+            else:floor1=ground_at(ground,p1.x,p1.y)+LINE_RELIEF_MM
             baseline_road=np.linspace(floor0,floor1,steps+1);ds=np.linspace(0,line.length,steps+1)
             surface=np.array([ground_at(ground,line.interpolate(d).x,line.interpolate(d).y,radius=.08) for d in ds])
             profile=printable_tunnel_profile(surface,baseline_road,
@@ -600,7 +634,7 @@ def underpasses(materials,fields,folder):
             e1,reach1=portal_extension(line,fields,False,row.width_mm)
             extended=LineString([e0,*list(line.coords),e1])
             ext_steps=max(12,int(extended.length/.25));ext_ds=np.linspace(0,extended.length,ext_steps+1)
-            ef0=ground_at(ground,*e0)+CFG['path_relief_mm'];ef1=ground_at(ground,*e1)+CFG['path_relief_mm']
+            ef0=ground_at(ground,*e0)+LINE_RELIEF_MM;ef1=ground_at(ground,*e1)+LINE_RELIEF_MM
             ext_road=np.interp(ext_ds,np.r_[0.,reach0+ds,extended.length],np.r_[ef0,road,ef1])
             floor_shape=strip_solid(extended,row.width_mm,np.full(len(ext_ds),base),ext_road,ext_steps)
             low=road+.005
@@ -716,7 +750,7 @@ def underpasses(materials,fields,folder):
                 report.append({'osm_id':int(row.osm_id),'status':'bridge deck retained: below printable opening length',
                     'length_mm':float(getattr(line,'length',0.))});continue
             water_part=shape.intersection(water_union)
-            deck=to_z(row.deck_elevation_m)+CFG['path_relief_mm'];lower=to_z(row.beneath_elevation_m)
+            deck=to_z(row.deck_elevation_m)+LINE_RELIEF_MM;lower=to_z(row.beneath_elevation_m)
             if water_part.area>=shape.area*.25:
                 # Water supplies an observed, level lower surface.  Preserve it
                 # below the separately measured bridge deck.
@@ -775,10 +809,10 @@ def underpasses(materials,fields,folder):
                     'lower_osm_id':lower_id});continue
             segment=max(parts,key=lambda part:part.length)
             steps=max(8,int(segment.length/.125));ds=np.linspace(0,segment.length,steps+1)
-            baseline=np.linspace(ground_at(ground,*segment.coords[0])+CFG['path_relief_mm'],
-                ground_at(ground,*segment.coords[-1])+CFG['path_relief_mm'],steps+1)
-            deck_start=to_z(float(row.get('deck_start_elevation_m',row.deck_elevation_m)))+CFG['path_relief_mm']
-            deck_end=to_z(float(row.get('deck_end_elevation_m',row.deck_elevation_m)))+CFG['path_relief_mm']
+            baseline=np.linspace(ground_at(ground,*segment.coords[0])+LINE_RELIEF_MM,
+                ground_at(ground,*segment.coords[-1])+LINE_RELIEF_MM,steps+1)
+            deck_start=to_z(float(row.get('deck_start_elevation_m',row.deck_elevation_m)))+LINE_RELIEF_MM
+            deck_end=to_z(float(row.get('deck_end_elevation_m',row.deck_elevation_m)))+LINE_RELIEF_MM
             surface=[]
             protected=[]
             visible_surface=[]
@@ -843,43 +877,60 @@ def main():
     p=argparse.ArgumentParser();p.add_argument('--stride',type=int,default=1);p.add_argument('--reuse-base',action='store_true');a=p.parse_args()
     folder=OUT/('mesh' if a.stride==1 else f'mesh_draft_{a.stride}');folder.mkdir(exist_ok=True)
     fields=np.load(OUT/'map_fields.npz');mats=[];report={'stride':a.stride,'parts':{}}
+    phase=Phases()
     if 'substrate_top_mm' not in fields:
         raise RuntimeError('Map fields lack the required continuous ivory substrate surface')
-    for i in range(4):
-        path=folder/f'material_{i}_base.ply'
-        if a.reuse_base and path.exists():m=solid(trimesh.load(path,process=False))
-        else:
-            m=material_solid(fields['height_mm'],fields['substrate_top_mm'],fields['material'],
-                fields['aoi_mask'],i,a.stride)
-            export(m,path)
-        mats.append(m)
-    mats,seating=seat_colored_surfaces(mats);report['surface_seating']=seating
-    mats,cuts=underpasses(mats,fields,folder);report['crossings']=cuts
+    with phase('material_solids'):
+        for i in range(4):
+            path=folder/f'material_{i}_base.ply'
+            if a.reuse_base and path.exists():m=solid(trimesh.load(path,process=False))
+            else:
+                m=material_solid(fields['height_mm'],fields['substrate_top_mm'],fields['material'],
+                    fields['aoi_mask'],i,a.stride)
+                export(m,path)
+            mats.append(m)
+    with phase('seat_colored_surfaces'):
+        mats,seating=seat_colored_surfaces(mats)
+    report['surface_seating']=seating
+    with phase('crossings'):
+        mats,cuts=underpasses(mats,fields,folder)
+    report['crossings']=cuts
     report['layer_support']=audit_layer_support(cuts,CFG['nozzle_mm'],CFG['layer_height_mm'])
     report['material_layers']={'substrate_material':0,'substrate_color':'ivory',
         'surface_color_depth_mm':float(CFG.get('surface_color_depth_mm',CFG.get('minimum_surface_color_depth_mm',.24)))}
-    mats,peaks=strengthen_top_peaks(mats,fields,folder);report['top_peak_reinforcements']=peaks
+    with phase('top_peaks'):
+        mats,peaks=strengthen_top_peaks(mats,fields,folder)
+    report['top_peak_reinforcements']=peaks
     report['measured_landmarks']=[]
-    for i,m in enumerate(mats):
-        m=clip_to_tile(m,i)
-        # Keep exact CSG interfaces through the 64-bit PLY/3MF path. Snapping
-        # and independently re-simplifying the colors here separates the two
-        # copies of an approach wall and can create enclosed seam wedges.
-        mats[i]=m
-    mats,partition=partition_materials(mats)
+    with phase('clip_to_tile'):
+        for i,m in enumerate(mats):
+            m=clip_to_tile(m,i)
+            # Keep exact CSG interfaces through the 64-bit PLY/3MF path. Snapping
+            # and independently re-simplifying the colors here separates the two
+            # copies of an approach wall and can create enclosed seam wedges.
+            mats[i]=m
+    with phase('partition'):
+        mats,partition=partition_materials(mats)
     # A Boolean difference can leave a micron-thin numerical skin when its
     # result is rebuilt as a new manifold. A second, non-simplifying pass
     # removes that residual before serialization; the strict 3MF validator
     # independently measures the packaged parts again.
     stabilization=[]
-    for _ in range(1):
-        mats,stabilized=partition_materials(mats);stabilization.append(stabilized)
+    with phase('partition_stabilization'):
+        for _ in range(1):
+            mats,stabilized=partition_materials(mats);stabilization.append(stabilized)
     partition['post_boolean_stabilization_passes']=stabilization
     report['material_partition']=partition
-    for i,m in enumerate(mats):
-        report['parts'][str(i)]=export(m,folder/f'material_{i}.ply')
-        print('Final',i,report['parts'][str(i)],flush=True)
-    report['parts'],report['serialized_material_partition']=stabilize_serialized_materials(folder,report['parts'])
+    with phase('export'):
+        for i,m in enumerate(mats):
+            report['parts'][str(i)]=export(m,folder/f'material_{i}.ply')
+            print('Final',i,report['parts'][str(i)],flush=True)
+    with phase('serialized_stabilization'):
+        report['parts'],report['serialized_material_partition']=stabilize_serialized_materials(folder,report['parts'])
+    report['phase_seconds']=phase.records
+    report['phase_seconds']['total']=round(sum(phase.records.values()),3)
+    report['triangles']={str(i):int(m.num_tri()) for i,m in enumerate(mats)}
+    print('Phase totals',json.dumps(report['phase_seconds']),flush=True)
     write_json(folder/'mesh_report.json',report)
 
 if __name__=='__main__':main()

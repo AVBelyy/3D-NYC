@@ -4,15 +4,18 @@ from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import shapely
 from shapely.geometry import LineString, box
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from crossings import minimum_crossing_length_mm  # noqa: E402
 from road_symbols import (  # noqa: E402
     TRAIL_HIGHWAYS,
     trail_width_mm,
     build_road_symbols,
     classify_highway,
+    draws_surface_ribbon,
     printable_road_width,
     sample_roadbed_widths_m,
 )
@@ -65,7 +68,14 @@ class RoadClassificationTests(unittest.TestCase):
         for major in [False, True]:
             width = printable_road_width(CFG, major).surface_mm
             self.assertAlmostEqual(width / 0.125, round(width / 0.125))
-            self.assertGreaterEqual(width, 0.45)
+            # A raised line's top has to carry two extrusions, not one bead.
+            self.assertGreaterEqual(width, 2 * CFG["nozzle_mm"])
+
+    def test_a_major_road_reads_wider_than_an_ordinary_one(self):
+        self.assertGreater(
+            printable_road_width(CFG, major=True).surface_mm,
+            printable_road_width(CFG, major=False).surface_mm,
+        )
 
     def test_road_ribbon_does_not_expand_to_physical_roadbed_width(self):
         small_scale = printable_road_width(CFG, physical_width_m=9.0, scale_denominator=50_000)
@@ -124,6 +134,66 @@ class RoadGeometryTests(unittest.TestCase):
         self.assertTrue(bool(routes.ivory_eligible.iloc[0]))
         self.assertGreater(roads.area.sum(), 0)
         self.assertTrue(roads.geometry.union_all().covers(osm.geometry.iloc[0]))
+
+    def test_two_streets_meeting_make_one_connected_crossroads(self):
+        # The reference maps draw a crossroads as one continuous raised line in
+        # each direction. A ribbon union that leaves the junction in separate
+        # pieces prints as two roads that stop short of each other.
+        osm = self.frame([
+            {"osm_id": 41, "highway": "secondary", "tags": '{"highway":"secondary","name":"Broad"}',
+             "geometry": LineString([(10, 50), (90, 50)])},
+            {"osm_id": 42, "highway": "residential", "tags": '{"highway":"residential","name":"Cross"}',
+             "geometry": LineString([(50, 10), (50, 90)])},
+        ])
+        _, roads, _ = build_road_symbols(osm, self.frame([]), self.aoi, self.scale, CFG)
+        union = roads.geometry.union_all()
+        self.assertEqual(len(list(shapely.get_parts(union))), 1)
+        for arm in [
+            LineString([(10, 50), (90, 50)]),
+            LineString([(50, 10), (50, 90)]),
+        ]:
+            self.assertTrue(union.covers(arm))
+
+    def test_a_bridge_too_short_to_open_still_gets_its_surface_ribbon(self):
+        # Nothing else draws it: build_map_fields refuses a deck below the
+        # smallest constructible opening, so without a ribbon the street has a
+        # hole where the map claims a continuous road.
+        minimum = minimum_crossing_length_mm(CFG)
+        short = minimum / 2 / (0.3048006096012192 * 1000 / self.scale)
+        tags = '{"highway":"residential","bridge":"yes","layer":"1"}'
+        osm = self.frame([
+            {"osm_id": 21, "highway": "residential", "tags": '{"highway":"residential"}',
+             "geometry": LineString([(10, 50), (50, 50)])},
+            {"osm_id": 22, "highway": "residential", "tags": tags,
+             "geometry": LineString([(50, 50), (50 + short, 50)])},
+            {"osm_id": 23, "highway": "residential", "tags": '{"highway":"residential"}',
+             "geometry": LineString([(50 + short, 50), (90, 50)])},
+        ])
+        routes, roads, report = build_road_symbols(osm, self.frame([]), self.aoi, self.scale, CFG)
+        self.assertTrue(routes.set_index("osm_id").surface_ribbon.all())
+        self.assertEqual(report["off_grade_routes_drawn_at_grade"], 1)
+        self.assertTrue(roads.geometry.union_all().covers(LineString([(10, 50), (90, 50)])))
+
+    def test_a_road_carrying_a_layer_tag_but_no_bridge_is_drawn_at_grade(self):
+        osm = self.frame([{
+            "osm_id": 31, "highway": "secondary",
+            "tags": '{"highway":"secondary","layer":"-1","name":"Underpass Approach"}',
+            "geometry": LineString([(10, 40), (90, 40)]),
+        }])
+        routes, roads, _ = build_road_symbols(osm, self.frame([]), self.aoi, self.scale, CFG)
+        self.assertEqual(routes.grade_key.iloc[0], "surface:-1")
+        self.assertTrue(bool(routes.surface_ribbon.iloc[0]))
+        self.assertTrue(roads.geometry.union_all().covers(osm.geometry.iloc[0]))
+
+    def test_a_tunnel_stays_buried_however_short_its_clipped_fragment(self):
+        # A plate boundary can cut a long tunnel down to a sliver. Surfacing it
+        # on length would put a road over the terrain in one plate and leave it
+        # buried in the neighbour sharing that seam.
+        for length_mm in [0.10, 40.0]:
+            with self.subTest(length_mm=length_mm):
+                self.assertFalse(draws_surface_ribbon(
+                    {"highway": "primary", "tunnel": "yes", "layer": "-1"},
+                    "carriageway", length_mm, CFG))
 
     def test_bridge_and_tunnel_do_not_leak_into_surface_polygons(self):
         osm = self.frame([

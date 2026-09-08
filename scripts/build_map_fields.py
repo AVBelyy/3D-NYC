@@ -15,9 +15,9 @@ import mapbox_earcut
 from map_common import *
 from _canopy_relief import measured_canopy_relief
 from crossings import carried_structures,fit_linear_elevation_profile,minimum_crossing_length_mm,tunnel_surface_masks
-from _material_layers import surface_color_depth_mm,white_substrate_top
-from road_symbols import TRAIL_HIGHWAYS,drawn_route_classification,parse_tags,trail_width_mm
-from _surface_styles import LAND_COVER_BARE_SOIL,apply_street_palette,paint_bridge_decks,paint_trail_ribbons,vegetated_ground_mask
+from _material_layers import drawn_line_relief_mm,surface_color_depth_mm,white_substrate_top
+from road_symbols import TRAIL_HIGHWAYS,constructs_bridge_deck,drawn_route_classification,parse_tags,trail_width_mm
+from _surface_styles import LAND_COVER_BARE_SOIL,apply_street_palette,paint_bridge_decks,paint_trail_ribbons,stair_tread_mask,vegetated_ground_mask
 from terrain_relief import absolute_elevation_to_mm,choose_terrain_relief
 
 def burn(shapes,dtype='float32',fill=0):
@@ -118,6 +118,10 @@ def main():
     vertical=CFG.get('vertical_exaggeration',1.)
     mm_to_source=lambda value:value*CFG['scale_denominator']/(1000*vertical)
     source_to_mm=lambda value:value*1000/CFG['scale_denominator']*vertical
+    # A pavement pad and a drawn line are different surfaces. Sidewalks, roadbeds,
+    # plazas and parking sit on the pad; carriageway and trail lines stand above it
+    # so a road reads as one continuous raised line through every junction.
+    pad_relief=float(CFG['path_relief_mm']);line_relief=drawn_line_relief_mm(CFG)
     report={'config':CFG,'bounds_epsg2263_ft':BOUNDS,'grid_shape':SHAPE,'layers':{},'inferences':[]}
     aoi_mask=geom_mask(AOI)
     if not aoi_mask.any():raise RuntimeError('Bounding polygon does not cover any manufacturing-grid cells')
@@ -239,13 +243,15 @@ def main():
     tan_pavement_mask=(tan_pavement_mask|osm_parking_fallback_mask|tan_roadbed_mask)&aoi_mask&~water_mask
     street_report=apply_street_palette(material,top,ground,
         sidewalk_mask=sidewalk_mask,tan_pavement_mask=tan_pavement_mask,
-        road_mask=road_surface_mask,relief_source=mm_to_source(CFG['path_relief_mm']))
+        road_mask=road_surface_mask,relief_source=mm_to_source(pad_relief),
+        line_relief_source=mm_to_source(line_relief))
     roadmask=roadbed_mask|road_surface_mask|sidewalk_mask|tan_pavement_mask
     report['layers']['street_palette']={**street_report,
         'roadbed_polygons':len(roadbed),'sidewalk_polygons':len(sidewalks),
         'ivory_ribbon_cells':int(road_surface_mask.sum()),
         'tan_roadbed_cells':int(tan_roadbed_mask.sum()),
-        'style':'fixed-width ivory road ribbons; tan urban roadbeds and sidewalks; green park shoulders'}
+        'pavement_relief_mm':pad_relief,'drawn_line_relief_mm':line_relief,
+        'style':'raised ivory road lines; tan urban roadbeds and sidewalks; green park shoulders'}
     report['layers']['osm_surface_parking']={'polygons':len(osm_parking),
         'fallback_cells':int(osm_parking_fallback_mask.sum()),
         'method':'tan open OSM parking only outside NYC Planimetrics paved coverage'}
@@ -274,7 +280,7 @@ def main():
         if classification=='trail':
             shape=geom.buffer(width_mm/2/K,quad_segs=4)
             paths.append((shape,1))
-        if tags.get('bridge') not in [None,'no'] and classification!='other' and geom.length*K>=minimum_crossing_length_mm(CFG):
+        if constructs_bridge_deck(tags,classification,geom.length*K,CFG):
             bridges.append({'geometry':geom,'osm_id':int(r.osm_id),'width_mm':width_mm,
                 'name':str(r['name']),'ivory_eligible':ivory_eligible,
                 'layer':str(tags.get('layer','1')),'bridge_tag':str(tags.get('bridge','yes'))})
@@ -287,7 +293,7 @@ def main():
         if part.length*K>.6:trail_add.append((part.buffer(CFG['minimum_path_width_mm']/2/K,quad_segs=4),1))
     pathmask=burn(paths+trail_add,dtype='uint8')>0
     trail_report=paint_trail_ribbons(material,top,ground,trail_mask=pathmask,
-        road_mask=road_surface_mask,relief_source=mm_to_source(CFG['path_relief_mm']))
+        road_mask=road_surface_mask,line_relief_source=mm_to_source(line_relief))
     transport=read('planimetrics_TRANSPORT_STRUCTURE')
 
     def endpoint_road_elevation(point):
@@ -385,7 +391,7 @@ def main():
                 'width_mm':bridge['width_mm'],'deck_cells':int(mask.sum()),
                 'method':'full measured bridge deck is ivory, matching the roadbed'})
             ivory_deck_records.append((ivory_motor_bridges[-1],deck_paint[-1]))
-    deck_report=paint_bridge_decks(material,top,deck_paint,relief_source=mm_to_source(CFG['path_relief_mm']))
+    deck_report=paint_bridge_decks(material,top,deck_paint,line_relief_source=mm_to_source(line_relief))
     # Report the ivory a deck actually keeps, not the cells it asked for: a
     # claim measured before the other decks are painted cannot detect a loss.
     for record,entry in ivory_deck_records:
@@ -406,7 +412,9 @@ def main():
     if hard_trail_eligible:raise RuntimeError('A hard trail class was assigned an ivory road surface')
     report['layers']['ivory_carriageways']={'cells':int(road_surface_mask.sum()),
         'roadbed_cells':int(roadbed_mask.sum()),'centerline_symbol_cells':int(symbol_road_mask.sum()),
-        'relief_above_surroundings_mm':0.,'style':'fixed-width ivory cartographic road ribbon',
+        'relief_above_surroundings_mm':line_relief-pad_relief,
+        'relief_above_ground_mm':line_relief,
+        'style':'fixed-width ivory cartographic road line raised above the pavement beside it',
         'categorical_trails_eligible':hard_trail_eligible}
     report['layers']['paths']={'osm_path_segments':len(paths),'supplementary_trail_segments':len(trail_add),'stairs':len(stairs),
         'mapped_bridge_segments':len(bridges),'mapped_road_tunnels':len(tunnels),'roadbed_polygons':len(roadbed),
@@ -539,7 +547,7 @@ def main():
     # towers remain part of the selected building's material rather than ivory.
     material[custom_building_mask]=building_material_grid[custom_building_mask]
     # Preserve the measured rise but quantize mapped stair runs to printable treads.
-    stair_records=[]
+    stair_records=[];stair_yielded=0
     for r in stairs:
         line=r['geometry']
         if line.geom_type!='LineString' or line.length*K<.9:continue
@@ -550,21 +558,29 @@ def main():
         if count<2:continue
         found=small_mask(line.buffer(r['width_mm']/2/K,quad_segs=3))
         if found is None:continue
-        sl,mask=found;mask&=~bmask[sl]&~(material[sl]==2)
+        sl,mask=found
+        mask,yielded=stair_tread_mask(mask,building_mask=bmask[sl],water_mask=material[sl]==2,
+            road_mask=road_surface_mask[sl],protected_transport_mask=protected_transport_surface[sl])
+        stair_yielded+=yielded
+        if not mask.any():continue
         rows,cols=np.where(mask);xx,yy=world_for_cells(rows+sl[0].start,cols+sl[1].start)
         t=shapely.line_locate_point(line,shapely.points(xx,yy),normalized=True)
-        stepped=z0+(z1-z0)*np.round(t*count)/count+mm_to_source(CFG['path_relief_mm'])
+        stepped=z0+(z1-z0)*np.round(t*count)/count+mm_to_source(line_relief)
         top[sl][mask]=stepped;material[sl][mask]=3
         absolute_window=absolute_terrain_surface_mask[sl];absolute_window[mask]=True
-        stair_records.append({'osm_id':r['osm_id'],'print_treads':count,'measured_rise_mm':rise_mm})
-    report['layers']['print_scaled_stairs']=stair_records
+        stair_records.append({'osm_id':r['osm_id'],'print_treads':count,'measured_rise_mm':rise_mm,
+            'tread_cells':int(mask.sum())})
+    report['layers']['print_scaled_stairs']={'runs':stair_records,
+        'tread_cells_yielded_to_roads_and_decks':stair_yielded,
+        'priority':'a stair tread yields to the drawn carriageway and to any mapped deck it would otherwise cut'}
     # Selected mapped wall/portal caps are strengthened to one printable line. No invented railings or ornament.
     wall_count=0
     for geom in read('planimetrics_RETAININGWALL').geometry:
         found=small_mask(geom.buffer(.20/K,quad_segs=2))
         if found is None:continue
         sl,mask=found;mask&=~bmask[sl]&~(material[sl]==2)
-        top[sl][mask]=ground[sl][mask]+mm_to_source(.20);material[sl][mask]=0;wall_count+=1
+        top[sl][mask]=np.maximum(top[sl][mask],ground[sl][mask]+mm_to_source(.20))
+        material[sl][mask]=0;wall_count+=1
     structures=read('planimetrics_TRANSPORT_STRUCTURE')
     portal_count=0
     for _,r in structures.iterrows():
@@ -572,7 +588,8 @@ def main():
         found=small_mask(r.geometry.buffer(.08/K,quad_segs=2))
         if found is None:continue
         sl,mask=found;mask&=~bmask[sl]&~(material[sl]==2)
-        top[sl][mask]=ground[sl][mask]+mm_to_source(.20);material[sl][mask]=0;portal_count+=1
+        top[sl][mask]=np.maximum(top[sl][mask],ground[sl][mask]+mm_to_source(.20))
+        material[sl][mask]=0;portal_count+=1
     report['layers']['wall_caps']=wall_count;report['layers']['portal_caps']=portal_count
     # Printable location markers for mapped subway entrances.  These are tiny
     # ivory caps on the local ground, not invented entrance architecture.
@@ -652,13 +669,15 @@ def main():
         minimum_terrain_mm=CFG['minimum_terrain_mm'])
     # Buildings, canopy, roads, wall caps and other surface treatments retain
     # their ground-relative height. Only surveyed bridge/stair elevations use
-    # the absolute terrain transform, with their print-only path lift restored.
+    # the absolute terrain transform, with their print-only line lift restored.
+    # Every cell it selects is a drawn line -- a bridge deck or a stair run --
+    # so the lift stripped here is the one those painters applied.
     z=gz+source_to_mm(top-ground)
     absolute_terrain_surface_mask&=aoi_mask&~bmask&np.isin(material,[0,3])
-    geographic_surface=top[absolute_terrain_surface_mask]-mm_to_source(CFG['path_relief_mm'])
+    geographic_surface=top[absolute_terrain_surface_mask]-mm_to_source(line_relief)
     z[absolute_terrain_surface_mask]=absolute_elevation_to_mm(geographic_surface,
         origin_m=origin,scale_denominator=CFG['scale_denominator'],vertical_exaggeration=vertical,
-        terrain_factor=terrain_relief.factor,minimum_terrain_mm=CFG['minimum_terrain_mm'])+CFG['path_relief_mm']
+        terrain_factor=terrain_relief.factor,minimum_terrain_mm=CFG['minimum_terrain_mm'])+line_relief
     if not np.isfinite(z[aoi_mask]).all() or z[aoi_mask].min()<=CFG['base_mm']:
         raise RuntimeError(
             f"Terrain origin {origin:g} m puts the model at or below its {CFG['base_mm']:g} mm base; "

@@ -127,12 +127,57 @@ a construction site, a dirt lot, a beach — stays ivory even where it abuts a
 lawn. This matters most outside mapped parks, where land cover is the only
 evidence the model has for green.
 
-Roads use printable ivory centerline ribbons: 0.5 mm for ordinary streets and
-0.625 mm for major roads. Physical roadbed width is retained as source metadata
-but does not widen the visible symbol. Outside parks, measured roadbeds and
+Roads and trails are drawn as raised lines rather than color painted onto the
+pavement. A carriageway line, a trail line on open ground, and the bridge deck
+that carries either across a crossing all stand `road_line_relief_mm` (0.48 mm)
+above the ground below them, while sidewalks, roadbeds, plazas, and surface
+parking stay on the `path_relief_mm` (0.16 mm) pavement pad. A line laid flush
+with that pad is separated from it by color alone, so every junction, marked
+crossing, and kerb overlap reads as a break in a road that is in fact
+continuous; the raised edge is what makes one street read as one line. The
+default height is two layers at the coarsest supported layer height, so the
+same symbol prints raised on every profile, and it is floored — never shrunk —
+at finer layer heights.
+
+Every trail is a drawn line, inside a measured street as much as across a park,
+so a street prints as three parallel raised lines — the tan footway along each
+block edge and the ivory carriageway between them — standing above the lower
+floor rather than as one flat field with a stripe painted down it.
+
+That relief has a build cost worth knowing about. `build_map_meshes` writes
+`phase_seconds` into its report, and on a dense tile the three whole-model seam
+repair passes (`partition`, `partition_stabilization`,
+`serialized_stabilization`) dominate it. They exist because each material solid
+is simplified independently, so the two copies of a wall two materials share
+drift apart and have to be reconciled. Raised lines multiply the length of that
+ivory/tan wall, and boolean cost tracks intersecting faces rather than triangle
+count. `mesh_simplify_mm` (default 0.006) exposes the simplification tolerance,
+but measurement says it is already near its optimum: loosening it to 0.020
+drifts the shared walls further and makes the repair passes slower overall,
+while tightening it to 0.002 is slower again and leaves less headroom than the
+derived seam bound allows.
+
+Ivory centerline ribbons are 0.875 mm wide for ordinary streets and 1.0 mm for
+major roads, both aligned to the manufacturing grid, with trails narrower at
+`minimum_path_width_mm`. A raised line needs two extrusions across its top
+rather than one wobbling bead, which sets the two-nozzle-width floor those
+widths clear. Physical roadbed width is retained as source metadata but does
+not widen the visible symbol. Outside parks, measured roadbeds and
 authoritative sidewalks form the tan street field; inside parks, road shoulders
 remain green. Park paths, plazas, and surface parking are tan, and categorical
 trails never become ivory roads.
+
+Every carriageway the map draws reaches the print through exactly one
+construction: a ribbon on the ground, a bridge deck long enough for a crossing
+to be opened under it, or a tunnel deliberately left invisible beneath the
+terrain above it. A way that qualifies for no deck and no tunnel — one
+carrying a layer tag but no bridge, or a bridge below the smallest
+constructible opening — is drawn at grade, because anything else leaves a hole
+in a street the map draws end to end. A tunnel keeps its hole in every case,
+because a tunnel clipped short by a plate boundary must not surface in one
+plate and stay buried in its neighbor. Where a trail meets a carriageway,
+the trail yields both its color and its height, so a marked crossing cannot
+notch the road line it reaches.
 
 A surveyed transport structure is claimed by proximity, so every way on a
 viaduct matches the same deck polygon: the roadway, and the footway or cycleway

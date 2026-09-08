@@ -24,6 +24,8 @@ import pandas as pd
 import shapely
 from shapely.geometry import LineString, Polygon
 
+from crossings import minimum_crossing_length_mm
+
 
 # These values are categorical exclusions.  They must never be promoted to an
 # ivory road, even when a trail is paved, named, or overlaps mapped pavement.
@@ -102,10 +104,13 @@ def printable_road_width(
     """
     grid = float(config.get("grid_step_mm", 0.125))
     nozzle = float(config.get("nozzle_mm", 0.4))
-    minimum = float(config.get("road_line_width_mm", max(nozzle * 1.25, grid * 4)))
+    # A drawn road is a raised line, so its top has to carry two extrusions
+    # rather than one wobbling bead: two nozzle widths is the smallest top the
+    # slicer can wall on both sides.
+    minimum = float(config.get("road_line_width_mm", max(nozzle * 2.0, grid * 4)))
     if major:
-        minimum = float(config.get("major_road_line_width_mm", max(minimum, grid * 5)))
-    return RoadWidth(surface_mm=_ceil_to(max(minimum, nozzle), grid))
+        minimum = float(config.get("major_road_line_width_mm", max(minimum + nozzle / 2, grid * 5)))
+    return RoadWidth(surface_mm=_ceil_to(max(minimum, nozzle * 2.0), grid))
 
 
 def _numeric_tag(value) -> float | None:
@@ -273,6 +278,45 @@ def classify_highway(highway: str, tags: dict, support: float) -> tuple[str, str
     return "other", f"unsupported highway={highway}"
 
 
+def constructs_bridge_deck(tags: dict, classification: str, length_mm: float, config: dict) -> bool:
+    """Return whether one way is drawn as its own bridge deck.
+
+    ``build_map_fields`` paints a deck and ``build_map_meshes`` opens the
+    crossing under it, and both refuse a way shorter than the smallest opening
+    worth constructing.  The surface symbolizer has to judge the same way by
+    the same rule, or a bridge neither stage builds is left out of every drawn
+    surface at once.
+    """
+    if classification == "other":
+        return False
+    return (
+        grade_key(tags).startswith("bridge:")
+        and float(length_mm) >= minimum_crossing_length_mm(config)
+    )
+
+
+def draws_surface_ribbon(tags: dict, classification: str, length_mm: float, config: dict) -> bool:
+    """Return whether one carriageway is drawn as a flat ribbon on the ground.
+
+    Every carriageway the map draws has to reach the print through exactly one
+    construction: a ground ribbon, a bridge deck, or a tunnel that is
+    deliberately invisible under the terrain above it.  Selecting the ribbon on
+    ``surface:0`` alone silently drops the ways that match none of them -- a
+    road carrying a layer tag but no bridge, and a bridge too short for a
+    crossing to be built under it -- and each dropped way is a hole in a street
+    the map otherwise draws end to end.
+
+    A tunnel keeps its hole: the surface above a buried road is terrain, and a
+    tunnel clipped short by a plate boundary must not surface in one plate and
+    stay buried in its neighbour.
+    """
+    if classification != "carriageway":
+        return False
+    if grade_key(tags).startswith("tunnel:"):
+        return False
+    return not constructs_bridge_deck(tags, classification, length_mm, config)
+
+
 def drawn_route_classification(semantic, highway) -> str:
     """Return how the surface symbolizer draws one OSM way.
 
@@ -341,6 +385,9 @@ def build_road_symbols(
             "ivory_eligible": bool(eligible), "grade_key": grade,
             "bridge": grade.startswith("bridge:"), "tunnel": grade.startswith("tunnel:"),
             "surface_support_ratio": support,
+            "length_mm": float(geometry.length * k),
+            "surface_ribbon": draws_surface_ribbon(
+                tags, classification, geometry.length * k, config),
             "_tags": tags, "_major": highway in MAJOR_CARRIAGEWAYS,
             "geometry": geometry,
         }
@@ -391,7 +438,7 @@ def build_road_symbols(
 
     eligible_buffers = []
     for record in rows:
-        if record["ivory_eligible"] and record["grade_key"] == "surface:0":
+        if record["surface_ribbon"]:
             eligible_buffers.append(record["geometry"].buffer(record["surface_width_mm"] / (2 * k), quad_segs=6))
         record.pop("_tags", None)
         record.pop("_major", None)
@@ -420,7 +467,9 @@ def build_road_symbols(
         "candidate_routes": int(len(routes)),
         "eligible_routes": int(len(eligible_routes)),
         "categorical_trails_eligible": int(len(forbidden_eligible)),
-        "surface_eligible_routes": int(sum(bool(r["ivory_eligible"]) and r["grade_key"] == "surface:0" for r in rows)),
+        "surface_eligible_routes": int(sum(bool(r["surface_ribbon"]) for r in rows)),
+        "off_grade_routes_drawn_at_grade": int(sum(
+            bool(r["surface_ribbon"]) and r["grade_key"] != "surface:0" for r in rows)),
         "surface_polygons": len(surfaces),
         "surface_area_mm2": float(surfaces.area.sum() * k * k) if len(surfaces) else 0.0,
         "minimum_print_widths_mm": {
@@ -429,7 +478,12 @@ def build_road_symbols(
         },
         "estimated_physical_width_m_range": [float(estimated_widths.min()), float(estimated_widths.max())] if len(estimated_widths) else None,
         "surface_match_tolerance_mm": float(config.get("road_surface_match_tolerance_mm", 0.20)),
-        "height_relationship": "ivory road ribbon is flush with its surrounding road surface",
+        "minimum_crossing_length_mm": minimum_crossing_length_mm(config),
+        "height_relationship": "ivory road ribbon is a raised line above its surrounding road surface",
+        "continuity_policy": (
+            "every carriageway is drawn once: a ground ribbon, a bridge deck long "
+            "enough to open a crossing under, or an invisible tunnel"
+        ),
         "trail_policy": "footway/path/steps/bridleway/cycleway/track and Parks trails are tan-only",
     }
     return routes, surfaces, report
