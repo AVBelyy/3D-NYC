@@ -86,7 +86,9 @@ BIN, DoITT ID, and BBL selectors do not use GeoSearch.
 - `--layer-height` selects an installed P2S process layer height. The pavement
   pad is rounded up to a whole number of layers for the chosen height, so a
   kerb slices identically along its whole length instead of appearing only on
-  the layers whose z-plane happens to fall above the ground beside it.
+  the layers whose z-plane happens to fall above the ground beside it. Every
+  visible surface is placed on the same layer planes for the same reason; see
+  [printable surfaces](#printable-surfaces).
 - `--foundation-color` chooses the filament for the hidden substrate.
 - `--building-colors` assigns selected buildings to the four existing
   material colors using JSON identifiers.
@@ -208,6 +210,35 @@ supplies elevation evidence regardless of who claims its surface. Where decks
 still overlap, the carriageway color wins, matching the road-over-tan priority
 already applied at kerbs; bridge decks are therefore ranked by class rather
 than by OSM source order.
+
+## Printable surfaces
+
+The printer can only put a surface on a layer plane. Every relief the map draws
+is already a whole number of layers -- the surface colour depth, the pavement
+pad, the drawn road line -- but the terrain they stand on is a measured
+elevation field, and the slicer decides each cell's level on its own by
+comparing a float height against the nearest plane.
+
+Where the ground is flatter than one layer that decision is noise rather than
+relief. A car park level to 0.04 mm whose height lands on a slicing plane is
+torn into two levels in a random speckle, and a carriageway ribbon under a
+millimetre wide is split down its length by a cross-fall no layer can show.
+Both read as missing material on the plate, because there is no relief there to
+read as relief.
+
+`build_map_fields` therefore places the ground and every visible surface on the
+slicer's layer planes, and partitions them into the largest regions that rise
+less than one layer end to end, printing each region at a single plane. The
+partition grows from the smallest height differences outward, so a region stops
+exactly where a layer of measured relief appears: a kerb standing one layer and
+a carriageway standing three are never absorbed, and a hillside becomes the
+contour bands its own relief defines. No surface moves a whole layer from where
+it was measured.
+
+The first layer sets the phase of every plane above it, so the meshes and the
+packaged process profile share one `first_layer_height_mm`; they cannot be
+chosen independently. `field_build_report.json` records the shifts this applied
+under `printable_surfaces`.
 
 LiDAR upper-surface heights define the varied canopy relief. The generator
 closes only narrow gaps in the canopy classification, smooths measured heights

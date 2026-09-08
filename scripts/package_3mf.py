@@ -9,6 +9,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 import numpy as np,trimesh
 from lxml import etree
+from _material_layers import FIRST_LAYER_HEIGHT_MM
 from map_common import *
 
 CORE='http://schemas.microsoft.com/3dmanufacturing/core/2015/02'
@@ -115,7 +116,10 @@ def settings(template,profiles):
             f'({", ".join(IRONING_TYPES)}); an unrecognized value is silently replaced by its default')
     d.update({'print_settings_id':f'NYC map - {CFG["layer_height_mm"]:g}mm detail @BBL P2S',
         'printer_settings_id':'Bambu Lab P2S 0.4 nozzle','printer_model':'Bambu Lab P2S','printer_variant':'0.4',
-        'layer_height':str(CFG['layer_height_mm']),'initial_layer_print_height':'0.2',
+        'layer_height':str(CFG['layer_height_mm']),
+        # The mesh was quantized onto the planes this height sets the phase of,
+        # so the two cannot be chosen independently.
+        'initial_layer_print_height':f'{CFG.get("first_layer_height_mm",FIRST_LAYER_HEIGHT_MM):g}',
         'filament_colour':CFG['colors'],'filament_type':['PLA']*4,
         'filament_settings_id':['Bambu PLA Matte @BBL P2S']*4,
         'wall_generator':CFG['wall_generator'],'detect_thin_wall':'1','wall_loops':str(CFG.get('wall_loops',2)),

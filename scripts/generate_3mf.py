@@ -49,16 +49,17 @@ from download_data import MIN_FREE, ROOT, download
 from cache_common import read_tiled_geoparquet
 from crossings import structural_roof_thickness_mm
 from _material_layers import (
-    DRAWN_LINE_RELIEF_MM, MATERIAL_NAMES, pavement_pad_relief_mm, surface_color_depth_mm)
+    DRAWN_LINE_RELIEF_MM, FIRST_LAYER_HEIGHT_MM, MATERIAL_NAMES, pavement_pad_relief_mm,
+    surface_color_depth_mm)
 from road_symbols import TRAIL_HIGHWAYS
 
 
-PIPELINE_VERSION = 24
+PIPELINE_VERSION = 25
 DETAIL_PIPELINE_VERSION = 2
-FIELD_PIPELINE_VERSION = 5
+FIELD_PIPELINE_VERSION = 6
 CROSSING_VALIDATION_VERSION = 1
-MESH_PIPELINE_VERSION = 21
-PACKAGE_PIPELINE_VERSION = 8
+MESH_PIPELINE_VERSION = 22
+PACKAGE_PIPELINE_VERSION = 9
 VALIDATION_PIPELINE_VERSION = 4
 SLICE_PIPELINE_VERSION = 2
 FT = 0.3048006096012192
@@ -2212,6 +2213,9 @@ def build_config(args) -> tuple[dict, str, Path]:
         "building_color_overrides": args.building_colors,
         "plate_translation_mm": translation, "nozzle_mm": 0.4, "wall_generator": "arachne",
         "layer_height_mm": args.layer_height, "process_preset": PROCESS_PRESETS[args.layer_height],
+        # The first layer sets the phase of every slicing plane above it, so the
+        # meshes are quantized against it and the sliced profile must repeat it.
+        "first_layer_height_mm": FIRST_LAYER_HEIGHT_MM,
         "wall_loops": 2, "infill_percent": 15, "bottom_shell_layers": 3,
         "ironing_type": "top", "top_surface_line_width_mm": 0.42,
         "top_shell_layers": 4, "brim_width_mm": brim_width, "brim_gap_mm": MODEL_BRIM_GAP_MM,

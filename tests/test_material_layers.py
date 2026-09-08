@@ -5,8 +5,9 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
-from _material_layers import (COARSEST_LAYER_HEIGHT_MM,DRAWN_LINE_RELIEF_MM,MATERIAL_NAMES,
-    drawn_line_relief_mm,pavement_pad_relief_mm,surface_color_depth_mm,white_substrate_top)
+from _material_layers import (COARSEST_LAYER_HEIGHT_MM,DRAWN_LINE_RELIEF_MM,
+    FIRST_LAYER_HEIGHT_MM,MATERIAL_NAMES,drawn_line_relief_mm,pavement_pad_relief_mm,
+    printable_surface_mm,surface_color_depth_mm,white_substrate_top)
 from build_map_meshes import material_solid
 from _surface_styles import apply_street_palette,paint_bridge_decks,paint_trail_ribbons,stair_tread_mask
 
@@ -396,3 +397,88 @@ class IroningSettingTests(unittest.TestCase):
 
 
 if __name__=='__main__':unittest.main()
+
+
+class PrintableSurfaceTest(unittest.TestCase):
+    """A printed surface exists only at a layer plane, and a step needs relief behind it."""
+
+    LAYER = 0.16
+    FIRST = 0.2
+
+    def quantize(self, surface, mask=None):
+        surface = np.asarray(surface, dtype=float)
+        if mask is None:
+            mask = np.ones(surface.shape, dtype=bool)
+        return printable_surface_mm(surface, mask, layer_height_mm=self.LAYER,
+                                    first_layer_height_mm=self.FIRST)
+
+    def levels(self, surface):
+        return np.rint((np.asarray(surface) - self.FIRST) / self.LAYER).astype(int)
+
+    def test_every_surface_lands_on_a_slicing_plane(self):
+        rng = np.random.default_rng(7)
+        surface = 3.0 + rng.uniform(0.0, 4.0, (30, 30))
+        result = self.quantize(surface)
+        offset = (result - self.FIRST) / self.LAYER
+        np.testing.assert_allclose(offset, np.rint(offset), atol=1e-9)
+
+    def test_ground_flatter_than_a_layer_prints_at_one_level(self):
+        # The manhattan_2m_A1 car park: level to 0.04 mm, sitting on the plane
+        # at 3.96 mm, so rounding tore it into two levels in a random speckle.
+        rng = np.random.default_rng(0)
+        surface = 3.96 + rng.uniform(-0.02, 0.02, (48, 48))
+        self.assertEqual(len(np.unique(self.levels(surface))), 2)
+        self.assertEqual(len(np.unique(self.levels(self.quantize(surface)))), 1)
+
+    def test_no_surface_moves_a_whole_layer(self):
+        rng = np.random.default_rng(3)
+        surface = 3.0 + rng.uniform(0.0, 5.0, (40, 40))
+        moved = np.abs(self.quantize(surface) - surface)
+        self.assertLess(moved.max(), self.LAYER)
+
+    def test_a_hillside_keeps_the_relief_it_has(self):
+        rows = np.arange(64)[:, None] * np.ones((1, 64))
+        surface = 3.0 + rows * 0.125 * 0.5
+        before = len(np.unique(self.levels(surface)))
+        after = len(np.unique(self.levels(self.quantize(surface))))
+        self.assertGreaterEqual(after, before - 4)
+        self.assertGreater(after, 15)
+
+    def test_a_one_layer_kerb_survives(self):
+        surface = np.full((32, 32), 3.96)
+        surface[:, 16:] += self.LAYER
+        result = self.quantize(surface)
+        self.assertEqual(len(np.unique(self.levels(result))), 2)
+        np.testing.assert_allclose(result[:, 16:] - result[:, :16], self.LAYER, atol=1e-9)
+
+    def test_a_carriageway_ribbon_keeps_its_three_layer_lift(self):
+        # 0.875 mm of ivory ribbon, the width printable_road_width settles on.
+        surface = np.full((32, 32), 3.96)
+        surface[:, 12:19] += 3 * self.LAYER
+        result = self.quantize(surface)
+        np.testing.assert_allclose(result[:, 12:19] - result[:, :1], 3 * self.LAYER, atol=1e-9)
+
+    def test_a_ribbon_with_a_sub_layer_cross_fall_stops_splitting(self):
+        # The measured defect on the printed plate: a cross-fall far under one
+        # layer split the ribbon down its length into two printed levels.
+        surface = np.full((40, 40), 3.96)
+        surface[:, 12:19] += 3 * self.LAYER + np.linspace(-0.03, 0.03, 7)
+        self.assertGreater(len(np.unique(self.levels(surface[:, 12:19]))), 1)
+        result = self.quantize(surface)
+        self.assertEqual(len(np.unique(self.levels(result[:, 12:19]))), 1)
+
+    def test_masked_cells_are_left_untouched(self):
+        surface = np.full((16, 16), 3.9137)
+        mask = np.zeros(surface.shape, dtype=bool)
+        mask[4:12, 4:12] = True
+        result = self.quantize(surface, mask)
+        np.testing.assert_allclose(result[~mask], surface[~mask])
+
+    def test_a_non_finite_surface_inside_the_mask_is_rejected(self):
+        surface = np.full((8, 8), 3.9)
+        surface[2, 2] = np.nan
+        with self.assertRaises(ValueError):
+            self.quantize(surface)
+
+    def test_the_first_layer_height_matches_the_packaged_profile(self):
+        self.assertEqual(FIRST_LAYER_HEIGHT_MM, 0.2)

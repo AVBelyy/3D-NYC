@@ -15,8 +15,8 @@ import mapbox_earcut
 from map_common import *
 from _canopy_relief import measured_canopy_relief
 from crossings import carried_structures,fit_linear_elevation_profile,minimum_crossing_length_mm,tunnel_surface_masks
-from _material_layers import (MATERIAL_NAMES,drawn_line_relief_mm,surface_color_depth_mm,
-    white_substrate_top)
+from _material_layers import (FIRST_LAYER_HEIGHT_MM,MATERIAL_NAMES,drawn_line_relief_mm,
+    printable_surface_mm,surface_color_depth_mm,white_substrate_top)
 from road_symbols import TRAIL_HIGHWAYS,constructs_bridge_deck,drawn_route_classification,parse_tags,trail_width_mm
 from _surface_styles import LAND_COVER_BARE_SOIL,apply_street_palette,paint_bridge_decks,paint_trail_ribbons,stair_tread_mask,vegetated_ground_mask
 from terrain_relief import absolute_elevation_to_mm,choose_terrain_relief
@@ -679,6 +679,30 @@ def main():
     z[absolute_terrain_surface_mask]=absolute_elevation_to_mm(geographic_surface,
         origin_m=origin,scale_denominator=CFG['scale_denominator'],vertical_exaggeration=vertical,
         terrain_factor=terrain_relief.factor,minimum_terrain_mm=CFG['minimum_terrain_mm'])+line_relief
+    # Every visible surface is now placed on the slicer's own layer planes, and
+    # any step rounding invented across ground flatter than a layer is settled.
+    # This is the last point at which the map's surfaces are all in one array,
+    # and it has to run before the substrate is seated beneath them, so the
+    # skin the substrate carries keeps its exact colour depth.
+    first_layer=float(CFG.get('first_layer_height_mm',FIRST_LAYER_HEIGHT_MM))
+    settled_ground=printable_surface_mm(gz,aoi_mask,layer_height_mm=CFG['layer_height_mm'],
+        first_layer_height_mm=first_layer)
+    settled_surface=printable_surface_mm(z,aoi_mask,layer_height_mm=CFG['layer_height_mm'],
+        first_layer_height_mm=first_layer)
+    # Ground and visible surface are quantized against their own neighbourhoods,
+    # so on ground the map draws nothing on they can settle onto different
+    # planes. Only an inversion the quantization introduced is corrected; where
+    # the source already put the surface below the ground it is left alone.
+    inverted=aoi_mask&(gz<=z)&(settled_ground>settled_surface)
+    settled_ground[inverted]=settled_surface[inverted]
+    report['printable_surfaces']={
+        'first_layer_height_mm':first_layer,'layer_height_mm':float(CFG['layer_height_mm']),
+        'maximum_ground_shift_mm':float(np.abs(settled_ground-gz)[aoi_mask].max()),
+        'maximum_surface_shift_mm':float(np.abs(settled_surface-z)[aoi_mask].max()),
+        'mean_surface_shift_mm':float(np.abs(settled_surface-z)[aoi_mask].mean()),
+        'inverted_cells_corrected':int(inverted.sum()),
+        'rule':'visible surfaces are placed on layer planes; a step is kept only where a region rises a whole layer'}
+    gz,z=settled_ground,settled_surface
     if not np.isfinite(z[aoi_mask]).all() or z[aoi_mask].min()<=CFG['base_mm']:
         raise RuntimeError(
             f"Terrain origin {origin:g} m puts the model at or below its {CFG['base_mm']:g} mm base; "
