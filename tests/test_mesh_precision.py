@@ -6,7 +6,10 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from mesh_precision import prepare_export_mesh,repair_export_vertices,seam_nudge_axis,seam_nudge_distance
+import trimesh
+
+from mesh_precision import (prepare_export_mesh,repair_export_vertices,seam_nudge_axis,
+    seam_nudge_distance,weld_microscopic_faces)
 
 
 class MeshPrecisionTests(unittest.TestCase):
@@ -41,7 +44,38 @@ class MeshPrecisionTests(unittest.TestCase):
         with patch('mesh_precision.repair_export_vertices',side_effect=RuntimeError('blocked repair')) as repair:
             with self.assertRaisesRegex(RuntimeError,'blocked repair'):
                 prepare_export_mesh(source,0.)
+        # Three simplify tolerances reach repair.  The weld candidates find
+        # no coincident cluster in this solid, so they stop before repair.
         self.assertEqual(repair.call_count,3)
+
+    def test_submicron_film_sliver_is_collapsed_rather_than_widened(self):
+        # A degenerate triangle whose vertices sit half a nanometre apart
+        # inside a film a micron thick cannot be grown to 1e-12 mm2 without
+        # inverting the film, so the export must weld it away instead.
+        vertices=np.array([[0.,0.,1.8],[3e-6,0.,1.8],[0.,3e-6,1.8],
+            [1e-6,1e-6,1.8000011],[1.00039e-6,0.99970e-6,1.8000011],
+            [1.00004e-6,1.00004e-6,1.8000011]])
+        faces=np.array([[0,2,1],[3,4,5],[0,1,3],[1,4,3],[1,2,4],[2,5,4],[2,0,5],[0,3,5]])
+        welded_vertices,welded_faces,welded=weld_microscopic_faces(vertices,faces,1.8)
+        self.assertEqual(welded,2)
+        self.assertEqual(len(welded_vertices),4)
+        mesh=trimesh.Trimesh(welded_vertices,welded_faces,process=False)
+        self.assertTrue(mesh.is_watertight and mesh.is_winding_consistent)
+        self.assertGreater(mesh.volume,0)
+        self.assert_valid_areas(welded_vertices,welded_faces)
+
+    def test_weld_keeps_base_contact_and_leaves_sound_meshes_alone(self):
+        # A cluster straddling the base plane stays exactly on it.
+        vertices=np.array([[0.,0.,1.8],[1.,0.,1.8],[0.,1.,1.8],
+            [1e-10,1e-10,1.8+4e-10],[2e-10,0.,1.8-3e-10],[0.,2e-10,1.8+1e-10]])
+        faces=np.array([[3,4,5],[0,1,2]])
+        welded_vertices,_,welded=weld_microscopic_faces(vertices,faces,1.8)
+        self.assertEqual(welded,2)
+        self.assertTrue(np.all(welded_vertices[:,2]==1.8))
+        sound=np.array([[0.,0.,1.8],[1.,0.,1.8],[0.,1.,1.8]])
+        unchanged,faces,welded=weld_microscopic_faces(sound,np.array([[0,1,2]]),1.8)
+        self.assertEqual(welded,0)
+        np.testing.assert_array_equal(unchanged,sound)
 
     def test_closed_solid_with_nanometre_corner_sliver(self):
         import manifold3d as md

@@ -58,7 +58,7 @@ DETAIL_PIPELINE_VERSION = 2
 FIELD_PIPELINE_VERSION = 5
 CROSSING_VALIDATION_VERSION = 1
 MESH_PIPELINE_VERSION = 21
-PACKAGE_PIPELINE_VERSION = 7
+PACKAGE_PIPELINE_VERSION = 8
 VALIDATION_PIPELINE_VERSION = 4
 SLICE_PIPELINE_VERSION = 2
 FT = 0.3048006096012192
@@ -2213,6 +2213,7 @@ def build_config(args) -> tuple[dict, str, Path]:
         "plate_translation_mm": translation, "nozzle_mm": 0.4, "wall_generator": "arachne",
         "layer_height_mm": args.layer_height, "process_preset": PROCESS_PRESETS[args.layer_height],
         "wall_loops": 2, "infill_percent": 15, "bottom_shell_layers": 3,
+        "ironing_type": "top", "top_surface_line_width_mm": 0.42,
         "top_shell_layers": 4, "brim_width_mm": brim_width, "brim_gap_mm": MODEL_BRIM_GAP_MM,
         "minimum_surface_color_depth_mm": 0.24, "surface_color_depth_mm": color_depth,
         "export_snap_denominator": 65536,

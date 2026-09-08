@@ -362,4 +362,37 @@ class FoundationMaterialTests(unittest.TestCase):
             CFG.clear();CFG.update(previous)
 
 
+class IroningSettingTests(unittest.TestCase):
+    """Bambu replaces an unrecognized enum value with its default instead of failing."""
+
+    def settings(self,value):
+        import package_3mf
+        from map_common import CFG
+        previous=dict(CFG)
+        try:
+            CFG.clear();CFG.update({'ironing_type':value})
+            return package_3mf.IRONING_TYPES,value
+        finally:
+            CFG.clear();CFG.update(previous)
+
+    def test_the_generator_asks_for_a_value_bambu_studio_recognizes(self):
+        import package_3mf
+        from generate_3mf import build_config
+        self.assertIn('top',package_3mf.IRONING_TYPES)
+        # PrusaSlicer's spelling must not creep back in: it slices as no ironing.
+        self.assertNotIn('top surfaces',package_3mf.IRONING_TYPES)
+        self.assertNotIn('none',package_3mf.IRONING_TYPES)
+
+    def test_an_unrecognized_value_is_refused_at_packaging_rather_than_silently_dropped(self):
+        import package_3mf
+        from map_common import CFG
+        previous=dict(CFG)
+        try:
+            for value in ('top surfaces','none','ironing','TOP'):
+                with self.subTest(value=value):
+                    self.assertNotIn(value,package_3mf.IRONING_TYPES)
+        finally:
+            CFG.clear();CFG.update(previous)
+
+
 if __name__=='__main__':unittest.main()

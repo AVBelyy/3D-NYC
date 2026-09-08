@@ -21,6 +21,15 @@ SURFACE_ROLES=['Ivory - road ribbons, default buildings and structural bridge ro
     'Tan - sidewalks, paths, plazas, surface parking and selected buildings']
 
 
+# Bambu Studio does not reject an unknown enum value: it silently substitutes
+# the option's default and reports the project as written by a newer slicer, so
+# a misspelled value reads as a working setting that quietly does nothing.
+# These are the values the installed 2.8 build accepts, labelled "No ironing",
+# "Top surfaces", "Topmost surface" and "All solid layer"; note they are not
+# PrusaSlicer's, which spells the first "none" and has no "no ironing".
+IRONING_TYPES=('no ironing','top','topmost','solid')
+
+
 def part_names():
     """Name every part for the surfaces it draws, and say which carries the substrate.
 
@@ -99,6 +108,11 @@ def settings(template,profiles):
     d['filament_map']=['1']*4
     d['filament_nozzle_map']=['0']*4
     prime=bool(CFG.get('prime_tower',True));tower=CFG.get('prime_tower_position_mm',[214,80])
+    ironing=str(CFG.get('ironing_type','top'))
+    if ironing not in IRONING_TYPES:
+        raise ValueError(
+            f'ironing_type {ironing!r} is not one of the values Bambu Studio accepts '
+            f'({", ".join(IRONING_TYPES)}); an unrecognized value is silently replaced by its default')
     d.update({'print_settings_id':f'NYC map - {CFG["layer_height_mm"]:g}mm detail @BBL P2S',
         'printer_settings_id':'Bambu Lab P2S 0.4 nozzle','printer_model':'Bambu Lab P2S','printer_variant':'0.4',
         'layer_height':str(CFG['layer_height_mm']),'initial_layer_print_height':'0.2',
@@ -116,7 +130,7 @@ def settings(template,profiles):
         # every solid-infill line and any sag between sparse-infill ribs.
         # Iron it, and keep the top line no wider than the outer wall so the
         # two meet without a ridge between them.
-        'ironing_type':'top surfaces','top_surface_line_width':str(CFG.get('top_surface_line_width_mm',.42)),
+        'ironing_type':ironing,'top_surface_line_width':str(CFG.get('top_surface_line_width_mm',.42)),
         'bottom_shell_layers':str(CFG.get('bottom_shell_layers',5)),
         'top_shell_layers':str(CFG.get('top_shell_layers',7)),'enable_support':'0',
         'brim_type':'outer_only','brim_width':str(CFG.get('brim_width_mm',3)),

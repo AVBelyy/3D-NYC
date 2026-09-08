@@ -16,7 +16,14 @@ def prepare_export_mesh(manifold, base_mm):
 
     last_error = None
     cleanup_source = None
-    for tolerance in (0., 1e-7, 1e-6, 1e-5):
+    # Welding is a topological last resort: a triangle only reaches the
+    # 1e-12 mm2 validation threshold if it can grow to about 2e-6 mm across,
+    # which no bounded motion can do inside a sub-micron partition film
+    # without inverting the film's own neighbours. Collapsing the cluster
+    # removes the sliver instead of trying to widen it, so try it only after
+    # simplify() has had every chance to remove the sliver on its own.
+    for weld, tolerance in [(False, t) for t in (0., 1e-7, 1e-6, 1e-5)] + \
+                           [(True, t) for t in (0., 1e-7, 1e-6, 1e-5)]:
         candidate = manifold
         if tolerance:
             # simplify() uses at least the solid's existing tolerance.
@@ -37,12 +44,19 @@ def prepare_export_mesh(manifold, base_mm):
         vertices = mesh.vertices.copy()
         vertices[np.abs(vertices[:, 2] - base_mm) < 1e-8, 2] = base_mm
         mesh.vertices = vertices
+        welded = 0
+        if weld:
+            vertices, faces, welded = weld_microscopic_faces(vertices, mesh.faces, base_mm)
+            if not welded:
+                continue
+            mesh = trimesh.Trimesh(vertices, faces, process=False)
+            vertices = mesh.vertices.copy()
         bad = mesh.area_faces < 1e-12
         # Prefer removing microscopic slivers before trying to enlarge them.
         # This is only a routing decision for the original mesh: simplify()
         # bounds surface error, not minimum face area. Its residual slivers
         # must reach guarded vertex repair rather than being rejected here.
-        if tolerance == 0. and np.any(bad):
+        if tolerance == 0. and not weld and np.any(bad):
             triangles = vertices[mesh.faces[bad]]
             edges = triangles - np.roll(triangles, 1, axis=1)
             tiny = np.max(np.linalg.norm(edges, axis=2), axis=1) < 2e-6
@@ -60,9 +74,88 @@ def prepare_export_mesh(manifold, base_mm):
             last_error = RuntimeError('Export vertex repair left degenerate faces')
             continue
         if not (mesh.is_watertight and mesh.is_winding_consistent and mesh.volume > 0):
-            raise RuntimeError('Export cleanup did not preserve a closed, positive-volume solid')
-        return mesh, adjusted, max(tolerance, manifold.get_tolerance()) if tolerance else 0.
+            # An unwelded candidate losing closure is a hard modelling error;
+            # a weld that does not happen to have a simple link is only a
+            # failed attempt, so let the remaining candidates run.
+            error = RuntimeError('Export cleanup did not preserve a closed, positive-volume solid')
+            if not weld:
+                raise error
+            last_error = error
+            continue
+        return mesh, adjusted + welded, max(tolerance, manifold.get_tolerance()) if tolerance else 0.
     raise RuntimeError(f'Export topology cleanup exhausted its 1e-5 mm bound: {last_error}') from last_error
+
+
+def weld_microscopic_faces(vertices, faces, base_mm, minimum_area=1e-12,
+                           maximum_weld_mm=1e-8):
+    """Collapse the vertex clusters of slivers that cannot be widened at all.
+
+    ``repair_export_vertices`` grows a degenerate triangle up to the validation
+    threshold, which needs roughly ``sqrt(4 * minimum_area)`` of room.  A
+    partition seam only microns thick has no such room: every displacement
+    large enough to fix the sliver inverts one of its own neighbours.  Removing
+    the sliver topologically is the only bounded repair left.  Vertices of a
+    degenerate face that sit within ``maximum_motion`` of each other are merged
+    to their centroid and the faces that degenerate as a result are dropped,
+    which is an ordinary edge collapse: it keeps the surface closed whenever
+    the collapsed cluster has a simple link, and the caller re-validates that.
+    Base contact is preserved -- a cluster touching the base stays on it.
+
+    The weld radius is a coincidence test, not a repair budget: 1e-8 mm is
+    six thousand times below the export snap grid and two hundred times below
+    the smallest triangle the validator accepts, so it can only merge vertices
+    that the Booleans left apart by double-precision drift.  Widening it to
+    the motion the vertex repair may use would swallow real micron detail.
+    """
+    vertices = np.asarray(vertices, dtype=float)
+    faces = np.asarray(faces, dtype=np.int64)
+    triangles = vertices[faces]
+    areas = np.linalg.norm(np.cross(triangles[:, 1] - triangles[:, 0],
+                                    triangles[:, 2] - triangles[:, 0]), axis=1) / 2
+    degenerate = np.flatnonzero(areas < minimum_area)
+    if not len(degenerate):
+        return vertices, faces, 0
+
+    parent = np.arange(len(vertices))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    merged = False
+    for ids in faces[degenerate]:
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            if np.linalg.norm(vertices[ids[a]] - vertices[ids[b]]) > maximum_weld_mm:
+                continue
+            first, second = find(ids[a]), find(ids[b])
+            if first != second:
+                parent[max(first, second)] = min(first, second)
+                merged = True
+    if not merged:
+        return vertices, faces, 0
+
+    label = np.array([find(index) for index in range(len(vertices))])
+    on_base = np.abs(vertices[:, 2] - base_mm) < 1e-8
+    counts = np.bincount(label, minlength=len(vertices)).reshape(-1, 1)
+    centroids = np.zeros_like(vertices)
+    np.add.at(centroids, label, vertices)
+    centroids = np.where(counts > 0, centroids / np.maximum(counts, 1), vertices)
+    grounded = np.zeros(len(vertices), dtype=bool)
+    np.logical_or.at(grounded, label, on_base)
+    centroids[grounded, 2] = base_mm
+    if np.any(np.linalg.norm(centroids[label] - vertices, axis=1) > maximum_weld_mm):
+        return vertices, faces, 0
+
+    faces = label[faces]
+    faces = faces[(faces[:, 0] != faces[:, 1]) & (faces[:, 1] != faces[:, 2]) &
+                  (faces[:, 2] != faces[:, 0])]
+    used = np.unique(faces)
+    remap = np.full(len(vertices), -1, dtype=np.int64)
+    remap[used] = np.arange(len(used))
+    welded = int((label != np.arange(len(vertices))).sum())
+    return centroids[used], remap[faces], welded
 
 
 def repair_export_vertices(vertices, faces, base_mm, minimum_area=1e-12,
