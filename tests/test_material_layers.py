@@ -5,8 +5,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
-from _material_layers import (COARSEST_LAYER_HEIGHT_MM,DRAWN_LINE_RELIEF_MM,
-    drawn_line_relief_mm,surface_color_depth_mm,white_substrate_top)
+from _material_layers import (COARSEST_LAYER_HEIGHT_MM,DRAWN_LINE_RELIEF_MM,MATERIAL_NAMES,
+    drawn_line_relief_mm,pavement_pad_relief_mm,surface_color_depth_mm,white_substrate_top)
 from build_map_meshes import material_solid
 from _surface_styles import apply_street_palette,paint_bridge_decks,paint_trail_ribbons,stair_tread_mask
 
@@ -282,6 +282,84 @@ class StairTreadPriorityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             stair_tread_mask(run[0],building_mask=buildings[0],water_mask=water[0],
                 road_mask=roads[0],protected_transport_mask=protected[0])
+
+
+class PavementPadReliefTests(unittest.TestCase):
+    """A pad shallower than one layer prints intermittently, not shallowly."""
+
+    def profiles(self):
+        from generate_3mf import PROCESS_PRESETS
+        return sorted(PROCESS_PRESETS)
+
+    def test_the_pad_is_a_whole_number_of_layers_on_every_supported_profile(self):
+        for layer in self.profiles():
+            with self.subTest(layer=layer):
+                pad=pavement_pad_relief_mm(layer)
+                self.assertAlmostEqual(pad/layer,round(pad/layer),places=9)
+                self.assertGreaterEqual(pad,layer)
+
+    def test_the_pad_is_never_shrunk_below_the_height_the_map_is_drawn_against(self):
+        # A symbol may grow to stay printable; it must never quietly shrink out
+        # of the print, so rounding is up rather than to nearest.
+        for layer in self.profiles():
+            with self.subTest(layer=layer):
+                self.assertGreaterEqual(pavement_pad_relief_mm(layer),.16-1e-9)
+
+    def test_a_drawn_line_still_clears_the_layer_aligned_pad(self):
+        for layer in self.profiles():
+            with self.subTest(layer=layer):
+                pad=pavement_pad_relief_mm(layer)
+                line=drawn_line_relief_mm({"path_relief_mm":pad,"layer_height_mm":layer})
+                self.assertGreaterEqual(line-pad,layer-1e-9)
+
+    def test_a_nonsense_pad_or_layer_height_is_rejected(self):
+        for layer,requested in [(0,.16),(-.1,.16),(float("nan"),.16),(.2,0),(.2,-1)]:
+            with self.subTest(layer=layer,requested=requested):
+                with self.assertRaises(ValueError):
+                    pavement_pad_relief_mm(layer,requested)
+
+
+class FoundationMaterialTests(unittest.TestCase):
+    """The substrate is bulk, not cartography, so its filament is a supply choice."""
+
+    def resolve(self,value):
+        import build_map_meshes
+        from map_common import CFG
+        previous=dict(CFG)
+        try:
+            CFG.clear();CFG.update({"colors":["#000000"]*4,**({} if value is None else {"foundation_material":value})})
+            return build_map_meshes.foundation_material()
+        finally:
+            CFG.clear();CFG.update(previous)
+
+    def test_the_substrate_defaults_to_the_first_filament(self):
+        self.assertEqual(self.resolve(None),MATERIAL_NAMES.index("ivory"))
+
+    def test_any_configured_filament_may_carry_the_substrate(self):
+        for index in range(len(MATERIAL_NAMES)):
+            with self.subTest(index=index):
+                self.assertEqual(self.resolve(index),index)
+
+    def test_a_filament_the_palette_does_not_have_is_rejected(self):
+        for index in (-1,4,99):
+            with self.subTest(index=index):
+                with self.assertRaises(ValueError):
+                    self.resolve(index)
+
+    def test_the_named_part_says_which_filament_carries_the_substrate(self):
+        import package_3mf
+        from map_common import CFG
+        previous=dict(CFG)
+        try:
+            for index in range(len(MATERIAL_NAMES)):
+                with self.subTest(index=index):
+                    CFG.clear();CFG.update({"foundation_material":index})
+                    names=package_3mf.part_names()
+                    carrying=[name for name in names if "substrate" in name]
+                    self.assertEqual(len(carrying),1)
+                    self.assertIs(carrying[0],names[index])
+        finally:
+            CFG.clear();CFG.update(previous)
 
 
 if __name__=='__main__':unittest.main()

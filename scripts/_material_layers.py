@@ -7,6 +7,13 @@ import math
 import numpy as np
 
 
+# Filament order is the print's material identity: index 0 is the first
+# extruder, and every stage -- fields, meshes, packaging, validation -- indexes
+# materials by these positions.  The names are the palette's roles, not the
+# filament actually loaded, which the operator is free to change.
+MATERIAL_NAMES = ["ivory", "green", "blue", "tan"]
+
+
 def surface_color_depth_mm(layer_height_mm: float, minimum_depth_mm: float = 0.24) -> float:
     """Return a layer-aligned color depth thick enough for a solid surface skin."""
     layer = float(layer_height_mm)
@@ -72,3 +79,35 @@ def drawn_line_relief_mm(config: dict) -> float:
     if not math.isfinite(requested) or requested <= 0:
         raise ValueError("drawn road line relief must be finite and positive")
     return round(max(requested, 2.0 * layer, pad + layer), 10)
+
+
+# The pavement pad is a cartographic step, not a structural one: it exists so a
+# sidewalk, plaza or roadbed reads as raised beside the ground it abuts.  The
+# request is therefore a design height, and 0.16 mm is the height the map is
+# drawn against.
+PAVEMENT_PAD_RELIEF_MM = 0.16
+
+
+def pavement_pad_relief_mm(layer_height_mm: float, requested_mm: float = PAVEMENT_PAD_RELIEF_MM) -> float:
+    """Return the pavement pad rounded up to a whole number of printed layers.
+
+    A pad shallower than one layer does not print shallower -- it prints
+    intermittently.  The slicer resolves the pad's top edge only on the layers
+    whose z-plane happens to fall above the ground beside it, so a step of 0.16
+    mm under 0.24 mm layers appears on roughly two thirds of the boundary and
+    vanishes on the rest, and the tan/ivory seam it defines breaks up into
+    slots that look like missing extrusion.
+
+    Rounding up is the whole fix: on a layer-aligned pad every point of the
+    boundary slices the same way, so the step either exists everywhere or --
+    for a pad deliberately set to zero, which is not this -- nowhere.  It is
+    rounded up rather than to nearest because a map symbol may grow to stay
+    printable and must never silently shrink out of the print.
+    """
+    layer = float(layer_height_mm)
+    requested = float(requested_mm)
+    if not math.isfinite(layer) or layer <= 0:
+        raise ValueError("layer height must be finite and positive")
+    if not math.isfinite(requested) or requested <= 0:
+        raise ValueError("pavement pad relief must be finite and positive")
+    return round(math.ceil((requested - 1e-9) / layer) * layer, 10)

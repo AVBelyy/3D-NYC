@@ -15,7 +15,8 @@ import mapbox_earcut
 from map_common import *
 from _canopy_relief import measured_canopy_relief
 from crossings import carried_structures,fit_linear_elevation_profile,minimum_crossing_length_mm,tunnel_surface_masks
-from _material_layers import drawn_line_relief_mm,surface_color_depth_mm,white_substrate_top
+from _material_layers import (MATERIAL_NAMES,drawn_line_relief_mm,surface_color_depth_mm,
+    white_substrate_top)
 from road_symbols import TRAIL_HIGHWAYS,constructs_bridge_deck,drawn_route_classification,parse_tags,trail_width_mm
 from _surface_styles import LAND_COVER_BARE_SOIL,apply_street_palette,paint_bridge_decks,paint_trail_ribbons,stair_tread_mask,vegetated_ground_mask
 from terrain_relief import absolute_elevation_to_mm,choose_terrain_relief
@@ -694,9 +695,10 @@ def main():
     report.update({'vertical_origin_m_navd88':origin,'local_minimum_elevation_m_navd88':local_origin,
         'z_range_mm':[float(z[aoi_mask].min()),float(z[aoi_mask].max())],
         'terrain_relief':terrain_relief.__dict__,
-        'material_layers':{'substrate_material':0,'substrate_color':'ivory',
+        'material_layers':{'substrate_material':int(CFG.get('foundation_material',0)),
+            'substrate_color':MATERIAL_NAMES[int(CFG.get('foundation_material',0))],
             'surface_color_depth_mm':color_depth,
-            'contract':'one continuous ivory substrate below all visible surface materials'},
+            'contract':'one continuous substrate below all visible surface materials'},
         'material_cell_counts':[int((material==color).sum()) for color in range(4)],'diagonal_contact_cleanups':cleanups,
         'isolated_cell_cleanups':isolated_cleanups})
     np.savez_compressed(OUT/'map_fields.npz',height_mm=z.astype(np.float32),ground_mm=gz.astype(np.float32),material=material,

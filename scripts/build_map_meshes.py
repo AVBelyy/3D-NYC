@@ -8,7 +8,7 @@ from scipy.ndimage import label,find_objects
 from map_common import *
 from crossings import (constrain_deck_to_visible_surface,minimum_crossing_length_mm,
     minimum_crossing_floor_mm,printable_tunnel_profile,structural_roof_thickness_mm)
-from _material_layers import drawn_line_relief_mm
+from _material_layers import MATERIAL_NAMES,drawn_line_relief_mm
 from mesh_precision import prepare_export_mesh
 from road_symbols import TRAIL_HIGHWAYS,trail_width_mm
 
@@ -114,7 +114,7 @@ def audit_layer_support(crossings,nozzle_mm,layer_height_mm):
         raise RuntimeError(f'Unsupported roof spans exceed {limit:g} mm: {details}')
     spans=[float(item['roof_span_mm']) for item in openings]
     return {
-        'result':'passed','ordinary_geometry':'colored surface solids seated on a continuous ivory substrate',
+        'result':'passed','ordinary_geometry':'colored surface solids seated on a continuous substrate',
         'explicit_bridge_roofs':len(openings),'maximum_bridge_span_mm':max(spans,default=0.),
         'maximum_allowed_bridge_span_mm':limit,
         'maximum_allowed_bridge_span_nozzle_widths':MAXIMUM_BRIDGE_SPAN_NOZZLES,
@@ -228,6 +228,22 @@ def serialized_seams_acceptable(intersections,thicknesses,tolerance,maximum_thic
     return all(volume<tolerance or thicknesses.get(key,float('inf'))<=maximum_thickness
         for key,volume in intersections.items())
 
+def foundation_material():
+    """Return the filament index that fills the hidden substrate.
+
+    The substrate is the continuous solid every visible surface colour is
+    seated on.  It is most of the model by volume and none of its cartography:
+    apart from the tile wall below the colour skin, none of it is ever seen.
+    Which filament fills it is therefore a supply decision rather than a map
+    decision, and the map reads identically whichever one is chosen.
+    """
+    index=int(CFG.get('foundation_material',0))
+    if not 0<=index<len(CFG['colors']):
+        raise ValueError(
+            f'foundation_material {index} is not one of the {len(CFG["colors"])} configured filaments')
+    return index
+
+
 def partition_materials(materials):
     """Make independently simplified color solids mutually exclusive.
 
@@ -272,14 +288,16 @@ def partition_materials(materials):
 
 
 def seat_colored_surfaces(materials):
-    """Cut simplified colored skins out of ivory once, preserving exact support contacts."""
-    colored=[material for material in materials[1:] if material.num_tri()]
-    if not colored or not materials[0].num_tri():
+    """Cut simplified colored skins out of the substrate once, preserving exact support contacts."""
+    foundation=foundation_material()
+    colored=[material for index,material in enumerate(materials)
+        if index!=foundation and material.num_tri()]
+    if not colored or not materials[foundation].num_tri():
         return materials,{'removed_overlap_mm3':0.,'effective_overlap_thickness_mm':0.}
     colors=md.Manifold.batch_boolean(colored,md.OpType.Add)
-    overlap,ivory=materials[0].split(colors)
-    if overlap.status()!=md.Error.NoError or ivory.status()!=md.Error.NoError:
-        raise RuntimeError('Failed to seat colored surface materials on the ivory substrate')
+    overlap,carrier=materials[foundation].split(colors)
+    if overlap.status()!=md.Error.NoError or carrier.status()!=md.Error.NoError:
+        raise RuntimeError('Failed to seat colored surface materials on the substrate')
     volume=abs(float(overlap.volume()));area=float(overlap.surface_area())
     thickness=2*volume/area if area else 0.
     # Independent raster-surface simplification can move either copy of a
@@ -288,9 +306,9 @@ def seat_colored_surfaces(materials):
     limit=float(CFG['grid_step_mm'])/2
     if thickness>limit+1e-9:
         raise RuntimeError(
-            f'Colored surfaces overlap the ivory substrate by approximately {thickness:g} mm; '
+            f'Colored surfaces overlap the substrate by approximately {thickness:g} mm; '
             f'the seating limit is {limit:g} mm')
-    result=list(materials);result[0]=ivory
+    result=list(materials);result[foundation]=carrier
     return result,{'removed_overlap_mm3':volume,'overlap_surface_area_mm2':area,
         'effective_overlap_thickness_mm':thickness,'maximum_allowed_thickness_mm':limit}
 
@@ -467,18 +485,18 @@ def raster_volume(top_cells,mask,bottom_vertices,step):
 def material_solid(h,substrate,mat,aoi,color,stride=1):
     h=h[::stride,::stride];substrate=substrate[::stride,::stride]
     mat=mat[::stride,::stride];aoi=aoi[::stride,::stride].astype(bool)
-    mask=mat==color
-    if not mask.any() and color!=0:
+    mask=mat==color;foundation=foundation_material()
+    if not mask.any() and color!=foundation:
         print('Material',color,'empty',flush=True);return md.Manifold()
     ny,nx=mask.shape;step=W/nx;base=float(np.float32(CFG['base_mm']))
     substrate_vertices,substrate_use=cell_vertex_heights(substrate,aoi,'minimum')
     base_vertices=np.full(substrate_vertices.shape,base,dtype=np.float32)
     substrate_solid=md.Manifold()
-    if color==0:
+    if color==foundation:
         substrate_solid=raster_volume(substrate,aoi,base_vertices,step)
         substrate_solid=substrate_solid+polygon_prism(MODEL_AOI,0,base)
     surface_solid=raster_volume(h,mask,substrate_vertices,step) if mask.any() else md.Manifold()
-    m=surface_solid if color else substrate_solid+surface_solid
+    m=substrate_solid+surface_solid if color==foundation else surface_solid
     print('Material',color,'initial substrate vertices',int(substrate_use.sum()),flush=True)
     print('Material',color,'simplified',m.num_tri(),'triangles',m.status(),flush=True)
     return m
@@ -582,6 +600,9 @@ def underpasses(materials,fields,folder):
     # Match the raster-solid base exactly. Mixing float32(1.8) and float64(1.8)
     # leaves a nanometre gap beneath narrow approach strips after exact CSG.
     report=[];ground=fields['ground_mm'];base=float(np.float32(CFG['base_mm']))
+    # Hidden fill placed under a cut opening is substrate like any other,
+    # so it follows the substrate's filament rather than assuming ivory.
+    foundation=foundation_material()
     structural_minimum=structural_roof_thickness_mm(CFG['nozzle_mm'],CFG['layer_height_mm'])
     tunnel_roof=max(structural_minimum,float(CFG['minimum_tunnel_cover_mm']))
     bridge_roof=max(structural_minimum,float(CFG['minimum_bridge_deck_thickness_mm']))
@@ -651,8 +672,8 @@ def underpasses(materials,fields,folder):
             void=md.Manifold.batch_boolean([void,*open_portals],md.OpType.Add)
             for i in range(4):
                 materials[i]=materials[i]-void
-                if i!=0:materials[i]=materials[i]-floor_shape
-            materials[0]=materials[0]+floor_shape
+                if i!=foundation:materials[i]=materials[i]-floor_shape
+            materials[foundation]=materials[foundation]+floor_shape
             export(void,folder/f'tunnel_{int(row.osm_id)}_void.ply')
             cut_tunnels.append({'osm_id':int(row.osm_id),'corridor':line.buffer(roof_span/2),
                 'void':void,'road':road,'line':line})
@@ -772,9 +793,9 @@ def underpasses(materials,fields,folder):
                 water_skin=polygon_prism(water_part,skin_bottom,printable_lower)
                 for i in range(4):
                     materials[i]=materials[i]-void
-                    if i!=0:materials[i]=materials[i]-substrate
+                    if i!=foundation:materials[i]=materials[i]-substrate
                     if i!=2:materials[i]=materials[i]-water_skin
-                materials[0]=materials[0]+substrate
+                materials[foundation]=materials[foundation]+substrate
                 materials[2]=materials[2]+water_skin
                 export(void,folder/f'bridge_{int(row.osm_id)}_void.ply')
                 report.append({'osm_id':int(row.osm_id),'status':'water bridge opening','deck_top_mm':deck,
@@ -855,9 +876,9 @@ def underpasses(materials,fields,folder):
             for i in range(4):
                 materials[i]=materials[i]-void
                 if i!=road_color:materials[i]=materials[i]-floor
-                if road_color==3 and i!=0:materials[i]=materials[i]-floor_support
+                if road_color==3 and i!=foundation:materials[i]=materials[i]-floor_support
             materials[road_color]=materials[road_color]+floor
-            if road_color==3:materials[0]=materials[0]+floor_support
+            if road_color==3:materials[foundation]=materials[foundation]+floor_support
             export(void,folder/f'bridge_{int(row.osm_id)}_void.ply')
             report.append({'osm_id':int(row.osm_id),'status':'road/path overpass opening','lower_osm_id':lower_id,
                 'lower_name':str(candidate['name']),'deck_top_mm':deck,
@@ -879,7 +900,7 @@ def main():
     fields=np.load(OUT/'map_fields.npz');mats=[];report={'stride':a.stride,'parts':{}}
     phase=Phases()
     if 'substrate_top_mm' not in fields:
-        raise RuntimeError('Map fields lack the required continuous ivory substrate surface')
+        raise RuntimeError('Map fields lack the required continuous substrate surface')
     with phase('material_solids'):
         for i in range(4):
             path=folder/f'material_{i}_base.ply'
@@ -896,7 +917,8 @@ def main():
         mats,cuts=underpasses(mats,fields,folder)
     report['crossings']=cuts
     report['layer_support']=audit_layer_support(cuts,CFG['nozzle_mm'],CFG['layer_height_mm'])
-    report['material_layers']={'substrate_material':0,'substrate_color':'ivory',
+    report['material_layers']={'substrate_material':foundation_material(),
+        'substrate_color':MATERIAL_NAMES[foundation_material()],
         'surface_color_depth_mm':float(CFG.get('surface_color_depth_mm',CFG.get('minimum_surface_color_depth_mm',.24)))}
     with phase('top_peaks'):
         mats,peaks=strengthen_top_peaks(mats,fields,folder)

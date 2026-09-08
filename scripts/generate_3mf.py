@@ -48,16 +48,17 @@ from _datasets import DATASETS
 from download_data import MIN_FREE, ROOT, download
 from cache_common import read_tiled_geoparquet
 from crossings import structural_roof_thickness_mm
-from _material_layers import DRAWN_LINE_RELIEF_MM, surface_color_depth_mm
+from _material_layers import (
+    DRAWN_LINE_RELIEF_MM, MATERIAL_NAMES, pavement_pad_relief_mm, surface_color_depth_mm)
 from road_symbols import TRAIL_HIGHWAYS
 
 
 PIPELINE_VERSION = 24
 DETAIL_PIPELINE_VERSION = 2
-FIELD_PIPELINE_VERSION = 4
+FIELD_PIPELINE_VERSION = 5
 CROSSING_VALIDATION_VERSION = 1
-MESH_PIPELINE_VERSION = 20
-PACKAGE_PIPELINE_VERSION = 6
+MESH_PIPELINE_VERSION = 21
+PACKAGE_PIPELINE_VERSION = 7
 VALIDATION_PIPELINE_VERSION = 4
 SLICE_PIPELINE_VERSION = 2
 FT = 0.3048006096012192
@@ -80,7 +81,6 @@ PROCESS_PRESETS = {
 }
 NYC_BOUNDS = (-74.27, 40.47, -73.68, 40.93)
 MATERIAL_COLORS = ["#F2F0E8", "#5FAA72", "#A9D5DF", "#C79A61"]
-MATERIAL_NAMES = ["ivory", "green", "blue", "tan"]
 BUILDING_COLOR_ALIASES = {
     "ivory": 0,
     "white": 0,
@@ -1670,6 +1670,17 @@ def parse_print_frame(text: str) -> dict:
     }
 
 
+def parse_material_color(text: str) -> int:
+    """Resolve one material name, alias, or palette hex to its filament index."""
+    key = str(text).strip().casefold()
+    if key not in BUILDING_COLOR_ALIASES:
+        raise argparse.ArgumentTypeError(
+            f"Unsupported color {text!r}; choose white/ivory, green, blue, brown/tan, "
+            "or a matching configured palette hex"
+        )
+    return BUILDING_COLOR_ALIASES[key]
+
+
 def parse_building_colors(text: str) -> list[dict]:
     """Read and normalize a JSON list of per-building material overrides."""
     source = text.strip()
@@ -1925,6 +1936,13 @@ def parser() -> argparse.ArgumentParser:
         help=("JSON list (inline, file, or @file) assigning visible buildings to the existing "
               "ivory, green, blue, or tan filament by address, WGS84 point, BIN, DoITT ID, or BBL"),
     )
+    result.add_argument(
+        "--foundation-color", type=parse_material_color, metavar="COLOR",
+        default="ivory",
+        help=("Filament for the hidden substrate below every visible surface: ivory (default), "
+              "green, blue, or tan. The substrate is most of the model by volume, so this is "
+              "the setting that decides which filament the print mostly consumes"),
+    )
     result.add_argument("--output", type=Path, help="Final 3MF path; derived from job ID when omitted")
     result.add_argument("--data-dir", type=Path, default=ROOT / "data", help="Shared input-data root")
     result.add_argument(
@@ -2167,7 +2185,8 @@ def build_config(args) -> tuple[dict, str, Path]:
         "minimum_terrain_relief_levels": args.minimum_terrain_levels,
         "maximum_terrain_relief_factor": 3.0, "minimum_terrain_source_span_m": 0.5,
         "base_mm": 1.8, "minimum_terrain_mm": 2.4, "minimum_path_width_mm": 0.625,
-        "path_relief_mm": 0.16, "minimum_fixture_width_mm": 0.45,
+        "path_relief_mm": pavement_pad_relief_mm(args.layer_height),
+        "minimum_fixture_width_mm": 0.45,
         "minimum_top_peak_diameter_mm": 1.0, "top_peak_minimum_separation_mm": 1.0,
         "top_peak_reinforcement_band_mm": 2.0,
         "top_peak_reinforcement_step_mm": 0.16, "inferred_cooling_height_mm": 0.2,
@@ -2189,10 +2208,11 @@ def build_config(args) -> tuple[dict, str, Path]:
         "subway_entrances": True, "minimum_entrance_width_mm": 0.5,
         "entrance_relief_mm": 0.2,
         "colors": MATERIAL_COLORS,
+        "foundation_material": args.foundation_color,
         "building_color_overrides": args.building_colors,
         "plate_translation_mm": translation, "nozzle_mm": 0.4, "wall_generator": "arachne",
         "layer_height_mm": args.layer_height, "process_preset": PROCESS_PRESETS[args.layer_height],
-        "wall_loops": 2, "infill_percent": 5, "bottom_shell_layers": 3,
+        "wall_loops": 2, "infill_percent": 15, "bottom_shell_layers": 3,
         "top_shell_layers": 4, "brim_width_mm": brim_width, "brim_gap_mm": MODEL_BRIM_GAP_MM,
         "minimum_surface_color_depth_mm": 0.24, "surface_color_depth_mm": color_depth,
         "export_snap_denominator": 65536,

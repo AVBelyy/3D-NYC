@@ -83,7 +83,11 @@ BIN, DoITT ID, and BBL selectors do not use GeoSearch.
 - `--vertical-exaggeration` scales measured vertical relief.
 - `--terrain-relief-factor` explicitly scales ground relief; otherwise the
   generator enforces its minimum printable relief budget automatically.
-- `--layer-height` selects an installed P2S process layer height.
+- `--layer-height` selects an installed P2S process layer height. The pavement
+  pad is rounded up to a whole number of layers for the chosen height, so a
+  kerb slices identically along its whole length instead of appearing only on
+  the layers whose z-plane happens to fall above the ground beside it.
+- `--foundation-color` chooses the filament for the hidden substrate.
 - `--building-colors` assigns selected buildings to the four existing
   material colors using JSON identifiers.
 - `--prime-tower auto` enables the fixed tower only when the centered model and
@@ -108,9 +112,24 @@ For example, select a visible building by BIN without calling GeoSearch:
 This selects New York City Hall in the example crop. A selector that matches no
 visible footprint fails rather than being ignored.
 
+## The substrate and its filament
+
+The substrate is the continuous solid every visible surface colour is seated
+on. It is most of the model by volume and none of its cartography: apart from
+the tile wall below the colour skin, none of it is ever seen. `--foundation-color`
+therefore decides which filament the print mostly consumes, and the map reads
+the same whichever is chosen. It defaults to ivory.
+
+Choosing another colour moves the whole substrate -- the base slab, the
+terrain-following bulk below the colour skin, and the hidden fill placed under
+tunnel floors, water bridges and overpass decks -- onto that filament. The one
+visible consequence is the lower tile edge, which then shows the chosen colour
+instead of ivory. Plates in one plan may be founded on different filament
+without affecting how they fit together.
+
 ## Print styling and support
 
-The four materials are arranged around a continuous ivory substrate. Green,
+The four materials are arranged around a continuous substrate. Green,
 blue, and tan surface regions begin only near the visible surface, while
 buildings and raised tree crowns retain their selected color above that
 substrate. This keeps the lower tile edge ivory and ensures that shallow tan

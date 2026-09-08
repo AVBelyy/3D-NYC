@@ -15,10 +15,26 @@ CORE='http://schemas.microsoft.com/3dmanufacturing/core/2015/02'
 PROD='http://schemas.microsoft.com/3dmanufacturing/production/2015/06'
 MAT='http://schemas.microsoft.com/3dmanufacturing/material/2015/02'
 ID='1 0 0 0 1 0 0 0 1 0 0 0'
-NAMES=['Ivory - continuous substrate, road ribbons, default buildings and structural bridge roofs',
+SURFACE_ROLES=['Ivory - road ribbons, default buildings and structural bridge roofs',
     'Green - terrain, recreation, gardens, grass, measured canopy relief and selected buildings',
     'Blue - level water surfaces and selected buildings',
     'Tan - sidewalks, paths, plazas, surface parking and selected buildings']
+
+
+def part_names():
+    """Name every part for the surfaces it draws, and say which carries the substrate.
+
+    The substrate is the bulk of the print and is assigned by supply rather
+    than by cartography, so the part list has to state where it went; reading
+    the plate in Bambu Studio is how the operator checks the filament mapping
+    before starting a multi-day print.
+    """
+    names=list(SURFACE_ROLES)
+    foundation=int(CFG.get('foundation_material',0))
+    if not 0<=foundation<len(names):
+        raise ValueError(f'foundation_material {foundation} is not one of the configured filaments')
+    names[foundation]+=', and the continuous substrate below every visible surface'
+    return names
 
 
 def validate_generation_metadata(generation,source='generation metadata'):
@@ -96,6 +112,11 @@ def settings(template,profiles):
         # at those shared material boundaries.
         'interface_shells':'1',
         'sparse_infill_density':f'{CFG.get("infill_percent",12):g}%',
+        # The map's ground is one large, nearly flat top surface, so it shows
+        # every solid-infill line and any sag between sparse-infill ribs.
+        # Iron it, and keep the top line no wider than the outer wall so the
+        # two meet without a ridge between them.
+        'ironing_type':'top surfaces','top_surface_line_width':str(CFG.get('top_surface_line_width_mm',.42)),
         'bottom_shell_layers':str(CFG.get('bottom_shell_layers',5)),
         'top_shell_layers':str(CFG.get('top_shell_layers',7)),'enable_support':'0',
         'brim_type':'outer_only','brim_width':str(CFG.get('brim_width_mm',3)),
@@ -112,12 +133,13 @@ def settings(template,profiles):
     return d
 
 def metadata_config(meshes,source_file):
+    names=part_names()
     root=etree.Element('config');obj=etree.SubElement(root,'object',id='9')
     etree.SubElement(obj,'metadata',key='name',value=CFG['name']);etree.SubElement(obj,'metadata',key='extruder',value='1')
     etree.SubElement(obj,'metadata',face_count=str(sum(len(m.faces) for _,m in meshes)))
     for i,m in meshes:
         part=etree.SubElement(obj,'part',id=str(i+1),subtype='normal_part')
-        for k,v in [('name',NAMES[i]),('matrix','1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1'),('source_file',source_file),('source_object_id','0'),('source_volume_id',str(i)),('extruder',str(i+1))]:
+        for k,v in [('name',names[i]),('matrix','1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1'),('source_file',source_file),('source_object_id','0'),('source_volume_id',str(i)),('extruder',str(i+1))]:
             etree.SubElement(part,'metadata',key=k,value=v)
         etree.SubElement(part,'mesh_stat',face_count=str(len(m.faces)),edges_fixed='0',degenerate_facets='0',facets_removed='0',facets_reversed='0',backwards_edges='0')
     plate=etree.SubElement(root,'plate')
@@ -179,8 +201,9 @@ def main():
             f.write(f'<?xml version="1.0" encoding="UTF-8"?><model xmlns="{CORE}" xmlns:p="{PROD}" xmlns:m="{MAT}" unit="millimeter" requiredextensions="p m"><metadata name="BambuStudio:3mfVersion">1</metadata><resources><m:colorgroup id="1008">')
             for color in CFG['colors']:f.write(f'<m:color color="{color}FF"/>')
             f.write('</m:colorgroup>')
+            names=part_names()
             for i,m in meshes:
-                f.write(f'<object id="{i+1}" name="{escape(NAMES[i])}" type="model" pid="1008" pindex="{i}" p:UUID="{U("mesh"+str(i))}"><mesh><vertices>\n')
+                f.write(f'<object id="{i+1}" name="{escape(names[i])}" type="model" pid="1008" pindex="{i}" p:UUID="{U("mesh"+str(i))}"><mesh><vertices>\n')
                 for start in range(0,len(m.vertices),10000):
                     f.writelines(f'<vertex x="{x:.17g}" y="{y:.17g}" z="{zz:.17g}"/>\n' for x,y,zz in m.vertices[start:start+10000])
                 f.write('</vertices><triangles>\n')

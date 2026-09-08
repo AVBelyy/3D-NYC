@@ -32,11 +32,13 @@ import _chunk_geometry as geometry
 from _chunk_cost import CostWeights, SourceDataError, build_cost_surface, cache_signature
 from _chunk_geometry import Frame, PlanGeometryError
 from cache_common import read_tiled_geoparquet
+from _material_layers import MATERIAL_NAMES
 from generate_3mf import (
     FT,
     NYC_BOUNDS,
     PROCESS_PRESETS,
     parse_bounding_polygon,
+    parse_material_color,
     parse_size,
 )
 from terrain_relief import choose_terrain_relief
@@ -364,6 +366,12 @@ def command_for(chunk: dict, shared: dict, paths: dict) -> list[str]:
         "--job-id", f"{shared['plan_id']}_{chunk['label']}",
         "--output", f"{paths['model']}",
     ]
+    # Not a cross-plate contract: the substrate is hidden, so plates may be
+    # founded on different filament and still fit together. Pin it only when
+    # it is not the default, so an ordinary plan's commands stay unchanged.
+    foundation = shared.get("foundation_color", 0)
+    if foundation:
+        command += ["--foundation-color", MATERIAL_NAMES[foundation]]
     if shared["offline"]:
         command.append("--offline")
     if shared["no_preview"]:
@@ -587,8 +595,16 @@ def parser() -> argparse.ArgumentParser:
         help="Report keep-out crossings instead of failing on them",
     )
     result.add_argument(
-        "--layer-height", type=float, choices=sorted(PROCESS_PRESETS), default=0.24,
-        help="Process layer height shared by every plate",
+        "--layer-height", type=float, choices=sorted(PROCESS_PRESETS), default=0.16,
+        help=("Process layer height shared by every plate. The default resolves the map's "
+              "0.16 mm pavement pad in exactly one layer, so a kerb slices identically "
+              "along its whole length"),
+    )
+    result.add_argument(
+        "--foundation-color", type=parse_material_color, metavar="COLOR",
+        default="ivory",
+        help=("Filament for the hidden substrate on every plate: ivory (default), green, "
+              "blue, or tan. Plates may differ without affecting how they fit together"),
     )
     result.add_argument("--grid-step-mm", type=float, default=0.125,
                         help="Manufacturing raster spacing shared by every plate")
@@ -873,6 +889,7 @@ def run(args, log) -> dict:
         "scale": scale,
         "grid_step_mm": args.grid_step_mm,
         "layer_height": args.layer_height,
+        "foundation_color": args.foundation_color,
         "vertical_exaggeration": args.vertical_exaggeration,
         "terrain_origin_m": terrain_origin,
         "terrain_relief_factor": relief.factor,
