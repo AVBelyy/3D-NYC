@@ -14,7 +14,7 @@ substitute for a representative physical test.
 
 | Material | Modeled content |
 | --- | --- |
-| Ivory | Continuous substrate, road ribbons, default buildings, roof fixtures, and structural bridge roofs |
+| Ivory | Road ribbons, default buildings, roof fixtures, structural bridge roofs, and the hidden substrate by default |
 | Green | Vegetated terrain, recreation areas, parks, institutional lawns and commons, gardens, grass, smoothed measured canopy, and selected buildings |
 | Blue | Level water surfaces and selected buildings |
 | Tan | Sidewalks, paths, plazas, surface parking, and selected buildings |
@@ -24,9 +24,21 @@ them with maintained building footprints and Planimetrics fixtures, and uses
 LiDAR for ground and upper-surface measurements. Roads, paths, land use,
 bridges, tunnels, and current semantic context combine NYC sources with
 OpenStreetMap. Classified carriageway centerlines become fixed-width ivory
-ribbons; measured urban roadbeds and sidewalk polygons are tan, while park-road
-shoulders remain green. Thin features are widened or separated where needed for
-the configured 0.4 mm nozzle.
+ribbons, drawn as raised lines standing above the pavement pad rather than as
+color painted onto it, so a junction or kerb overlap reads as a continuous
+street; measured urban roadbeds and sidewalk polygons are tan, while park-road
+shoulders remain green.
+
+Every drawn width is floored at what the selected nozzle can lay, and a color
+region the nozzle cannot draw at all is absorbed into the neighbor that
+surrounds it rather than widened at that neighbor's expense. `--nozzle-mm`
+selects the installed P2S nozzle -- 0.2, 0.4 (the default), 0.6, or 0.8 mm --
+and sets that printable minimum.
+
+The substrate every visible surface is seated on is the largest share of the
+print by volume and none of its cartography. `--foundation-color` chooses which
+of the four filaments it consumes; ivory is the default, and the only visible
+consequence is the lower tile edge.
 
 Building-color overrides reuse the four installed materials; they do not add a
 fifth material. Address selectors use NYC Planning GeoSearch, while coordinate,
@@ -77,7 +89,7 @@ explicit inferences rather than underground or architectural surveys.
 The generation pipeline checks source cardinalities against independent
 context, rejects out-of-bounds or degenerate geometry, and requires each
 material mesh to be watertight, consistently wound, and positive-volume.
-Colored surface solids are seated into a continuous ivory substrate, then all
+Colored surface solids are seated into the continuous substrate, then all
 materials are made mutually exclusive after simplification and manufacturing-
 grid snapping. Crossing validation also requires layer-aligned permanent roofs
 at least three layers thick and limits unsupported apertures to three nozzle
@@ -86,11 +98,13 @@ widths. Full validation adds more expensive pairwise intersection checks.
 The 3MF embeds a shell-safe generation command and the packaged Bambu project
 settings. The full normalized configuration remains in the job directory. An
 optional Bambu Studio slice verifies that the archive can be consumed with the
-installed P2S 0.4 mm profiles; it does not certify adhesion, color transitions,
-surface finish, or unsupported features.
+installed P2S profiles for the selected nozzle; it does not certify adhesion,
+color transitions, surface finish, or unsupported features.
 
-The supported process layer heights are 0.08, 0.12, 0.16, 0.20, and 0.24 mm;
-0.24 mm is the default. Prime-tower `auto` enables the fixed tower only when
+Each nozzle ships its own process layer heights, so `--layer-height` is
+validated against the selected `--nozzle-mm` rather than against one global
+list. At the default 0.4 mm nozzle they are 0.08, 0.12, 0.16, 0.20, and 0.24 mm,
+and 0.24 mm is the default. Prime-tower `auto` enables the fixed tower only when
 the centered model and both brim envelopes fit. It is therefore off for the
 default 200 x 200 mm square. Tower-free models may be as large as 250 x 250 mm,
 subject to the generator's grid and elevation-cell limits.
@@ -100,7 +114,8 @@ subject to the generator's grid and elevation-cell limits.
 - No free source guarantees current, ornament-level geometry for every
   building; newer or changed roofs can be simplified.
 - Narrow paths, fixtures, road symbols, and entrance markers may be enlarged to
-  remain printable.
+  remain printable at the selected nozzle, and a color region still too thin to
+  print is absorbed into its neighbor rather than drawn.
 - Inferred hidden roads are not measured underground geometry.
 - The project has no general monument catalog and does not invent unsupported
   landmark geometry.

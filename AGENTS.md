@@ -35,8 +35,11 @@ Run commands from the repository root. Use Python 3.12 and install
 
 - Keep user-facing orchestration in `generate_3mf.py` and `plan_map_chunks.py`;
   individual extraction, field, mesh, render, package, and validation scripts
-  are pipeline stages. Modules that are not command-line entry points are
-  prefixed with `_`.
+  are pipeline stages. Give a new module that is not a command-line entry point
+  a `_` prefix. Six shared modules predate that rule and keep unprefixed names:
+  `cache_common`, `map_common`, `crossings`, `road_symbols`, `terrain_relief`,
+  and `mesh_precision`. Import-only is what makes a module internal, not the
+  name; do not add a `__main__` guard to one to settle the question.
 - Dataset pairs follow `download_X.py` to `data/raw/X/` and `cache_X.py` to
   `data/cache/X/`, with documented exceptions such as streamed Building
   Footprints and region-selective LiDAR.
@@ -114,9 +117,10 @@ CI runs the same command on Ubuntu with Python 3.12. For documentation changes,
 also check local Markdown links, run affected CLIs with `--help`, and use
 `git diff --check`.
 
-Generating a complete 3MF requires source caches and installed Bambu Lab P2S
-0.4 mm profiles. Use parser, unit, and validation tests when a full geospatial
-build would be disproportionate.
+Generating a complete 3MF requires source caches and the installed Bambu Lab
+P2S profiles for the selected `--nozzle-mm` (0.4 mm by default). Use parser,
+unit, and validation tests when a full geospatial build would be
+disproportionate.
 
 Do not claim that a model is physically printable solely because mesh or slicer
 validation passed. Recommend a representative physical test for consequential

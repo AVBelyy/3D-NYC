@@ -357,8 +357,10 @@ class CostSurface(CutChooser):
     # Named keep-out features in EPSG:2263, so a report can say which bridge a
     # seam crosses rather than only that it crossed something.
     keep_out_features: gpd.GeoDataFrame | None = None
-    # "staircase" follows the street grid with right-angle jogs; "angled" makes
-    # each seam one straight line whose angle and position are optimized.
+    # "staircase" follows the street grid with right-angle jogs; "angled" then
+    # collapses those jogs into the fewest straight segments that stay clear of
+    # every keep-out, so right angles survive only where a dense block leaves no
+    # straight route.
     style: str = "staircase"
     _index: shapely.STRtree | None = field(default=None, repr=False)
 

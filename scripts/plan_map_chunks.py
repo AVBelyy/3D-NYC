@@ -543,7 +543,8 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument(
         "--cut-style", choices=["angled", "staircase", "axis"], default="angled",
-        help=("angled: one straight seam per cut, angle and position optimized; "
+        help=("angled: the street-following path with its right angles collapsed into "
+              "the fewest straight segments that stay clear of every keep-out; "
               "staircase: street-following runs joined by right-angle jogs; "
               "axis: straight and parallel to the frame axis"),
     )
