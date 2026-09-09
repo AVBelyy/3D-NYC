@@ -6,8 +6,8 @@ packages Bambu project settings, validates the result, and records a
 job provenance manifest.
 
 Run it from the repository root in the Python 3.12 environment described in the
-[project README](../README.md). Packaging always reads the installed Bambu Lab
-P2S 0.4 mm profiles. Preview rendering additionally uses `xcrun` and `clang++`;
+[project README](../README.md). Packaging reads the installed Bambu Lab P2S
+profiles for the selected nozzle; see `--nozzle-mm`. Preview rendering additionally uses `xcrun` and `clang++`;
 pass `--no-preview` when Xcode Command Line Tools are unavailable.
 
 ## Quick start
@@ -83,6 +83,12 @@ BIN, DoITT ID, and BBL selectors do not use GeoSearch.
 - `--vertical-exaggeration` scales measured vertical relief.
 - `--terrain-relief-factor` explicitly scales ground relief; otherwise the
   generator enforces its minimum printable relief budget automatically.
+- `--nozzle-mm` selects the installed P2S nozzle: 0.2, 0.4 (the default), 0.6 or
+  0.8. It sets the printable minimum for every drawn feature and selects the
+  machine and process presets, which Bambu names for the nozzle. Each nozzle
+  offers its own layer heights, so `--layer-height` is validated against the
+  chosen nozzle and an unavailable combination is refused with the list of
+  heights that nozzle does ship.
 - `--layer-height` selects an installed P2S process layer height. The pavement
   pad is rounded up to a whole number of layers for the chosen height, so a
   kerb slices identically along its whole length instead of appearing only on
@@ -181,8 +187,12 @@ derived seam bound allows.
 Ivory centerline ribbons are 0.875 mm wide for ordinary streets and 1.0 mm for
 major roads, both aligned to the manufacturing grid, with trails narrower at
 `minimum_path_width_mm`. A raised line needs two extrusions across its top
-rather than one wobbling bead, which sets the two-nozzle-width floor those
-widths clear. Physical roadbed width is retained as source metadata but does
+rather than one wobbling bead, so every drawn width is a cartographic choice
+floored at what the selected nozzle can lay: two beads for a drawn line, one for
+anything that merely has to exist. At the default 0.4 mm nozzle the drawn widths
+already clear their floors and are used as written; a wider nozzle raises them
+rather than dropping the feature, and a finer one never shrinks them below the
+width the map intends. Physical roadbed width is retained as source metadata but does
 not widen the visible symbol. Outside parks, measured roadbeds and
 authoritative sidewalks form the tan street field; inside parks, road shoulders
 remain green. Park paths, plazas, and surface parking are tan, and categorical
@@ -239,6 +249,36 @@ The first layer sets the phase of every plane above it, so the meshes and the
 packaged process profile share one `first_layer_height_mm`; they cannot be
 chosen independently. `field_build_report.json` records the shifts this applied
 under `printable_surfaces`.
+
+## Printable feature width
+
+The same rule applies across the plate. A colour region narrower than one
+extrusion has no printed width at all -- the variable-width wall generator
+refuses a bead below its minimum -- so what the map drew as colour appears on
+the plate as a gap showing whatever lies beneath it. This is why flat parkland
+and the kerb outlines beside roads speckle while canopy and carriageways do
+not: relief makes a region wide, and only the leftovers between features are
+thin.
+
+`build_map_fields` therefore absorbs every colour region the nozzle cannot draw.
+A cell belongs to a printable region only if a disk one bead across fits inside
+that region and covers the cell; cells that fail are taken from the nearest
+material that passed, so a sliver joins whichever neighbour actually surrounds
+it. Absorbing rather than widening is what keeps the map honest -- a region too
+thin to print has no printed width to lose, while widening it would take that
+width from a neighbour drawn where it is for a reason. Mapped bridge decks and
+upper tunnel surfaces are exempt, as they are from the topology pass.
+
+The threshold is a nozzle width converted through the grid, so it follows
+`--grid-step-mm` and the nozzle rather than being tuned once for one scale.
+`field_build_report.json` records it and the cells it moved under
+`printable_width_mm` and `printable_width_cleanups`.
+
+Reseating a sliver can leave a colour meeting itself at a corner and nowhere
+else, which is zero-width whatever the nozzle and collapses when the closed mesh
+is serialized as float32. The diagonal-contact pass therefore runs after this
+one and repairs those junctions; it also subsumes the older single-cell cleanup,
+since a one-cell island can never be covered by a bead-wide disk.
 
 LiDAR upper-surface heights define the varied canopy relief. The generator
 closes only narrow gaps in the canopy classification, smooths measured heights

@@ -16,6 +16,7 @@ from map_common import *
 from _canopy_relief import measured_canopy_relief
 from crossings import carried_structures,fit_linear_elevation_profile,minimum_crossing_length_mm,tunnel_surface_masks
 from _material_layers import (FIRST_LAYER_HEIGHT_MM,MATERIAL_NAMES,drawn_line_relief_mm,
+    printable_material_index,printable_feature_width_mm,
     printable_surface_mm,surface_color_depth_mm,white_substrate_top)
 from road_symbols import TRAIL_HIGHWAYS,constructs_bridge_deck,drawn_route_classification,parse_tags,trail_width_mm
 from _surface_styles import LAND_COVER_BARE_SOIL,apply_street_palette,paint_bridge_decks,paint_trail_ribbons,stair_tread_mask,vegetated_ground_mask
@@ -612,7 +613,28 @@ def main():
     # fifth printable material. Keep the sentinel through topology cleanup and
     # let mesh generation ignore it.
     material[~aoi_mask]=255
-    # Clean one-pixel islands and diagonal-only contacts that cannot be manufactured at this nozzle size.
+    # Absorb colour regions the nozzle cannot draw.  A ribbon two or three cells
+    # across is below one extrusion, so the slicer lays no bead for it and what
+    # the map drew as colour prints as a gap showing whatever lies beneath.  That
+    # is why flat parkland and the kerb outlines beside roads speckle while
+    # canopy and carriageways do not: relief makes a region wide, and only the
+    # leftovers between features are thin.  This runs before the topology pass
+    # below, which subsumes the old single-cell cleanup and also repairs the few
+    # corner-only junctions that reseating slivers can itself create.
+    # ``printable_material_index`` carries the rule and the reasoning; the index
+    # it returns re-seats the surface height and the absolute-terrain flag with
+    # the material, since a cell that changes colour takes that colour's surface.
+    printable_source,printable_width_cleanups=printable_material_index(
+        material,aoi_mask,nozzle_mm=CFG['nozzle_mm'],grid_step_mm=STEP,
+        protected=protected_transport_surface)
+    material[...]=material[printable_source]
+    top[...]=top[printable_source]
+    absolute_terrain_surface_mask[...]=absolute_terrain_surface_mask[printable_source]
+    # Repair diagonal-only contacts, where a colour meets itself at a corner and
+    # nowhere else.  This is a topology rule, not a width one: such a junction is
+    # zero-width whatever the nozzle, and collapses when the closed mesh is
+    # serialized as float32.  It runs last so that it also catches the junctions
+    # the printable-width pass creates when it reseats a sliver.
     cleanups=0
     for _ in range(12):
         a=material[:-1,:-1];bb=material[:-1,1:];c=material[1:,:-1];d=material[1:,1:]
@@ -632,28 +654,6 @@ def main():
         absolute_terrain_surface_mask[ii+1,jj+1]=old_absolute[ii,jj+1]
         absolute_terrain_surface_mask[ii2+1,jj2]=old_absolute[ii2,jj2]
         cleanups+=len(ii)+len(ii2)
-    # Remove cells connected to their own material only at a corner.  Such
-    # zero-width junctions collapse when the closed mesh is serialized as
-    # float32, while being far below one extrusion width.
-    isolated_cleanups=0
-    for _ in range(4):
-        changed=0;old=material.copy();old_top=top.copy();old_absolute=absolute_terrain_surface_mask.copy()
-        for color in range(4):
-            same=np.zeros(SHAPE,np.uint8)
-            same[1:]+=(old[1:]==color)&(old[:-1]==color);same[:-1]+=(old[:-1]==color)&(old[1:]==color)
-            same[:,1:]+=(old[:,1:]==color)&(old[:,:-1]==color);same[:,:-1]+=(old[:,:-1]==color)&(old[:,1:]==color)
-            rr,cc=np.where((old==color)&(same==0)&~protected_transport_surface&
-                (np.indices(SHAPE)[0]>0)&(np.indices(SHAPE)[0]<NY-1)&
-                (np.indices(SHAPE)[1]>0)&(np.indices(SHAPE)[1]<NX-1))
-            for r,c in zip(rr,cc):
-                values=[value for value in [old[r-1,c],old[r+1,c],old[r,c-1],old[r,c+1]] if value<4]
-                if not values:continue
-                replacement=max(set(values),key=values.count)
-                source=next((p for p in [(r-1,c),(r+1,c),(r,c-1),(r,c+1)] if old[p]==replacement),(r,c))
-                material[r,c]=replacement;top[r,c]=old_top[source]
-                absolute_terrain_surface_mask[r,c]=old_absolute[source];changed+=1
-        isolated_cleanups+=changed
-        if not changed:break
     local_origin=float(np.min(ground[aoi_mask]))
     origin=float(CFG.get('terrain_origin_m')) if CFG.get('terrain_origin_m') is not None else local_origin
     terrain_values=ground[aoi_mask&~water_mask]
@@ -724,7 +724,8 @@ def main():
             'surface_color_depth_mm':color_depth,
             'contract':'one continuous substrate below all visible surface materials'},
         'material_cell_counts':[int((material==color).sum()) for color in range(4)],'diagonal_contact_cleanups':cleanups,
-        'isolated_cell_cleanups':isolated_cleanups})
+        'printable_width_cleanups':printable_width_cleanups,
+        'printable_width_mm':printable_feature_width_mm(CFG['nozzle_mm'],STEP)})
     np.savez_compressed(OUT/'map_fields.npz',height_mm=z.astype(np.float32),ground_mm=gz.astype(np.float32),material=material,
         substrate_top_mm=substrate_top,canopy_height_m=canopy_height.astype(np.float32),building_mask=bmask,aoi_mask=aoi_mask,
         upper_tunnel_surface_mask=upper_tunnel_surface_mask)

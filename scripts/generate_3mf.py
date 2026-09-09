@@ -51,15 +51,16 @@ from cache_common import read_tiled_geoparquet
 from crossings import structural_roof_thickness_mm
 from _material_layers import (
     DRAWN_LINE_RELIEF_MM, FIRST_LAYER_HEIGHT_MM, MATERIAL_NAMES, pavement_pad_relief_mm,
+    printable_width_mm,DRAWN_LINE_BEADS,MINIMUM_FEATURE_BEADS,
     surface_color_depth_mm)
 from road_symbols import TRAIL_HIGHWAYS
 
 
 PIPELINE_VERSION = 25
 DETAIL_PIPELINE_VERSION = 2
-FIELD_PIPELINE_VERSION = 6
-CROSSING_VALIDATION_VERSION = 1
-MESH_PIPELINE_VERSION = 23
+FIELD_PIPELINE_VERSION = 9
+CROSSING_VALIDATION_VERSION = 2
+MESH_PIPELINE_VERSION = 24
 PACKAGE_PIPELINE_VERSION = 9
 VALIDATION_PIPELINE_VERSION = 4
 SLICE_PIPELINE_VERSION = 2
@@ -71,16 +72,45 @@ MODEL_MAX_BRIM_MM = 3.0
 PRIME_TOWER_WIDTH_MM = 35.0
 PRIME_TOWER_BRIM_MM = 2.0
 PRIME_TOWER_POSITION_MM = (214.0, 80.0)
-# Keep at least one 0.4 mm nozzle width between generated brim envelopes.
-PRIME_TOWER_CLEARANCE_MM = 0.4
+# Keep at least one nozzle width between generated brim envelopes.  Expressed
+# as a bead rather than a millimetre count so it follows --nozzle-mm.
+PRIME_TOWER_CLEARANCE_BEADS = 1.0
 SCRIPT_DIR = Path(__file__).resolve().parent
+# Bambu names its 0.4 mm presets without a suffix and every other size with one,
+# and each nozzle offers its own layer heights: a 0.6 mm nozzle cannot lay a
+# 0.08 mm layer and a 0.2 mm one cannot lay 0.24.  These are the P2S presets
+# Bambu Studio ships, so --layer-height is checked against the selected nozzle's
+# row rather than against one global list.
 PROCESS_PRESETS = {
-    0.08: "0.08mm High Quality @BBL P2S",
-    0.12: "0.12mm High Quality @BBL P2S",
-    0.16: "0.16mm Standard @BBL P2S",
-    0.20: "0.20mm Standard @BBL P2S",
-    0.24: "0.24mm Standard @BBL P2S",
+    0.2: {
+        0.08: "0.08mm High Quality @BBL P2S 0.2 nozzle",
+        0.10: "0.10mm Standard @BBL P2S 0.2 nozzle",
+        0.12: "0.12mm Balanced Quality @BBL P2S 0.2 nozzle",
+    },
+    0.4: {
+        0.08: "0.08mm High Quality @BBL P2S",
+        0.12: "0.12mm High Quality @BBL P2S",
+        0.16: "0.16mm Standard @BBL P2S",
+        0.20: "0.20mm Standard @BBL P2S",
+        0.24: "0.24mm Standard @BBL P2S",
+    },
+    0.6: {
+        0.18: "0.18mm Balanced Quality @BBL P2S 0.6 nozzle",
+        0.24: "0.24mm Balanced Quality @BBL P2S 0.6 nozzle",
+        0.30: "0.30mm Standard @BBL P2S 0.6 nozzle",
+    },
+    0.8: {
+        0.24: "0.24mm Balanced Quality @BBL P2S 0.8 nozzle",
+        0.32: "0.32mm Balanced Quality @BBL P2S 0.8 nozzle",
+        0.40: "0.40mm Standard @BBL P2S 0.8 nozzle",
+    },
 }
+DEFAULT_NOZZLE_MM = 0.4
+
+
+def machine_preset(nozzle_mm: float) -> str:
+    """Return the installed P2S machine preset for a nozzle size."""
+    return f"Bambu Lab P2S {nozzle_mm:g} nozzle"
 NYC_BOUNDS = (-74.27, 40.47, -73.68, 40.93)
 MATERIAL_COLORS = ["#F2F0E8", "#5FAA72", "#A9D5DF", "#C79A61"]
 BUILDING_COLOR_ALIASES = {
@@ -1868,7 +1898,7 @@ def model_envelope(
     return x - reach, y - reach, x + width + reach, y + height + reach
 
 
-def prime_tower_layout(width: float, height: float) -> dict:
+def prime_tower_layout(width: float, height: float, nozzle_mm: float = DEFAULT_NOZZLE_MM) -> dict:
     """Center the model and evaluate it against the fixed tower band.
 
     Bambu Studio defines wipe_tower_x/y as the left-front tower corner. Tower
@@ -1891,7 +1921,8 @@ def prime_tower_layout(width: float, height: float) -> dict:
         and tower_right <= PLATE_MM - PLATE_EDGE_CLEARANCE_MM
     )
     clearance = tower_left - envelope[2]
-    fits = plate_fits and clearance >= PRIME_TOWER_CLEARANCE_MM - 1e-9
+    required_clearance = PRIME_TOWER_CLEARANCE_BEADS * float(nozzle_mm)
+    fits = plate_fits and clearance >= required_clearance - 1e-9
     return {
         "fits": fits,
         "translation_mm": [translation_xy[0], translation_xy[1], 0.0],
@@ -1899,7 +1930,7 @@ def prime_tower_layout(width: float, height: float) -> dict:
         "model_envelope_mm": list(envelope),
         "tower_x_envelope_mm": [tower_left, tower_right],
         "model_to_tower_clearance_mm": clearance,
-        "required_model_to_tower_clearance_mm": PRIME_TOWER_CLEARANCE_MM,
+        "required_model_to_tower_clearance_mm": required_clearance,
     }
 
 
@@ -1958,8 +1989,12 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--grid-step-mm", type=float, default=0.125, help="Manufacturing raster spacing")
     result.add_argument(
-        "--layer-height", type=float, choices=sorted(PROCESS_PRESETS), default=0.24,
-        help="Installed official P2S process layer height",
+        "--nozzle-mm", type=float, choices=sorted(PROCESS_PRESETS), default=DEFAULT_NOZZLE_MM,
+        help="Installed P2S nozzle size; sets the printable minimum for every drawn feature",
+    )
+    result.add_argument(
+        "--layer-height", type=float, default=0.24,
+        help="Installed official P2S process layer height for the selected nozzle",
     )
     result.add_argument(
         "--prime-tower", choices=["auto", "on", "off"], default="auto",
@@ -2153,7 +2188,7 @@ def build_config(args) -> tuple[dict, str, Path]:
     for dimension in [width, height]:
         if abs(dimension / args.grid_step_mm - round(dimension / args.grid_step_mm)) > 1e-6:
             raise ValueError("Width and height must be exact multiples of --grid-step-mm")
-    proposed_prime_layout = prime_tower_layout(width, height)
+    proposed_prime_layout = prime_tower_layout(width, height, args.nozzle_mm)
     prime = args.prime_tower == "on" or (
         args.prime_tower == "auto" and proposed_prime_layout["fits"]
     )
@@ -2164,7 +2199,7 @@ def build_config(args) -> tuple[dict, str, Path]:
             "Prime tower does not fit beside this model: "
             f"model brim envelope={envelope}, tower X envelope={tower}, "
             f"clearance={proposed_prime_layout['model_to_tower_clearance_mm']:.3f} mm "
-            f"(required {PRIME_TOWER_CLEARANCE_MM:g} mm)"
+            f"(required {proposed_prime_layout['required_model_to_tower_clearance_mm']:g} mm)"
         )
     if prime:
         translation = proposed_prime_layout["translation_mm"]
@@ -2200,7 +2235,17 @@ def build_config(args) -> tuple[dict, str, Path]:
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", slug)
     output = (args.output or args.output_dir / "models" / f"{slug}.3mf").resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    structural_roof=structural_roof_thickness_mm(0.4,args.layer_height)
+    if args.layer_height not in PROCESS_PRESETS[args.nozzle_mm]:
+        raise ValueError(
+            f"Layer height {args.layer_height:g} mm has no installed P2S process preset for a "
+            f"{args.nozzle_mm:g} mm nozzle; available: "
+            + ", ".join(f"{height:g}" for height in sorted(PROCESS_PRESETS[args.nozzle_mm])))
+    # Every drawn width below is a cartographic choice floored by what this
+    # nozzle can lay, so a coarser nozzle widens a symbol rather than dropping
+    # it and a finer one never shrinks it below the width the map intends.
+    line=lambda mm:printable_width_mm(mm,args.nozzle_mm,beads=DRAWN_LINE_BEADS)
+    feature=lambda mm:printable_width_mm(mm,args.nozzle_mm,beads=MINIMUM_FEATURE_BEADS)
+    structural_roof=structural_roof_thickness_mm(args.nozzle_mm,args.layer_height)
     color_depth=surface_color_depth_mm(args.layer_height,.24)
     config = {
         "pipeline_version": PIPELINE_VERSION,
@@ -2219,9 +2264,9 @@ def build_config(args) -> tuple[dict, str, Path]:
         "terrain_relief_factor": args.terrain_relief_factor,
         "minimum_terrain_relief_levels": args.minimum_terrain_levels,
         "maximum_terrain_relief_factor": 3.0, "minimum_terrain_source_span_m": 0.5,
-        "base_mm": 1.8, "minimum_terrain_mm": 2.4, "minimum_path_width_mm": 0.625,
+        "base_mm": 1.8, "minimum_terrain_mm": 2.4, "minimum_path_width_mm": feature(0.625),
         "path_relief_mm": pavement_pad_relief_mm(args.layer_height),
-        "minimum_fixture_width_mm": 0.45,
+        "minimum_fixture_width_mm": feature(0.45),
         "minimum_top_peak_diameter_mm": 1.0, "top_peak_minimum_separation_mm": 1.0,
         "top_peak_reinforcement_band_mm": 2.0,
         "top_peak_reinforcement_step_mm": 0.16, "inferred_cooling_height_mm": 0.2,
@@ -2235,23 +2280,25 @@ def build_config(args) -> tuple[dict, str, Path]:
         "minimum_bridge_deck_thickness_mm": structural_roof,
         "maximum_bridge_clearance_mm": 1.40, "minimum_crossing_length_mm": 0.80,
         "ivory_carriageways": True,
-        "road_line_width_mm": 0.875, "major_road_line_width_mm": 1.00,
+        "road_line_width_mm": line(0.875), "major_road_line_width_mm": line(1.00),
         "road_line_relief_mm": DRAWN_LINE_RELIEF_MM,
         "road_surface_match_tolerance_mm": 0.20,
         "road_width_percentile": 30.0,
         "road_width_sample_interval_m": 15.0, "road_maximum_physical_width_m": 60.0,
-        "subway_entrances": True, "minimum_entrance_width_mm": 0.5,
+        "subway_entrances": True, "minimum_entrance_width_mm": feature(0.5),
         "entrance_relief_mm": 0.2,
         "colors": MATERIAL_COLORS,
         "foundation_material": args.foundation_color,
         "building_color_overrides": args.building_colors,
-        "plate_translation_mm": translation, "nozzle_mm": 0.4, "wall_generator": "arachne",
-        "layer_height_mm": args.layer_height, "process_preset": PROCESS_PRESETS[args.layer_height],
+        "plate_translation_mm": translation, "nozzle_mm": args.nozzle_mm, "wall_generator": "arachne",
+        "layer_height_mm": args.layer_height,
+        "process_preset": PROCESS_PRESETS[args.nozzle_mm][args.layer_height],
+        "machine_preset": machine_preset(args.nozzle_mm),
         # The first layer sets the phase of every slicing plane above it, so the
         # meshes are quantized against it and the sliced profile must repeat it.
         "first_layer_height_mm": FIRST_LAYER_HEIGHT_MM,
         "wall_loops": 2, "infill_percent": 15, "bottom_shell_layers": 3,
-        "ironing_type": "top", "top_surface_line_width_mm": 0.42,
+        "ironing_type": "top", "top_surface_line_width_mm": round(1.05*args.nozzle_mm,10),
         "top_shell_layers": 4, "brim_width_mm": brim_width, "brim_gap_mm": MODEL_BRIM_GAP_MM,
         "minimum_surface_color_depth_mm": 0.24, "surface_color_depth_mm": color_depth,
         "export_snap_denominator": 65536,

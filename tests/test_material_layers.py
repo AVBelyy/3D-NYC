@@ -7,6 +7,7 @@ import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from _material_layers import (COARSEST_LAYER_HEIGHT_MM,DRAWN_LINE_RELIEF_MM,
     FIRST_LAYER_HEIGHT_MM,MATERIAL_NAMES,drawn_line_relief_mm,pavement_pad_relief_mm,
+    printable_material_index,printable_feature_width_mm,
     printable_surface_mm,surface_color_depth_mm,white_substrate_top)
 from build_map_meshes import material_solid
 from _surface_styles import apply_street_palette,paint_bridge_decks,paint_trail_ribbons,stair_tread_mask
@@ -24,9 +25,23 @@ class DrawnLineReliefTests(unittest.TestCase):
         self.assertEqual(heights,{DRAWN_LINE_RELIEF_MM})
 
     def test_the_default_prints_raised_at_the_coarsest_supported_layer(self):
+        from generate_3mf import PROCESS_PRESETS,DEFAULT_NOZZLE_MM
+        coarsest=max(PROCESS_PRESETS[DEFAULT_NOZZLE_MM])
+        self.assertLessEqual(coarsest,COARSEST_LAYER_HEIGHT_MM)
+        self.assertGreaterEqual(DRAWN_LINE_RELIEF_MM,2*coarsest)
+
+    def test_a_line_stays_raised_on_every_nozzle_and_layer_offered(self):
+        # The design reference is the default nozzle's coarsest layer, so the
+        # runtime floor is what has to carry the coarser profiles a wider nozzle
+        # offers.  Nothing may print flatter than two layers there either.
         from generate_3mf import PROCESS_PRESETS
-        self.assertLessEqual(max(PROCESS_PRESETS),COARSEST_LAYER_HEIGHT_MM)
-        self.assertGreaterEqual(DRAWN_LINE_RELIEF_MM,2*max(PROCESS_PRESETS))
+        for nozzle,heights in PROCESS_PRESETS.items():
+            for layer in heights:
+                with self.subTest(nozzle=nozzle,layer=layer):
+                    pad=pavement_pad_relief_mm(layer)
+                    relief=drawn_line_relief_mm({"path_relief_mm":pad,"layer_height_mm":layer})
+                    self.assertGreaterEqual(relief,2*layer)
+                    self.assertGreaterEqual(relief,pad+layer)
 
     def test_a_line_always_out_tops_the_pavement_pad_beside_it(self):
         for layer in [.08,.12,.16,.20,.24]:
@@ -482,3 +497,84 @@ class PrintableSurfaceTest(unittest.TestCase):
 
     def test_the_first_layer_height_matches_the_packaged_profile(self):
         self.assertEqual(FIRST_LAYER_HEIGHT_MM, 0.2)
+
+
+class PrintableMaterialWidthTests(unittest.TestCase):
+    """A colour region narrower than one bead has no printed width to keep."""
+
+    def clean(self,material,**kw):
+        grid=np.asarray(material)
+        inside=kw.pop('aoi',np.ones(grid.shape,bool))
+        source,count=printable_material_index(grid,inside,
+            nozzle_mm=kw.pop('nozzle_mm',.4),grid_step_mm=kw.pop('grid_step_mm',.125),**kw)
+        return grid[source],count
+
+    def test_a_sliver_thinner_than_one_bead_is_absorbed(self):
+        # A single-cell stripe of colour 1 through colour 0: 0.125 mm wide,
+        # a third of a bead, so it cannot be drawn at all.
+        grid=np.zeros((9,9),np.uint8);grid[:,4]=1
+        cleaned,count=self.clean(grid)
+        self.assertEqual(count,9)
+        np.testing.assert_array_equal(cleaned,np.zeros((9,9),np.uint8))
+
+    def test_a_region_wider_than_one_bead_is_untouched(self):
+        # Five cells is 0.625 mm, comfortably more than a 0.4 mm bead.
+        grid=np.zeros((11,11),np.uint8);grid[:,3:8]=1
+        cleaned,count=self.clean(grid)
+        self.assertEqual(count,0)
+        np.testing.assert_array_equal(cleaned,grid)
+
+    def test_a_sliver_joins_the_neighbour_that_surrounds_it(self):
+        # A one-cell stripe of colour 1 inside a field of colour 2, with a
+        # colour-3 field further off: the sliver takes the colour actually
+        # around it rather than the lowest index or the first colour found.
+        grid=np.full((9,13),2,np.uint8);grid[:,0:4]=3;grid[:,7]=1
+        cleaned,_=self.clean(grid)
+        self.assertTrue((cleaned[:,7]==2).all())
+        self.assertTrue((cleaned[:,0:4]==3).all())
+
+    def test_a_sliver_equidistant_from_two_colours_still_resolves(self):
+        # Between two equally close neighbours there is no better answer, so
+        # the rule only has to leave a printable map: the sliver is gone and
+        # whichever colour claimed it is one of the two it touched.
+        grid=np.full((9,9),3,np.uint8);grid[:,5:]=2;grid[:,4]=1
+        cleaned,count=self.clean(grid)
+        self.assertEqual(count,9)
+        self.assertFalse((cleaned==1).any())
+        self.assertTrue(set(np.unique(cleaned[:,4]))<={2,3})
+
+    def test_protected_cells_are_never_reassigned(self):
+        grid=np.zeros((9,9),np.uint8);grid[:,4]=1
+        keep=np.zeros((9,9),bool);keep[:,4]=True
+        cleaned,count=self.clean(grid,protected=keep)
+        self.assertEqual(count,0)
+        np.testing.assert_array_equal(cleaned,grid)
+
+    def test_cells_outside_the_area_are_left_alone(self):
+        grid=np.zeros((9,9),np.uint8);grid[:,4]=1;grid[0,:]=255
+        aoi=np.ones((9,9),bool);aoi[0,:]=False
+        cleaned,_=self.clean(grid,aoi=aoi)
+        np.testing.assert_array_equal(cleaned[0],grid[0])
+
+    def test_the_index_carries_every_co_located_field(self):
+        # A cell that changes colour must take that colour's surface height,
+        # or the map would show one material standing at another's elevation.
+        grid=np.zeros((9,9),np.uint8);grid[:,4]=1
+        height=np.where(grid==1,5.,2.)
+        source,_=printable_material_index(grid,np.ones(grid.shape,bool),
+            nozzle_mm=.4,grid_step_mm=.125)
+        self.assertTrue((height[source]==2.).all())
+
+    def test_threshold_follows_the_nozzle_and_the_grid(self):
+        self.assertAlmostEqual(printable_feature_width_mm(.4,.125),.375)
+        self.assertAlmostEqual(printable_feature_width_mm(.6,.125),.625)
+        self.assertGreater(printable_feature_width_mm(.6,.125),
+                           printable_feature_width_mm(.4,.125))
+
+    def test_invalid_inputs_are_rejected(self):
+        grid=np.zeros((4,4),np.uint8);aoi=np.ones((4,4),bool)
+        for bad in ({'nozzle_mm':0},{'nozzle_mm':float('nan')},{'grid_step_mm':-1}):
+            with self.assertRaises(ValueError):
+                printable_material_index(grid,aoi,**{'nozzle_mm':.4,'grid_step_mm':.125,**bad})
+        with self.assertRaises(ValueError):
+            printable_material_index(grid,np.ones((3,3),bool),nozzle_mm=.4,grid_step_mm=.125)

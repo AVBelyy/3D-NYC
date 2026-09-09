@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 import numpy as np
+from scipy.ndimage import binary_opening, distance_transform_edt
 
 
 # Filament order is the print's material identity: index 0 is the first
@@ -43,10 +44,16 @@ def white_substrate_top(support_surface_mm, aoi_mask, *, base_mm: float, color_d
     return result
 
 
-# The coarsest layer height any supported print profile uses.  A drawn map
-# symbol has to read as raised on that profile too, so it is the height the
-# default symbol is sized against.  ``test_material_layers`` holds it to the
-# profiles ``generate_3mf`` actually offers.
+# The coarsest layer height the default nozzle prints at.  A drawn map symbol
+# has to read as raised on that profile too, so it is the height the default
+# symbol is sized against -- a design reference, not a limit.  A coarser nozzle
+# offers coarser layers, and a symbol stays raised there because
+# ``drawn_line_relief_mm`` floors every request at two layers of whatever height
+# is actually selected; the reference is deliberately not raised to match the
+# coarsest profile any nozzle offers, or fitting a wider nozzle would make every
+# road on every print stand taller.  ``test_material_layers`` holds it to the
+# profiles ``generate_3mf`` offers for that nozzle, and checks the floor covers
+# the rest.
 COARSEST_LAYER_HEIGHT_MM = 0.24
 DRAWN_LINE_RELIEF_MM = 2 * COARSEST_LAYER_HEIGHT_MM
 
@@ -285,3 +292,110 @@ def _grow_quasi_flat_zones(parent, low, high, start, end, tolerance):
         parent[right] = left
         low[left] = bottom
         high[left] = top
+
+
+def printable_material_index(material, aoi_mask, *, nozzle_mm, grid_step_mm,
+                             protected=None, passes=6):
+    """Index that redraws every colour region at a width the nozzle can lay.
+
+    ``printable_surface_mm`` is this rule on the vertical axis: relief thinner
+    than a layer does not print thinner, it prints intermittently.  The same is
+    true across the plate.  A colour region narrower than one extrusion has no
+    printed width at all -- the variable-width wall generator refuses a bead
+    below its minimum -- so what the map drew as colour appears as a gap showing
+    whatever lies beneath it.
+
+    The test is the print's rather than the map's.  A cell belongs to a
+    printable region only if a disk one bead across fits inside that region and
+    covers the cell, which is a morphological opening; cells that fail are taken
+    from the nearest material that passed, so a sliver joins whichever neighbour
+    actually surrounds it instead of a fixed priority order.  Absorbing rather
+    than widening is what keeps the map honest: a region too thin to print has
+    no printed width to lose, while widening it would have to take that width
+    from a neighbour that is drawn where it is for a reason.
+
+    Reassignment can expose new slivers, so it repeats until none remain or
+    ``passes`` is spent.  Returned is a pair of row and column index arrays, so
+    one call re-seats the material map and every field co-located with it -- a
+    cell that changes colour has to take that colour's surface height too, or
+    the map would show one material standing at another's elevation.
+    """
+    grid = np.asarray(material)
+    inside = np.asarray(aoi_mask, dtype=bool)
+    if grid.ndim != 2 or grid.shape != inside.shape:
+        raise ValueError("material and AOI mask must be same-shaped two-dimensional arrays")
+    nozzle = float(nozzle_mm)
+    step = float(grid_step_mm)
+    if not math.isfinite(nozzle) or nozzle <= 0:
+        raise ValueError("nozzle width must be finite and positive")
+    if not math.isfinite(step) or step <= 0:
+        raise ValueError("grid step must be finite and positive")
+    keep = np.zeros(grid.shape, dtype=bool) if protected is None else np.asarray(protected, dtype=bool)
+    if keep.shape != grid.shape:
+        raise ValueError("protected mask must match the material map")
+    radius = nozzle / 2.0 / step
+    span = int(math.ceil(radius))
+    rows, columns = np.ogrid[-span:span + 1, -span:span + 1]
+    bead = rows * rows + columns * columns <= radius * radius + 1e-9
+    index = np.indices(grid.shape)
+    current = grid.copy()
+    cleaned = 0
+    if inside.any():
+        for _ in range(int(passes)):
+            thin = np.zeros(grid.shape, dtype=bool)
+            for color in np.unique(current[inside]):
+                same = (current == color) & inside
+                if same.any():
+                    thin |= same & ~binary_opening(same, bead)
+            thin &= inside & ~keep
+            if not thin.any():
+                break
+            nearest = distance_transform_edt(~(inside & ~thin),
+                                             return_distances=False, return_indices=True)
+            picked = tuple(axis[thin] for axis in nearest)
+            current[thin] = current[picked]
+            index[0][thin] = index[0][picked]
+            index[1][thin] = index[1][picked]
+            cleaned += int(thin.sum())
+    return (index[0], index[1]), cleaned
+
+
+def printable_feature_width_mm(nozzle_mm, grid_step_mm):
+    """Return the narrowest colour region ``printable_material_index`` keeps."""
+    radius = float(nozzle_mm) / 2.0 / float(grid_step_mm)
+    span = int(math.ceil(radius))
+    rows, columns = np.ogrid[-span:span + 1, -span:span + 1]
+    bead = rows * rows + columns * columns <= radius * radius + 1e-9
+    return round(int(bead.any(axis=0).sum()) * float(grid_step_mm), 10)
+
+
+# How many extrusions wide a drawn map feature has to be.  A line the eye reads
+# as a line needs an inside and an outside, so it takes two beads; anything that
+# only has to exist on the plate takes one, the same floor
+# ``printable_material_index`` applies to the colour regions themselves.
+DRAWN_LINE_BEADS = 2
+MINIMUM_FEATURE_BEADS = 1
+
+
+def printable_width_mm(requested_mm, nozzle_mm, *, beads=MINIMUM_FEATURE_BEADS):
+    """Return a drawn width floored at what the nozzle can actually lay.
+
+    A map width is a cartographic choice -- a road is drawn as wide as a road
+    should look -- but it is also printed, and a feature narrower than the beads
+    it needs does not come out narrower, it comes out broken.  So the request is
+    honoured whenever the nozzle can carry it and raised to the nozzle's own
+    minimum when it cannot, which is the same shape of rule as
+    ``drawn_line_relief_mm`` on the vertical axis: a design value floored by the
+    print.  A finer nozzle therefore never shrinks a symbol below the width the
+    map intends, and a coarser one widens it rather than dropping it.
+    """
+    requested = float(requested_mm)
+    nozzle = float(nozzle_mm)
+    count = float(beads)
+    if not math.isfinite(requested) or requested <= 0:
+        raise ValueError("requested width must be finite and positive")
+    if not math.isfinite(nozzle) or nozzle <= 0:
+        raise ValueError("nozzle width must be finite and positive")
+    if not math.isfinite(count) or count <= 0:
+        raise ValueError("bead count must be finite and positive")
+    return round(max(requested, count * nozzle), 10)

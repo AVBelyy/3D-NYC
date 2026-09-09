@@ -77,16 +77,23 @@ def preset(profiles,kind,name):
     out.update(d);return out
 
 def settings(template,profiles):
-    if CFG.get('nozzle_mm')!=0.4:
-        raise ValueError(
-            'The packager currently selects official P2S 0.4 mm profiles; '
-            f'configured nozzle_mm={CFG.get("nozzle_mm")!r}. Update the profiles before changing nozzle size.')
+    # The process and machine presets are named for the nozzle, so both come
+    # from the config rather than being fixed here.  A missing preset is
+    # reported by name: it means Bambu Studio does not ship that combination,
+    # or ships it under a name this build does not know.
+    nozzle=float(CFG['nozzle_mm'])
+    machine_name=CFG.get('machine_preset',f'Bambu Lab P2S {nozzle:g} nozzle')
+    process_name=CFG['process_preset']
+    for kind,name in (('process',process_name),('machine',machine_name)):
+        if not (profiles/kind/(name+'.json')).exists():
+            raise ValueError(
+                f'No installed {kind} preset {name!r} for a {nozzle:g} mm nozzle under {profiles}; '
+                'install it in Bambu Studio or select a nozzle and layer height it ships')
     d=json.loads(template.read_text())
-    process_name=CFG.get('process_preset','0.08mm High Quality @BBL P2S')
     process=preset(profiles,'process',process_name)
     for k,v in process.items():
         if k not in ['type','name','inherits','include','from','setting_id','instantiation','compatible_printers']:d[k]=v
-    machine=preset(profiles,'machine','Bambu Lab P2S 0.4 nozzle')
+    machine=preset(profiles,'machine',machine_name)
     for k,v in machine.items():
         if 'gcode' in k:d[k]=v
     filament=preset(profiles,'filament','Bambu PLA Matte @BBL P2S')
@@ -114,8 +121,8 @@ def settings(template,profiles):
         raise ValueError(
             f'ironing_type {ironing!r} is not one of the values Bambu Studio accepts '
             f'({", ".join(IRONING_TYPES)}); an unrecognized value is silently replaced by its default')
-    d.update({'print_settings_id':f'NYC map - {CFG["layer_height_mm"]:g}mm detail @BBL P2S',
-        'printer_settings_id':'Bambu Lab P2S 0.4 nozzle','printer_model':'Bambu Lab P2S','printer_variant':'0.4',
+    d.update({'print_settings_id':f'NYC map - {CFG["layer_height_mm"]:g}mm detail @BBL P2S {nozzle:g} nozzle',
+        'printer_settings_id':machine_name,'printer_model':'Bambu Lab P2S','printer_variant':f'{nozzle:g}',
         'layer_height':str(CFG['layer_height_mm']),
         # The mesh was quantized onto the planes this height sets the phase of,
         # so the two cannot be chosen independently.
@@ -134,7 +141,7 @@ def settings(template,profiles):
         # every solid-infill line and any sag between sparse-infill ribs.
         # Iron it, and keep the top line no wider than the outer wall so the
         # two meet without a ridge between them.
-        'ironing_type':ironing,'top_surface_line_width':str(CFG.get('top_surface_line_width_mm',.42)),
+        'ironing_type':ironing,'top_surface_line_width':str(CFG.get('top_surface_line_width_mm',round(1.05*nozzle,10))),
         'bottom_shell_layers':str(CFG.get('bottom_shell_layers',5)),
         'top_shell_layers':str(CFG.get('top_shell_layers',7)),'enable_support':'0',
         'brim_type':'outer_only','brim_width':str(CFG.get('brim_width_mm',3)),
