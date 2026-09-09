@@ -867,8 +867,16 @@ def underpasses(materials,fields,folder):
                     'lower_osm_id':lower_id,'minimum_inferred_road_mm':float(profile.road.min()),
                     'minimum_printable_floor_mm':route_floor,'deck_top_mm':deck,
                     'method':row.height_method});continue
-            if road_color==3:
-                colored_bottom=np.maximum(base,profile.road-color_depth)
+            # The hidden column under a reopened roadway is substrate like any
+            # other, so only the visible skin belongs to the route's own colour.
+            # This used to be done for trails alone, which left an ordinary road
+            # -- the common case -- founding its whole column on ivory whatever
+            # filament the plate was founded on. Splitting needs room for the
+            # skin to sit on: where the roadway runs close enough to the base
+            # that the support would be shallower than nothing, the visible
+            # filament carries the column as before.
+            colored_bottom=np.maximum(base,profile.road-color_depth)
+            if float(colored_bottom.min())>base+1e-9:
                 floor_support=strip_solid(segment,width,np.full(steps+1,base),colored_bottom,steps)
                 floor=strip_solid(segment,width,colored_bottom,profile.road,steps)
             else:
@@ -880,9 +888,9 @@ def underpasses(materials,fields,folder):
             for i in range(4):
                 materials[i]=materials[i]-void
                 if i!=road_color:materials[i]=materials[i]-floor
-                if road_color==3 and i!=foundation:materials[i]=materials[i]-floor_support
+                if floor_support.num_tri() and i!=foundation:materials[i]=materials[i]-floor_support
             materials[road_color]=materials[road_color]+floor
-            if road_color==3:materials[foundation]=materials[foundation]+floor_support
+            if floor_support.num_tri():materials[foundation]=materials[foundation]+floor_support
             export(void,folder/f'bridge_{int(row.osm_id)}_void.ply')
             report.append({'osm_id':int(row.osm_id),'status':'road/path overpass opening','lower_osm_id':lower_id,
                 'lower_name':str(candidate['name']),'deck_top_mm':deck,
