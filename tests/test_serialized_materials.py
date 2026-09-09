@@ -28,21 +28,29 @@ class SerializedMaterialTests(unittest.TestCase):
         return {p.name: hashlib.sha256(p.read_bytes()).hexdigest()
                 for p in self.folder.glob('*.ply')}
 
-    def test_thin_distributed_overlap_is_repaired_and_reloaded(self):
+    def test_thin_distributed_overlap_is_kept_without_rebuilding(self):
+        # A sub-micron seam spread over a whole tile face carries more volume
+        # than the nozzle threshold while staying far thinner than the vertex
+        # motion the simplify and export passes are allowed to introduce. The
+        # exported geometry already satisfies the rule the repair is judged by,
+        # so there is nothing to buy by rebuilding it: on a dense tile those
+        # trials cost minutes and their result is accepted on the same grounds.
         parts = self.write_parts(1e-5)
         before = self.fingerprint()
-        parts, report = build.stabilize_serialized_materials(self.folder, parts)
+        kept, report = build.stabilize_serialized_materials(self.folder, parts)
         self.assertGreater(report['roundtrip_intersections_mm3'][0]['0-3'],
                            report['intersection_tolerance_mm3'])
-        self.assertEqual(report['cutter_translation_mm'][2], 0.)
-        meshes = [trimesh.load(self.folder / f'material_{i}.ply', process=False) for i in (0, 3)]
-        for i, mesh in zip((0, 3), meshes):
+        self.assertLess(report['roundtrip_intersection_effective_thickness_mm'][0]['0-3'],
+                        report['maximum_seam_thickness_mm'])
+        self.assertTrue(report['accepted_by_thickness'])
+        self.assertEqual(len(report['roundtrip_intersections_mm3']), 1)
+        self.assertEqual(report['cutter_translation_mm'], [0., 0., 0.])
+        self.assertEqual(kept, parts)
+        self.assertEqual(before, self.fingerprint())
+        for i in (0, 3):
+            mesh = trimesh.load(self.folder / f'material_{i}.ply', process=False)
             self.assertTrue(mesh.is_watertight and mesh.is_winding_consistent)
-            self.assertTrue((mesh.area_faces >= 1e-12).all())
             self.assertEqual(len(mesh.faces), parts[str(i)]['triangles'])
-        overlap = abs((build.solid(meshes[0]) ^ build.solid(meshes[1])).volume())
-        self.assertLess(overlap, report['intersection_tolerance_mm3'])
-        self.assertEqual(before['material_0.ply'], self.fingerprint()['material_0.ply'])
 
     def test_valid_files_are_unchanged(self):
         parts = self.write_parts(-1.)
@@ -59,30 +67,30 @@ class SerializedMaterialTests(unittest.TestCase):
         self.assertEqual(before, self.fingerprint())
         self.assertFalse(list(self.folder.glob('.seam-*')))
 
+    def write_collision_beside_a_thin_seam(self):
+        # Only geometry the acceptance rule rejects reaches the repair, so a
+        # trial gets as far as writing a file just when one pair is a real
+        # collision and another is the ordinary tile-wide coincident seam:
+        # the repair rebuilds the seam material before it reaches the
+        # collision. Tan carries the thin seam here, ivory the collision.
+        materials = [md.Manifold.cube([1, 1, 1]).translate([150, 50, 99.6]),
+                     md.Manifold.cube([100, 100, 100]), md.Manifold(),
+                     md.Manifold.cube([100, 100, 100]).translate([100 - 1e-5, 0, 0])]
+        return {str(i): build.export(m, self.folder / f'material_{i}.ply')
+                for i, m in enumerate(materials)}
+
     def test_failed_export_never_replaces_original_files(self):
-        # An unrepairable seam is only fatal when the geometry already on disk
-        # is unacceptable. Here it is a sub-micron seam the validator accepts,
-        # so every candidate failing must leave the originals in place and
-        # report the attempts rather than fail the build.
-        parts = self.write_parts(1e-5)
+        # A trial that cannot write its staged geometry must leave the files on
+        # disk exactly as it found them, take its temporary directory with it,
+        # and name why it was rejected so the failure stays diagnosable.
+        parts = self.write_collision_beside_a_thin_seam()
         before = self.fingerprint()
         with patch.object(build, 'export', side_effect=RuntimeError('export rejected')):
-            kept, report = build.stabilize_serialized_materials(self.folder, parts)
-        self.assertEqual(kept, parts)
-        self.assertTrue(report['accepted_serialized_originals'])
-        self.assertEqual(report['cutter_translation_mm'], [0., 0., 0.])
-        self.assertEqual(len(report['rejected_candidates']), 3)
-        self.assertTrue(all('export rejected' in f for f in report['rejected_candidates']))
+            with self.assertRaisesRegex(RuntimeError, 'could not be repaired') as raised:
+                build.stabilize_serialized_materials(self.folder, parts)
+        self.assertIn('export rejected', str(raised.exception))
         self.assertEqual(before, self.fingerprint())
         self.assertFalse(list(self.folder.glob('.seam-*')))
-
-    def test_unrepairable_thick_seam_still_fails(self):
-        parts = self.write_parts(1.)
-        before = self.fingerprint()
-        with patch.object(build, 'export', side_effect=RuntimeError('export rejected')):
-            with self.assertRaisesRegex(RuntimeError, 'could not be repaired'):
-                build.stabilize_serialized_materials(self.folder, parts)
-        self.assertEqual(before, self.fingerprint())
 
     def test_long_thin_seam_outranks_its_accumulated_volume(self):
         # A coincident seam that follows every road and building edge of a

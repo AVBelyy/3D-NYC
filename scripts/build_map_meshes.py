@@ -349,7 +349,18 @@ def stabilize_serialized_materials(folder,parts):
     # relative vertex motion cannot create a printable overlap, even when its
     # total volume exceeds the nozzle-volume threshold. Treat it as already
     # stable; repeated coincident-face subtraction can make it worse.
-    if max(initial.values(),default=0.)<tolerance:return parts,report
+    #
+    # Apply exactly the rule the repair is judged by, not half of it. Testing
+    # only the volume put every tile one long sub-micron seam away from
+    # rebuilding geometry it would have accepted either way: a coincident seam
+    # that follows every road edge of a dense tile passes the nozzle-volume
+    # threshold on area alone, and the trials it triggers cost minutes.
+    if serialized_seams_acceptable(initial,initial_thickness,tolerance,maximum_thickness):
+        report['accepted_by_thickness']=max(initial.values(),default=0.)>=tolerance
+        if report['accepted_by_thickness']:
+            print('Serialized seams kept as exported; the thickest stays within '
+                f'{maximum_thickness:g} mm',flush=True)
+        return parts,report
     affected={i:[j for j in range(i) if initial.get(f'{j}-{i}',0.)>=tolerance] for i in range(4)}
     failures=[]
     for offset in ((1e-5,7.31e-6,0.),(-1e-5,-7.31e-6,0.),(7.31e-6,-1e-5,0.)):
@@ -388,19 +399,12 @@ def stabilize_serialized_materials(folder,parts):
             report['cutter_translation_mm']=list(offset)
             report['rejected_candidates']=failures
             return trial_parts,report
-    # Every cutter translation failed.  Subtracting a reconstructed coincident
-    # face can create slivers faster than the bounded export cleanup absorbs
-    # them, and that gets likelier as a tile carries more shared boundary.  The
-    # repair is an improvement, not a requirement: it is only fatal when the
-    # geometry already on disk is unacceptable.  Keep the untouched originals
-    # whenever they satisfy the same rule the packaged 3MF is validated by.
-    if serialized_seams_acceptable(initial,initial_thickness,tolerance,maximum_thickness):
-        report['accepted_by_thickness']=True
-        report['accepted_serialized_originals']=True
-        report['rejected_candidates']=failures
-        print('Serialized seam repair unavailable; kept the exported geometry, whose seams '
-            f'stay within {maximum_thickness:g} mm',flush=True)
-        return parts,report
+    # Every cutter translation failed.  Geometry that already satisfied the
+    # packaged-3MF rule never reaches this loop, so there is no acceptable
+    # original left to fall back on: what remains is a seam thicker than the
+    # simplify and export passes can account for, which is a modeling
+    # collision rather than a numerical one.
+    report['rejected_candidates']=failures
     raise RuntimeError(f'Serialized seams could not be repaired below {tolerance:g} mm3 or '
         f'{maximum_thickness:g} mm effective thickness; audits={history}; '
         f'effective thickness={report["roundtrip_intersection_effective_thickness_mm"]}; '
@@ -913,6 +917,32 @@ def main():
     with phase('seat_colored_surfaces'):
         mats,seating=seat_colored_surfaces(mats)
     report['surface_seating']=seating
+    # Resolve the seams here, before anything is cut into the tile, because
+    # this is the last point at which they are only a simplification artefact.
+    # Independent simplification of the raster solids is what moves the two
+    # copies of a shared wall apart; every stage below is exact CSG that
+    # subtracts and adds the same solid, so none of them can introduce a new
+    # overlap -- serialized_stabilization measures that on the packaged parts.
+    #
+    # Position matters enormously for cost. Cutting a crossing leaves the
+    # materials meeting along the exactly coincident walls of a swept strip,
+    # and resolving those is the degenerate case for exact CSG: on a plate
+    # carrying sixty-four openings the same partition costs 63 s after the
+    # crossings against 6 s before them, and a second pass over that geometry
+    # does not finish in eight minutes. What it removed there was 0.023 mm3 at
+    # 4e-06 mm thick -- inside the tolerance the packaged 3MF is accepted by.
+    with phase('partition'):
+        mats,partition=partition_materials(mats)
+    # A Boolean difference can leave a micron-thin numerical skin when its
+    # result is rebuilt as a new manifold. A second, non-simplifying pass
+    # removes that residual, which export otherwise meets as degenerate
+    # triangles no bounded vertex repair can widen.
+    stabilization=[]
+    with phase('partition_stabilization'):
+        for _ in range(1):
+            mats,stabilized=partition_materials(mats);stabilization.append(stabilized)
+    partition['post_boolean_stabilization_passes']=stabilization
+    report['material_partition']=partition
     with phase('crossings'):
         mats,cuts=underpasses(mats,fields,folder)
     report['crossings']=cuts
@@ -931,18 +961,6 @@ def main():
             # and independently re-simplifying the colors here separates the two
             # copies of an approach wall and can create enclosed seam wedges.
             mats[i]=m
-    with phase('partition'):
-        mats,partition=partition_materials(mats)
-    # A Boolean difference can leave a micron-thin numerical skin when its
-    # result is rebuilt as a new manifold. A second, non-simplifying pass
-    # removes that residual before serialization; the strict 3MF validator
-    # independently measures the packaged parts again.
-    stabilization=[]
-    with phase('partition_stabilization'):
-        for _ in range(1):
-            mats,stabilized=partition_materials(mats);stabilization.append(stabilized)
-    partition['post_boolean_stabilization_passes']=stabilization
-    report['material_partition']=partition
     with phase('export'):
         for i,m in enumerate(mats):
             report['parts'][str(i)]=export(m,folder/f'material_{i}.ply')
