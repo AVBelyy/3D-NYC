@@ -33,6 +33,20 @@ elevation and land-cover evidence, and writes `generate_3mf.py` commands plus a
 preview under `output/plans/`. See the
 [planner guide](../docs/plan_map_chunks.md).
 
+Estimate filament and print time for finished models:
+
+```bash
+.venv/bin/python scripts/estimate_print_stats.py output/models/manhattan_2m_A2.3mf
+```
+
+`estimate_print_stats.py` reports per-filament grams, the share spent on
+tool-change purge, cost, and the slicer's own time prediction. A generated 3MF
+carries no such numbers, so the script runs an offline Bambu Studio slice and
+caches it under the validation directory keyed by the input's SHA-256; a project
+that already carries slice metadata is read directly. Pass several models to get
+a combined per-color spool total, and `--json` to keep the machine-readable
+form.
+
 ## Dataset scripts
 
 Durable dataset scripts follow this naming and destination convention:

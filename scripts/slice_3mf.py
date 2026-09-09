@@ -5,6 +5,7 @@ from map_common import ROOT, VALID, write_json
 
 
 EXTRUSION=re.compile(r'(?:^|\s)E([-+]?(?:\d+(?:\.\d*)?|\.\d+))(?=\s|$)')
+SLICER=Path('/Applications/BambuStudio.app/Contents/MacOS/BambuStudio')
 
 def audit_sliced_gcode(path):
     """Confirm that every elevated filament begins with a solid interface skin."""
@@ -39,24 +40,17 @@ def audit_sliced_gcode(path):
             for tool,value in sorted(starts.items())}}
 
 
-def main():
-    parser=argparse.ArgumentParser()
-    parser.add_argument('--model',type=Path,required=True)
-    parser.add_argument('--slicer',type=Path,default=Path('/Applications/BambuStudio.app/Contents/MacOS/BambuStudio'))
-    parser.add_argument('--name',default='slice_'+datetime.datetime.now().strftime('%Y%m%dT%H%M%S'))
-    parser.add_argument('--replace',action='store_true',help='Replace an existing derived slice directory')
-    parser.add_argument('--export-project',action='store_true',help='Also ask Bambu to export its sliced 3MF; its macOS CLI thumbnail renderer may abort.')
-    args=parser.parse_args()
-    output=VALID/args.name
-    if output.exists() and args.replace:shutil.rmtree(output)
-    output.mkdir(exist_ok=False)
-    command=[str(args.slicer),'--datadir',str(VALID/'bambu_profile'),
+def run_slice(model,output,slicer=SLICER,export_project=False):
+    """Slice one model offline into output and record the invocation; never contacts a printer."""
+    output.mkdir(parents=True,exist_ok=False)
+    command=[str(slicer),'--datadir',str(VALID/'bambu_profile'),
         '--debug','3','--arrange','0','--orient','0','--slice','1',
         '--mtcpp','10000000','--mstpp','7200','--outputdir',str(output)]
-    if args.export_project:command+=['--export-3mf',str(output/'sliced.3mf')]
-    command.append(str(args.model.resolve()))
-    with args.model.open('rb') as f:sha=hashlib.file_digest(f,'sha256').hexdigest()
-    record={'command':command,'input_sha256':sha,'input_bytes':args.model.stat().st_size,
+    if export_project:command+=['--export-3mf',str(output/'sliced.3mf')]
+    command.append(str(model.resolve()))
+    with model.open('rb') as f:sha=hashlib.file_digest(f,'sha256').hexdigest()
+    record={'command':command,'input':str(model.resolve()),'input_sha256':sha,
+        'input_bytes':model.stat().st_size,
         'started':datetime.datetime.now().astimezone().isoformat(),'result':'running',
         'purpose':'Offline validation only. No printer connection or print command.'}
     write_json(output/'run.json',record)
@@ -67,14 +61,29 @@ def main():
     record.update(exit_code=result.returncode,elapsed_seconds=time.monotonic()-started,
         finished=datetime.datetime.now().astimezone().isoformat(),
         result='completed' if result.returncode==0 else 'failed')
-    if result.returncode==0:
+    write_json(output/'run.json',record)
+    return record
+
+
+def main():
+    parser=argparse.ArgumentParser()
+    parser.add_argument('--model',type=Path,required=True)
+    parser.add_argument('--slicer',type=Path,default=SLICER)
+    parser.add_argument('--name',default='slice_'+datetime.datetime.now().strftime('%Y%m%dT%H%M%S'))
+    parser.add_argument('--replace',action='store_true',help='Replace an existing derived slice directory')
+    parser.add_argument('--export-project',action='store_true',help='Also ask Bambu to export its sliced 3MF; its macOS CLI thumbnail renderer may abort.')
+    args=parser.parse_args()
+    output=VALID/args.name
+    if output.exists() and args.replace:shutil.rmtree(output)
+    record=run_slice(args.model,output,args.slicer,args.export_project)
+    code=record['exit_code']
+    if code==0:
         try:record['support_audit']=audit_sliced_gcode(output/'plate_1.gcode')
         except (OSError,RuntimeError) as error:
-            record.update(result='failed',support_audit={'result':'failed','error':str(error)})
-            result=subprocess.CompletedProcess(command,1)
+            record.update(result='failed',support_audit={'result':'failed','error':str(error)});code=1
     write_json(output/'run.json',record)
     print(json.dumps(record,indent=2),flush=True)
-    raise SystemExit(result.returncode)
+    raise SystemExit(code)
 
 
 if __name__=='__main__':main()
