@@ -9,6 +9,7 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 import numpy as np,trimesh
 from lxml import etree
+from PIL import Image
 from _material_layers import FIRST_LAYER_HEIGHT_MM
 from map_common import *
 
@@ -16,6 +17,7 @@ CORE='http://schemas.microsoft.com/3dmanufacturing/core/2015/02'
 PROD='http://schemas.microsoft.com/3dmanufacturing/production/2015/06'
 MAT='http://schemas.microsoft.com/3dmanufacturing/material/2015/02'
 ID='1 0 0 0 1 0 0 0 1 0 0 0'
+PLATE_THUMBNAIL_PX=2400                 # longest edge of the preview embedded for the slicer
 SURFACE_ROLES=['Ivory - road ribbons, default buildings and structural bridge roofs',
     'Green - terrain, recreation, gardens, grass, measured canopy relief and selected buildings',
     'Blue - level water surfaces and selected buildings',
@@ -177,6 +179,20 @@ def metadata_config(meshes,source_file):
     etree.SubElement(assemble,'assemble_item',object_id='9',instance_id='0',transform=transform,offset='0 0 0')
     return etree.tostring(root,xml_declaration=True,encoding='UTF-8',pretty_print=True)
 
+def plate_thumbnail(path):
+    """The preview at slicer-thumbnail size; the full-resolution file stays on disk.
+
+    A slicer shows this small, so embedding a print-quality render would grow
+    every project file for nothing.
+    """
+    with Image.open(path) as im:
+        im=im.convert('RGB')
+        if max(im.size)>PLATE_THUMBNAIL_PX:
+            scale=PLATE_THUMBNAIL_PX/max(im.size)
+            im=im.resize((round(im.width*scale),round(im.height*scale)),Image.Resampling.LANCZOS)
+        buffer=io.BytesIO();im.save(buffer,'PNG');return buffer.getvalue()
+
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--mesh-dir',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--preview',type=Path)
     p.add_argument('--project-settings-template',type=Path,required=True);p.add_argument('--profiles-dir',type=Path,required=True)
@@ -240,7 +256,7 @@ def main():
         # Deliberately stored as an archive metadata part, not a display/title field.
         z.writestr('Metadata/generation_command.json',json.dumps(generation,indent=2))
         z.writestr('Metadata/slice_info.config','<config><header><header_item key="X-BBL-Client-Type" value="slicer"/><header_item key="X-BBL-Client-Version" value="02.08.02.61"/></header></config>')
-        if a.preview and a.preview.exists():z.write(a.preview,'Metadata/plate_1.png')
+        if a.preview and a.preview.exists():z.writestr('Metadata/plate_1.png',plate_thumbnail(a.preview))
     print(a.output,a.output.stat().st_size,'bytes',flush=True)
 
 if __name__=='__main__':main()

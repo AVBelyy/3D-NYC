@@ -12,11 +12,13 @@ idna==3.19
 kiwisolver==1.5.1
 laspy==2.7.0
 lazrs==0.8.2
+llvmlite==0.49.0
 lxml==6.1.2
 manifold3d==3.5.2
 mapbox_earcut==2.0.0
 matplotlib==3.11.1
 networkx==3.6.1
+numba==0.67.0
 numpy==2.5.2
 osmium==4.3.1
 packaging==26.3

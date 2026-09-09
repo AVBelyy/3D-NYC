@@ -442,7 +442,7 @@ class CostSurface(CutChooser):
             minimum_run=minimum_run,
             nominal_index=nominal_index,
             # Priced in the same units as a run: a jog must save at least
-            # `straightness` runs' worth of cheap-surface cost to be worth it.
+            # `straightness` runs' worth of the band's mean cost to be worth it.
             jog_penalty=self.weights.straightness * reference * minimum_run,
             centering_penalty=centering,
             min_jog_levels=max(1, int(round(request.min_jog_ft / level_ft))),
@@ -739,15 +739,18 @@ class _State:
 
 
 # --------------------------------------------------------------------------
-# Assembly and caching
+# Assembly
 # --------------------------------------------------------------------------
 
 
 def surface_key(frame: Frame, target_ft: Polygon, resolution_m: float,
                 weights: CostWeights, sources: dict) -> str:
-    # Deliberately excludes scale and grid step: the raster depends only on the
-    # frame's origin, axes and sampling, so one surface serves every scale a
-    # --fit-scale search tries.
+    """Fingerprint of every input behind the raster, recorded in the plan.
+
+    Deliberately excludes scale and grid step: the raster depends only on the
+    frame's origin, axes and sampling, so two plans share a key exactly when
+    they were routed over the same cut evidence, whatever scale they print at.
+    """
     payload = json.dumps({
         "version": COST_SURFACE_VERSION,
         "origin_ft": list(frame.origin_ft),
@@ -769,7 +772,6 @@ def build_cost_surface(
     resolution_m: float = 4.0,
     margin_m: float = 60.0,
     weights: CostWeights | None = None,
-    planner_cache_dir: Path | None = None,
     use_land_cover: bool = True,
     log=None,
 ) -> CostSurface:
@@ -786,12 +788,6 @@ def build_cost_surface(
             cache_dir, "nyc_land_cover_2017", required=False
         )
     key = surface_key(frame, target_ft, resolution_m, weights, sources)
-    cached = _load_surface(planner_cache_dir, key, grid, weights, sources)
-    if cached is not None:
-        if log:
-            log.info("cost_surface_cached", key=key, shape=list(grid.shape))
-        return cached
-
     if log:
         log.info("cost_surface_building", key=key, shape=list(grid.shape),
                  resolution_m=resolution_m)
@@ -877,7 +873,7 @@ def build_cost_surface(
     cost = np.where(observed, cost, weights.nodata_cost)
     cost = np.where(keep_out, np.inf, cost).astype(np.float32)
 
-    surface = CostSurface(
+    return CostSurface(
         grid=grid, cost=cost, keep_out=keep_out,
         height_m=height_positive.astype(np.float32),
         ground_m=ground.astype(np.float32),
@@ -888,8 +884,6 @@ def build_cost_surface(
                  "keep_out_fraction": float(keep_out.mean()), "key": key},
         keep_out_features=named,
     )
-    _store_surface(planner_cache_dir, key, surface)
-    return surface
 
 
 def _narrow_width(geometry) -> float:
@@ -915,51 +909,3 @@ def _names(frame: gpd.GeoDataFrame, column: str, fallback: str) -> list[str]:
     return values.fillna(fallback).tolist()
 
 
-def _surface_path(planner_cache_dir: Path | None, key: str) -> Path | None:
-    if planner_cache_dir is None:
-        return None
-    return planner_cache_dir / f"cost_{key}.npz"
-
-
-def _load_surface(planner_cache_dir, key, grid, weights, sources) -> CostSurface | None:
-    path = _surface_path(planner_cache_dir, key)
-    features_path = path.with_name(f"cost_{key}_keepouts.parquet") if path else None
-    if path is None or not path.is_file() or not features_path.is_file():
-        return None
-    try:
-        with np.load(path, allow_pickle=False) as data:
-            names = [name for name in data.files if name.startswith("layer_")]
-            layers = {name[len("layer_"):]: data[name] for name in names}
-            meta = json.loads(path.with_suffix(".json").read_text())
-            return CostSurface(
-                grid=grid, cost=data["cost"], keep_out=data["keep_out"],
-                height_m=data["height_m"], ground_m=data["ground_m"],
-                ground_min_m=data["ground_min_m"], layers=layers,
-                weights=weights, sources=meta,
-                keep_out_features=gpd.read_parquet(features_path),
-            )
-    except (OSError, KeyError, ValueError, json.JSONDecodeError):
-        return None
-
-
-def _store_surface(planner_cache_dir, key, surface: CostSurface) -> None:
-    path = _surface_path(planner_cache_dir, key)
-    if path is None:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp.npz")
-    np.savez_compressed(
-        temporary,
-        cost=surface.cost, keep_out=surface.keep_out, height_m=surface.height_m,
-        ground_m=surface.ground_m, ground_min_m=surface.ground_min_m,
-        **{f"layer_{name}": value for name, value in surface.layers.items()},
-    )
-    path.with_suffix(".json").write_text(json.dumps(surface.sources, indent=2, sort_keys=True))
-    if surface.keep_out_features is not None:
-        surface.keep_out_features.to_parquet(
-            path.with_name(f"cost_{path.stem[len('cost_'):]}_keepouts.parquet"),
-            compression="zstd", write_covering_bbox=True, index=False,
-        )
-    # Publish the array bundle last so a resumed run never loads a surface
-    # whose named keep-outs are missing.
-    temporary.replace(path)

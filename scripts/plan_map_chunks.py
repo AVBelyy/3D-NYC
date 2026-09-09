@@ -628,9 +628,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--data-dir", type=Path, default=ROOT / "data", help="Shared input-data root")
     result.add_argument("--cache-dir", type=Path, help="Dataset cache root (defaults to <data-dir>/cache)")
     result.add_argument("--output-dir", type=Path, default=ROOT / "output",
-                        help="Root for generated plans, planner caches, and models")
-    result.add_argument("--planner-cache-dir", type=Path,
-                        help="Reusable cut-cost surfaces (defaults to <output-dir>/planner_cache)")
+                        help="Root for generated plans and models")
     result.add_argument("--no-land-cover", action="store_true",
                         help="Skip the land-cover raster when scoring open ground")
     result.add_argument("--preview", action=argparse.BooleanOptionalAction, default=True,
@@ -696,8 +694,6 @@ def resolve(args) -> dict:
     return {
         "envelope_mm": envelope,
         "cache_dir": cache_dir,
-        "planner_cache_dir": (args.planner_cache_dir
-                              or args.output_dir / "planner_cache").resolve(),
         "scale_ceiling": ceiling,
     }
 
@@ -813,7 +809,6 @@ def run(args, log) -> dict:
         cache_dir=resolved["cache_dir"],
         resolution_m=args.cost_resolution_m,
         weights=weights,
-        planner_cache_dir=resolved["planner_cache_dir"],
         use_land_cover=not args.no_land_cover,
         log=log,
     )

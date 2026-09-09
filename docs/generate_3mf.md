@@ -7,8 +7,8 @@ job provenance manifest.
 
 Run it from the repository root in the Python 3.12 environment described in the
 [project README](../README.md). Packaging reads the installed Bambu Lab P2S
-profiles for the selected nozzle; see `--nozzle-mm`. Preview rendering additionally uses `xcrun` and `clang++`;
-pass `--no-preview` when Xcode Command Line Tools are unavailable.
+profiles for the selected nozzle; see `--nozzle-mm`. Preview rendering needs no
+toolchain beyond the Python environment; pass `--no-preview` to skip it.
 
 ## Quick start
 
@@ -23,8 +23,10 @@ pass `--no-preview` when Xcode Command Line Tools are unavailable.
 If `--output` is omitted, the model is written to
 `output/models/<job-id>.3mf`. The checksum and optional preview are written
 beside the model as `<model-stem>.sha256` and
-`<model-stem>_preview.png`. Intermediate fields, extracted subsets, logs,
-validation reports, and stage records go to `output/jobs/<job-id>/`.
+`<model-stem>_preview.png`. That file is full resolution; the copy embedded in
+the 3MF for the slicer's plate thumbnail is resampled down, so a sharper preview
+does not enlarge every project file. Intermediate fields, extracted subsets,
+logs, validation reports, and stage records go to `output/jobs/<job-id>/`.
 
 ## Crop forms
 

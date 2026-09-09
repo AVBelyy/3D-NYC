@@ -26,7 +26,7 @@ need the full source set that `generate_3mf.py` requires.
   --plan-id manhattan_2m
 ```
 
-Inspect `output/plans/manhattan_2m/preview.png` and `plan.json`, then build the
+Inspect `output/plans/manhattan_2m/preview.svg` and `plan.json`, then build the
 plates:
 
 ```bash
@@ -112,8 +112,15 @@ cutting through a building.
   over buildings  0.25%
   over structures  0.19%
   mean height    6.4 m above ground
-  keep-outs      34 crossings, 4.0 mm longest
+  keep-outs      34 crossings, 4.0 mm longest:
+    - building (building, 4.0 mm on the A12/B13 seam)
+    - FDR Drive (bridge, 3.4 mm on the C12.2/B13 seam)
+    - High Line (bridge, 2.7 mm on the A11/A12 seam)
+  shared datum   -11.47 m NAVD88, relief factor 1.000
 ```
+
+The longest crossings are listed under the summary, named where the publisher
+supplied a name, so a suspicious one can be found in the preview directly.
 
 Quality is measured on the finished plate joints, not on the cuts the search
 made. Compaction merges neighboring pieces afterwards, so part of an early cut
@@ -192,14 +199,24 @@ Run `scripts/plan_map_chunks.py --help` for the complete option reference.
 | --- | --- |
 | `plan.json` | Normalized request, frame, shared values, per-chunk record, seam quality |
 | `commands.sh` | One `generate_3mf.py` invocation per chunk, in assembly order |
-| `chunks/<label>.geojson`, `chunks/<label>.frame.json` | The files those commands reference |
+| `chunks/<plan-id>_<label>.geojson`, `.frame.json` | The files those commands reference |
 | `chunks.geojson` | All chunks with attributes, for GIS inspection |
 | `preview.svg` | Chunk layout over a basemap drawn from the local caches |
 | `preview_cuts.svg` | With `--diagnostics`: the cut-cost surface and keep-outs |
 
-Chunks are labelled by frame position (`A1`, `B2`, ...) for wall assembly.
-Reusable cut-cost surfaces are cached under `output/planner_cache/`; delete that
-directory to force a rebuild after refreshing a source cache.
+The plates themselves are written outside the plan, to
+`<output-dir>/models/<plan-id>_<label>.3mf`, by the commands rather than by the
+planner.
+
+Chunks are labelled by frame position for wall assembly, top-left first: a
+column letter and a row number (`A1`, `B2`, ...). Rows and columns are grouped
+by overlapping extent rather than a fixed pitch, so where two plates land in one
+cell the second takes a suffix (`C12.2`).
+
+The cut-cost surface is rebuilt from `data/cache` on every run and never
+persisted, so a plan always reflects the caches as they are now. Building it
+dominates the runtime: roughly 70 of the 90 seconds a Manhattan-sized plan
+takes at `--cost-resolution-m 4`, against about 11 for the partition search.
 
 ## Why the shared values matter
 

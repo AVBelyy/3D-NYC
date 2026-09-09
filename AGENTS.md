@@ -115,8 +115,8 @@ also check local Markdown links, run affected CLIs with `--help`, and use
 `git diff --check`.
 
 Generating a complete 3MF requires source caches and installed Bambu Lab P2S
-0.4 mm profiles; previews additionally use the platform renderer. Use parser,
-unit, and validation tests when a full geospatial build would be disproportionate.
+0.4 mm profiles. Use parser, unit, and validation tests when a full geospatial
+build would be disproportionate.
 
 Do not claim that a model is physically printable solely because mesh or slicer
 validation passed. Recommend a representative physical test for consequential
