@@ -19,6 +19,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -1337,22 +1338,55 @@ class Pipeline:
             "cache": str(cached[0]) if cached else None,
         })
 
+    def reap(self, process: subprocess.Popen, stage: str) -> None:
+        """Take the child's whole process group down with an abandoned stage.
+
+        A stage that unwinds early -- an interrupt, or a failure raised while
+        reading output -- used to leave its child running.  A long boolean pass
+        does not reach a Python signal handler until it returns from C++, so ask
+        once and then insist; both waits are bounded because the next attempt
+        must not have to compete with the abandoned one for CPU and memory.
+        """
+        if process.poll() is not None:
+            return
+        self.log.warning("command_abandoned", stage=stage, pid=process.pid)
+        for number, grace in ((signal.SIGTERM, 5.0), (signal.SIGKILL, 5.0)):
+            try:
+                os.killpg(process.pid, number)
+            except (ProcessLookupError, PermissionError):
+                pass
+            try:
+                process.wait(timeout=grace)
+                self.log.info("command_terminated", stage=stage, pid=process.pid,
+                              signal=number.name, return_code=process.returncode)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+        self.log.error("command_termination_failed", stage=stage, pid=process.pid)
+
     def run_command(self, stage: str, command: list[str]):
         log_path = self.logs / f"{stage}.log"
         self.log.info("command_started", stage=stage, command=command, log=str(log_path))
         started = time.monotonic()
         with log_path.open("w") as output:
+            # Own session so the child leads its own process group: the whole
+            # group is then addressable as one unit in ``reap``, including any
+            # workers the stage forks for itself.
             process = subprocess.Popen(
                 command, cwd=ROOT, env=self.env, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, bufsize=1,
+                start_new_session=True,
             )
             assert process.stdout is not None
-            for line in process.stdout:
-                output.write(line)
-                output.flush()
-                if line.startswith("PROGRESS "):
-                    self.log.info("command_progress", stage=stage, message=line.strip()[9:])
-            process.wait()
+            try:
+                for line in process.stdout:
+                    output.write(line)
+                    output.flush()
+                    if line.startswith("PROGRESS "):
+                        self.log.info("command_progress", stage=stage, message=line.strip()[9:])
+                process.wait()
+            finally:
+                self.reap(process, stage)
         elapsed = time.monotonic() - started
         if process.returncode:
             tail = "\n".join(log_path.read_text(errors="replace").splitlines()[-40:])
