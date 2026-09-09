@@ -2,7 +2,7 @@
 import argparse,hashlib,json,re,shutil,zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from map_common import VALID
+from map_common import OUTPUT_DIR
 from slice_3mf import SLICER,run_slice
 
 SPOOL_G=1000.
@@ -21,7 +21,8 @@ def parse_duration(text):
 
 
 def format_duration(seconds):
-    seconds=int(round(seconds));hours,rest=divmod(seconds,3600)
+    seconds=int(round(seconds));hours,rest=divmod(seconds,3600);days,hours=divmod(hours,24)
+    if days:return f'{days}d {hours:02d}h {rest//60:02d}m'
     return f'{hours}h {rest//60:02d}m' if hours else f'{rest//60}m {rest%60:02d}s'
 
 
@@ -108,6 +109,15 @@ def part_labels(model):
 
 def sha256(path):
     with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
+
+
+def job_slice_root(model):
+    """Derived slices belong to the job that produced the model, beside its other validation."""
+    job=OUTPUT_DIR/'jobs'/model.stem
+    if not job.is_dir():
+        raise SystemExit(f'{model.name} does not match a job under {OUTPUT_DIR/"jobs"}; '
+            'pass --slice-dir to say where its derived slices go')
+    return job/'validation'/'estimates'
 
 
 def slice_dir(model,root,replace,slicer):
@@ -207,8 +217,9 @@ def report(entries):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('models',nargs='+',type=Path,help='3MF files to estimate')
-    parser.add_argument('--slice-dir',type=Path,default=VALID/'estimates',
-        help='Directory holding derived slices, reused when the input bytes match')
+    parser.add_argument('--slice-dir',type=Path,
+        help='Directory holding derived slices, reused when the input bytes match '
+            '(default: the producing job, output/jobs/<job-id>/validation/estimates)')
     parser.add_argument('--replace',action='store_true',help='Reslice even when a cached slice matches')
     parser.add_argument('--force-slice',action='store_true',
         help='Slice locally even if the 3MF already carries slice metadata')
@@ -217,9 +228,8 @@ def main():
     args=parser.parse_args()
     if not args.slicer.exists():
         raise SystemExit(f'Bambu Studio executable is missing: {args.slicer}')
-    args.slice_dir.mkdir(parents=True,exist_ok=True)
-    entries=[collect(model,args.slice_dir,args.replace,args.force_slice,args.slicer)
-        for model in args.models]
+    entries=[collect(model,args.slice_dir or job_slice_root(model),
+        args.replace,args.force_slice,args.slicer) for model in args.models]
     report(entries)
     if args.json:args.json.write_text(json.dumps(entries,indent=2)+'\n')
 

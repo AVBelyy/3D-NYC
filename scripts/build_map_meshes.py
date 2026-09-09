@@ -953,7 +953,7 @@ def underpasses(materials,fields,folder):
 
 def main():
     p=argparse.ArgumentParser();p.add_argument('--stride',type=int,default=1);p.add_argument('--reuse-base',action='store_true');a=p.parse_args()
-    folder=OUT/('mesh' if a.stride==1 else f'mesh_draft_{a.stride}');folder.mkdir(exist_ok=True)
+    folder=OUT/('mesh' if a.stride==1 else f'mesh_draft_{a.stride}');folder.mkdir(parents=True,exist_ok=True)
     fields=np.load(OUT/'map_fields.npz');mats=[];report={'stride':a.stride,'parts':{}}
     phase=Phases()
     if 'substrate_top_mm' not in fields:

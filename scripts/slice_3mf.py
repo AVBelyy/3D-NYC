@@ -1,7 +1,7 @@
 """Run a local Bambu Studio CLI validation slice; never send anything to a printer."""
 import argparse, datetime, hashlib, json, re, shutil, subprocess, time
 from pathlib import Path
-from map_common import ROOT, VALID, write_json
+from map_common import CACHE_DIR, VALID, write_json
 
 
 EXTRUSION=re.compile(r'(?:^|\s)E([-+]?(?:\d+(?:\.\d*)?|\.\d+))(?=\s|$)')
@@ -43,7 +43,7 @@ def audit_sliced_gcode(path):
 def run_slice(model,output,slicer=SLICER,export_project=False):
     """Slice one model offline into output and record the invocation; never contacts a printer."""
     output.mkdir(parents=True,exist_ok=False)
-    command=[str(slicer),'--datadir',str(VALID/'bambu_profile'),
+    command=[str(slicer),'--datadir',str(CACHE_DIR/'bambu_profile'),
         '--debug','3','--arrange','0','--orient','0','--slice','1',
         '--mtcpp','10000000','--mstpp','7200','--outputdir',str(output)]
     if export_project:command+=['--export-3mf',str(output/'sliced.3mf')]

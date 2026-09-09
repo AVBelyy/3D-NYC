@@ -1,5 +1,5 @@
 """Shared map/model coordinate helpers. Model coordinates are millimetres."""
-import json,os
+import atexit,json,os,tempfile
 from pathlib import Path
 import numpy as np,geopandas as gpd,shapely,rasterio
 from affine import Affine
@@ -14,11 +14,30 @@ DOWNLOAD_MANIFESTS=Path(os.environ.get('NYC_DOWNLOAD_MANIFEST_DIR',RAW)).resolve
 CONFIG_PATH=Path(os.environ.get('MAP_CONFIG',ROOT/'scripts/map_config.example.json')).resolve()
 CFG=json.loads(CONFIG_PATH.read_text())
 OUTPUT_DIR=Path(os.environ.get('NYC_OUTPUT_DIR',ROOT/'output')).resolve()
-STANDALONE=OUTPUT_DIR/'standalone'
-OUT=Path(os.environ.get('MAP_WORK_DIR',STANDALONE/'work')).resolve();OUT.mkdir(parents=True,exist_ok=True)
-VALID=Path(os.environ.get('NYC_VALID_DIR',STANDALONE/'validation')).resolve();VALID.mkdir(parents=True,exist_ok=True)
-PROCESSED=Path(os.environ.get('NYC_PROCESSED_DIR',STANDALONE/'processed')).resolve()
-ANALYSIS=Path(os.environ.get('NYC_ANALYSIS_DIR',STANDALONE/'analysis')).resolve();ANALYSIS.mkdir(parents=True,exist_ok=True)
+_SCRATCH=None
+
+def _scratch():
+    """One throwaway directory per process, removed at exit.
+
+    A run inside a job is handed every directory it may write to. A run without
+    one is an experiment, so its output belongs outside the repository and is
+    not worth keeping; pass the environment variables below to keep it.
+    """
+    global _SCRATCH
+    if _SCRATCH is None:
+        _SCRATCH=tempfile.TemporaryDirectory(prefix='3d-nyc-')
+        atexit.register(_SCRATCH.cleanup)
+    return Path(_SCRATCH.name)
+
+def _job_dir(variable,name):
+    value=os.environ.get(variable)
+    if value:return Path(value).resolve()  # a job owns and creates its own directories
+    path=_scratch()/name;path.mkdir(parents=True,exist_ok=True);return path
+
+OUT=_job_dir('MAP_WORK_DIR','work')
+VALID=_job_dir('NYC_VALID_DIR','validation')
+PROCESSED=_job_dir('NYC_PROCESSED_DIR','processed')
+ANALYSIS=_job_dir('NYC_ANALYSIS_DIR','analysis')
 FT=.3048006096012192
 K=FT*1000/CFG['scale_denominator']
 W,H=CFG['size_mm'];STEP=CFG['grid_step_mm']
