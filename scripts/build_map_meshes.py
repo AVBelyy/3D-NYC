@@ -51,6 +51,16 @@ INITIAL_SIMPLIFY_MM=float(CFG.get('mesh_simplify_mm',.006))
 # seam apart, leaving an enclosed wedge. Preserve the constructed interfaces.
 FINAL_SIMPLIFY_MM=0.
 MAXIMUM_BRIDGE_SPAN_NOZZLES=3.
+# How much of an overpass's lower route may already be open before the overpass
+# stops cutting its own opening. An interchange stacks many bridge ways over one
+# street and every one of them resolves to the same lower route and the same
+# short piece of it; cutting that piece once per deck stacks a dozen floor slabs
+# whose walls coincide laterally and whose tops sit microns apart, which is the
+# pathological input for exact CSG. One opening serves the whole stack, because
+# the void is subtracted from every material, so the decks that keep their own
+# geometry still have clear air beneath them. This is a fraction of the
+# candidate's own length, so it holds at any scale, tile size or road width.
+REOPENED_ROUTE_FRACTION=.5
 OPENING_STATUSES={'cut','water bridge opening','road/path overpass opening'}
 
 def maximum_bridge_span_mm(nozzle_mm):
@@ -526,6 +536,30 @@ def strip_solid(line,width,bottom,top,steps=24,arch_rise=0):
     for j in range(1,count-1):faces.extend([[0,j,j+1],[steps*count,steps*count+j+1,steps*count+j]])
     mesh=trimesh.Trimesh(verts,faces,process=False);mesh.fix_normals();return solid(mesh)
 
+def route_span(line,segment):
+    """Locate a sub-line of a route in that route's own along-track coordinate.
+
+    Comparing openings along the route rather than in the plane keeps the test
+    free of any lateral tolerance: two overpasses either reopen the same stretch
+    of the same way or they do not, whatever the road's width or the model's
+    scale.
+    """
+    ends=[float(shapely.line_locate_point(line,Point(*segment.coords[end]))) for end in (0,-1)]
+    return min(ends),max(ends)
+
+def span_covered(spans,span):
+    """Return how much of ``span`` the disjoint intervals ``spans`` already hold."""
+    start,end=span
+    return sum(max(0.,min(end,b)-max(start,a)) for a,b in spans)
+
+def merge_span(spans,span):
+    """Insert ``span`` into ``spans``, coalescing every interval it touches."""
+    start,end=span;kept=[]
+    for a,b in spans:
+        if b<start or a>end:kept.append((a,b))
+        else:start,end=min(start,a),max(end,b)
+    return sorted(kept+[(start,end)])
+
 def polygon_prism(geom,z0,z1):
     parts=[]
     for poly in shapely.get_parts(shapely.make_valid(geom)):
@@ -619,6 +653,9 @@ def underpasses(materials,fields,folder):
     vertical=CFG.get('vertical_exaggeration',1.)
     to_z=lambda elevation:(elevation-origin)*1000/CFG['scale_denominator']*vertical*terrain_factor+CFG['minimum_terrain_mm']
     cut_tunnels=[]
+    # Stretches of each lower route that an accepted opening has already
+    # reopened, in that route's along-track coordinate. See REOPENED_ROUTE_FRACTION.
+    reopened={}
     if (OUT/'tunnels.parquet').exists() and CFG['infer_hidden_road_profiles']:
         for _,row in gpd.read_parquet(OUT/'tunnels.parquet').iterrows():
             line=local(row.geometry)
@@ -867,6 +904,14 @@ def underpasses(materials,fields,folder):
                     'lower_osm_id':lower_id,'minimum_inferred_road_mm':float(profile.road.min()),
                     'minimum_printable_floor_mm':route_floor,'deck_top_mm':deck,
                     'method':row.height_method});continue
+            span=route_span(lower_line,segment)
+            if span_covered(reopened.get(lower_id,()),span)>REOPENED_ROUTE_FRACTION*(span[1]-span[0]):
+                report.append({'osm_id':int(row.osm_id),
+                    'status':'bridge deck retained: lower route already reopened',
+                    'lower_osm_id':lower_id,'deck_top_mm':deck,
+                    'reopened_fraction':span_covered(reopened[lower_id],span)/max(span[1]-span[0],1e-12),
+                    'method':row.height_method});continue
+            reopened[lower_id]=merge_span(reopened.get(lower_id,[]),span)
             # The hidden column under a reopened roadway is substrate like any
             # other, so only the visible skin belongs to the route's own colour.
             # This used to be done for trails alone, which left an ordinary road
