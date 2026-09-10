@@ -6,8 +6,9 @@ packages Bambu project settings, validates the result, and records a
 job provenance manifest.
 
 Run it from the repository root in the Python 3.12 environment described in the
-[project README](../README.md). Packaging reads the installed Bambu Lab P2S
-profiles for the selected nozzle; see `--nozzle-mm`. Preview rendering needs no
+[project README](../README.md). Packaging reads the installed profiles for the
+printer named by the project settings template and the selected nozzle; see
+`--nozzle-mm`. Preview rendering needs no
 toolchain beyond the Python environment; pass `--no-preview` to skip it.
 
 ## Quick start
@@ -85,13 +86,15 @@ BIN, DoITT ID, and BBL selectors do not use GeoSearch.
 - `--vertical-exaggeration` scales measured vertical relief.
 - `--terrain-relief-factor` explicitly scales ground relief; otherwise the
   generator enforces its minimum printable relief budget automatically.
-- `--nozzle-mm` selects the installed P2S nozzle: 0.2, 0.4 (the default), 0.6 or
-  0.8. It sets the printable minimum for every drawn feature and selects the
-  machine and process presets, which Bambu names for the nozzle. Each nozzle
-  offers its own layer heights, so `--layer-height` is validated against the
-  chosen nozzle and an unavailable combination is refused with the list of
-  heights that nozzle does ship.
-- `--layer-height` selects an installed P2S process layer height. The pavement
+- `--nozzle-mm` selects the nozzle, defaulting to the one the project settings
+  template declares. It sets the printable minimum for every drawn feature and
+  selects the machine and process presets, which Bambu names for the nozzle.
+  Which sizes exist is read from the profiles Bambu Studio ships for the
+  configured printer, so a different printer offers its own. Each nozzle offers
+  its own layer heights, so `--layer-height` is validated against the chosen
+  nozzle and an unavailable combination is refused with the list of heights that
+  nozzle does ship.
+- `--layer-height` selects an installed process layer height. The pavement
   pad is rounded up to a whole number of layers for the chosen height, so a
   kerb slices identically along its whole length instead of appearing only on
   the layers whose z-plane happens to fall above the ground beside it. Every

@@ -42,8 +42,11 @@ Estimate filament and print time for finished models:
 `estimate_print_stats.py` reports per-filament grams, the share spent on
 tool-change purge, cost, and the slicer's own time prediction. A generated 3MF
 carries no such numbers, so the script runs an offline Bambu Studio slice and
-writes it beside the model as `<model>.gcode.3mf`, a sliced project that Bambu
-Studio opens ready to print without reslicing. That project is also the cache:
+writes it beside the model as `<model>.gcode.3mf`, a sliced file that Bambu
+Studio opens ready to print without reslicing. That file carries the toolpaths
+and the plate but no mesh: a 3MF that still holds its objects opens as a project
+to edit, and Studio then discards the G-code and reslices. The mesh stays in the
+`<model>.3mf` beside it. That project is also the cache:
 a rerun reuses it while it still matches the model's SHA-256, and no loose
 G-code is left behind. A project that already carries slice metadata is read
 directly. Pass several models to get a combined per-color spool total, and

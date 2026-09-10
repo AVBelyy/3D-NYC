@@ -36,7 +36,6 @@ from _material_layers import MATERIAL_NAMES
 from generate_3mf import (
     FT,
     NYC_BOUNDS,
-    PROCESS_PRESETS,
     parse_bounding_polygon,
     parse_material_color,
     parse_size,
@@ -596,8 +595,9 @@ def parser() -> argparse.ArgumentParser:
         help="Report keep-out crossings instead of failing on them",
     )
     result.add_argument(
-        "--layer-height", type=float, choices=sorted(PROCESS_PRESETS), default=0.16,
-        help=("Process layer height shared by every plate. The default resolves the map's "
+        "--layer-height", type=float, default=0.16,
+        help=("Process layer height shared by every plate, checked against the installed "
+              "printer profile when a plate is generated. The default resolves the map's "
               "0.16 mm pavement pad in exactly one layer, so a kerb slices identically "
               "along its whole length"),
     )

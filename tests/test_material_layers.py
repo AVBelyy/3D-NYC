@@ -10,6 +10,12 @@ from _material_layers import (COARSEST_LAYER_HEIGHT_MM,DRAWN_LINE_RELIEF_MM,
     printable_material_index,printable_feature_width_mm,
     printable_surface_mm,surface_color_depth_mm,white_substrate_top)
 from build_map_meshes import material_solid
+# Which presets exist is the installed printer profile's to say, so these design
+# invariants are checked against the layer heights the project is willing to print
+# rather than against one printer's catalogue, which no test may depend on.
+NOZZLE_LAYER_HEIGHTS={0.2:(.08,.10,.12),0.4:(.08,.12,.16,.20,.24),
+    0.6:(.18,.24,.30),0.8:(.24,.32,.40)}
+DEFAULT_NOZZLE_MM=0.4
 from _surface_styles import apply_street_palette,paint_bridge_decks,paint_trail_ribbons,stair_tread_mask
 
 
@@ -25,8 +31,7 @@ class DrawnLineReliefTests(unittest.TestCase):
         self.assertEqual(heights,{DRAWN_LINE_RELIEF_MM})
 
     def test_the_default_prints_raised_at_the_coarsest_supported_layer(self):
-        from generate_3mf import PROCESS_PRESETS,DEFAULT_NOZZLE_MM
-        coarsest=max(PROCESS_PRESETS[DEFAULT_NOZZLE_MM])
+        coarsest=max(NOZZLE_LAYER_HEIGHTS[DEFAULT_NOZZLE_MM])
         self.assertLessEqual(coarsest,COARSEST_LAYER_HEIGHT_MM)
         self.assertGreaterEqual(DRAWN_LINE_RELIEF_MM,2*coarsest)
 
@@ -34,8 +39,7 @@ class DrawnLineReliefTests(unittest.TestCase):
         # The design reference is the default nozzle's coarsest layer, so the
         # runtime floor is what has to carry the coarser profiles a wider nozzle
         # offers.  Nothing may print flatter than two layers there either.
-        from generate_3mf import PROCESS_PRESETS
-        for nozzle,heights in PROCESS_PRESETS.items():
+        for nozzle,heights in NOZZLE_LAYER_HEIGHTS.items():
             for layer in heights:
                 with self.subTest(nozzle=nozzle,layer=layer):
                     pad=pavement_pad_relief_mm(layer)
@@ -304,8 +308,7 @@ class PavementPadReliefTests(unittest.TestCase):
     """A pad shallower than one layer prints intermittently, not shallowly."""
 
     def profiles(self):
-        from generate_3mf import PROCESS_PRESETS
-        return sorted(PROCESS_PRESETS)
+        return sorted(NOZZLE_LAYER_HEIGHTS)
 
     def test_the_pad_is_a_whole_number_of_layers_on_every_supported_profile(self):
         for layer in self.profiles():

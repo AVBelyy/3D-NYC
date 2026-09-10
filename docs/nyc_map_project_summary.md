@@ -32,8 +32,9 @@ shoulders remain green.
 Every drawn width is floored at what the selected nozzle can lay, and a color
 region the nozzle cannot draw at all is absorbed into the neighbor that
 surrounds it rather than widened at that neighbor's expense. `--nozzle-mm`
-selects the installed P2S nozzle -- 0.2, 0.4 (the default), 0.6, or 0.8 mm --
-and sets that printable minimum.
+selects the nozzle, defaulting to the one the project settings template
+declares, and sets that printable minimum. The sizes on offer come from the
+profiles installed for the configured printer.
 
 The substrate every visible surface is seated on is the largest share of the
 print by volume and none of its cartography. `--foundation-color` chooses which
@@ -98,7 +99,7 @@ widths. Full validation adds more expensive pairwise intersection checks.
 The 3MF embeds a shell-safe generation command and the packaged Bambu project
 settings. The full normalized configuration remains in the job directory. An
 optional Bambu Studio slice verifies that the archive can be consumed with the
-installed P2S profiles for the selected nozzle; it does not certify adhesion,
+installed profiles for the selected nozzle; it does not certify adhesion,
 color transitions, surface finish, or unsupported features.
 
 Each nozzle ships its own process layer heights, so `--layer-height` is

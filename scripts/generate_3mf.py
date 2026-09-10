@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import hashlib
 import json
 import logging
@@ -76,41 +77,88 @@ PRIME_TOWER_POSITION_MM = (214.0, 80.0)
 # as a bead rather than a millimetre count so it follows --nozzle-mm.
 PRIME_TOWER_CLEARANCE_BEADS = 1.0
 SCRIPT_DIR = Path(__file__).resolve().parent
-# Bambu names its 0.4 mm presets without a suffix and every other size with one,
-# and each nozzle offers its own layer heights: a 0.6 mm nozzle cannot lay a
-# 0.08 mm layer and a 0.2 mm one cannot lay 0.24.  These are the P2S presets
-# Bambu Studio ships, so --layer-height is checked against the selected nozzle's
-# row rather than against one global list.
-PROCESS_PRESETS = {
-    0.2: {
-        0.08: "0.08mm High Quality @BBL P2S 0.2 nozzle",
-        0.10: "0.10mm Standard @BBL P2S 0.2 nozzle",
-        0.12: "0.12mm Balanced Quality @BBL P2S 0.2 nozzle",
-    },
-    0.4: {
-        0.08: "0.08mm High Quality @BBL P2S",
-        0.12: "0.12mm High Quality @BBL P2S",
-        0.16: "0.16mm Standard @BBL P2S",
-        0.20: "0.20mm Standard @BBL P2S",
-        0.24: "0.24mm Standard @BBL P2S",
-    },
-    0.6: {
-        0.18: "0.18mm Balanced Quality @BBL P2S 0.6 nozzle",
-        0.24: "0.24mm Balanced Quality @BBL P2S 0.6 nozzle",
-        0.30: "0.30mm Standard @BBL P2S 0.6 nozzle",
-    },
-    0.8: {
-        0.24: "0.24mm Balanced Quality @BBL P2S 0.8 nozzle",
-        0.32: "0.32mm Balanced Quality @BBL P2S 0.8 nozzle",
-        0.40: "0.40mm Standard @BBL P2S 0.8 nozzle",
-    },
-}
+# Bambu names its presets per printer and nozzle, and each nozzle offers its own
+# layer heights: a 0.6 mm nozzle cannot lay a 0.08 mm layer and a 0.2 mm one
+# cannot lay 0.24.  Which presets exist is the installed profile's to say, so the
+# catalogue is read from the profiles Bambu Studio ships rather than restated here.
 DEFAULT_NOZZLE_MM = 0.4
 
 
-def machine_preset(nozzle_mm: float) -> str:
-    """Return the installed P2S machine preset for a nozzle size."""
-    return f"Bambu Lab P2S {nozzle_mm:g} nozzle"
+def preset_field(preset: dict, folder: Path, field: str):
+    """Read a preset field, following the `inherits` chain the shipped profiles are written in."""
+    seen: set[str] = set()
+    current = preset
+    while current is not None:
+        if field in current:
+            return current[field]
+        parent = current.get("inherits")
+        if not parent or parent in seen:
+            return None
+        seen.add(parent)
+        path = folder / f"{parent}.json"
+        current = json.loads(path.read_text()) if path.is_file() else None
+    return None
+
+
+def variant_of(preset: str) -> str:
+    """The quality variant a preset name carries, such as `Standard` in `0.20mm Standard @BBL P2S`."""
+    return re.sub(r"^\d+(?:\.\d+)?mm\s+", "", preset).split(" @")[0].strip()
+
+
+@functools.lru_cache(maxsize=None)
+def installed_presets(printer_model: str, slicer: Path) -> dict:
+    """Map one printer's installed machine and process presets by nozzle size.
+
+    Returns ``{"machines": {nozzle: preset}, "processes": {nozzle: {layer: preset}}}``
+    for whichever vendor profile declares ``printer_model``, so a different printer
+    brings its own nozzle sizes and layer heights without a code change.
+    """
+    root = Path(slicer).resolve().parents[1] / "Resources" / "profiles"
+    machines: dict[float, str] = {}
+    preferred: dict[float, str] = {}
+    candidates: dict[float, dict[float, list[str]]] = {}
+    for vendor in sorted(root.glob("*.json")):
+        catalogue = json.loads(vendor.read_text())
+        folder = root / vendor.stem
+        nozzles: dict[str, float] = {}
+        for entry in catalogue.get("machine_list", []):
+            path = folder / entry.get("sub_path", "")
+            if not path.is_file():
+                continue
+            preset = json.loads(path.read_text())
+            diameters = preset.get("nozzle_diameter") or []
+            if preset.get("printer_model") != printer_model or not diameters:
+                continue
+            nozzle = float(diameters[0])
+            nozzles[preset["name"]] = nozzle
+            if nozzle not in machines:
+                machines[nozzle] = preset["name"]
+                default = preset_field(preset, folder / "machine", "default_print_profile")
+                preferred[nozzle] = variant_of(default) if default else ""
+        if not nozzles:
+            continue
+        for entry in catalogue.get("process_list", []):
+            path = folder / entry.get("sub_path", "")
+            if not path.is_file():
+                continue
+            preset = json.loads(path.read_text())
+            compatible = [name for name in preset.get("compatible_printers", []) if name in nozzles]
+            height = preset_field(preset, folder / "process", "layer_height") if compatible else None
+            if height is None:
+                continue
+            for name in compatible:
+                candidates.setdefault(nozzles[name], {}).setdefault(float(height), []).append(preset["name"])
+    # Several presets share a layer height; the machine's own default names the
+    # quality variant to prefer, and the rest is settled by name so a rerun agrees.
+    processes = {
+        nozzle: {
+            height: next((name for name in sorted(names) if variant_of(name) == preferred.get(nozzle)),
+                sorted(names)[0])
+            for height, names in heights.items()}
+        for nozzle, heights in candidates.items()}
+    return {"machines": machines, "processes": processes}
+
+
 NYC_BOUNDS = (-74.27, 40.47, -73.68, 40.93)
 MATERIAL_COLORS = ["#F2F0E8", "#5FAA72", "#A9D5DF", "#C79A61"]
 BUILDING_COLOR_ALIASES = {
@@ -1989,12 +2037,13 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--grid-step-mm", type=float, default=0.125, help="Manufacturing raster spacing")
     result.add_argument(
-        "--nozzle-mm", type=float, choices=sorted(PROCESS_PRESETS), default=DEFAULT_NOZZLE_MM,
-        help="Installed P2S nozzle size; sets the printable minimum for every drawn feature",
+        "--nozzle-mm", type=float, default=None,
+        help="Installed nozzle size, defaulting to the project template's; sets the "
+             "printable minimum for every drawn feature",
     )
     result.add_argument(
         "--layer-height", type=float, default=0.24,
-        help="Installed official P2S process layer height for the selected nozzle",
+        help="Installed process layer height for the selected nozzle",
     )
     result.add_argument(
         "--prime-tower", choices=["auto", "on", "off"], default="auto",
@@ -2188,6 +2237,25 @@ def build_config(args) -> tuple[dict, str, Path]:
     for dimension in [width, height]:
         if abs(dimension / args.grid_step_mm - round(dimension / args.grid_step_mm)) > 1e-6:
             raise ValueError("Width and height must be exact multiples of --grid-step-mm")
+    template = json.loads(args.project_settings_template.read_text())
+    printer_model = template.get("printer_model", "")
+    if args.nozzle_mm is None:
+        args.nozzle_mm = float((template.get("nozzle_diameter") or [DEFAULT_NOZZLE_MM])[0])
+    presets = installed_presets(printer_model, args.bambu_studio.resolve())
+    offered = presets["processes"]
+    if not offered:
+        raise ValueError(
+            f"No installed profiles for {printer_model or 'the configured printer'} beside "
+            f"{args.bambu_studio}; install Bambu Studio or point --bambu-studio at it")
+    if args.nozzle_mm not in offered:
+        raise ValueError(
+            f"{printer_model} has no installed process preset for a {args.nozzle_mm:g} mm nozzle; "
+            "available: " + ", ".join(f"{size:g}" for size in sorted(offered)))
+    if args.layer_height not in offered[args.nozzle_mm]:
+        raise ValueError(
+            f"Layer height {args.layer_height:g} mm has no installed {printer_model} process preset "
+            f"for a {args.nozzle_mm:g} mm nozzle; available: "
+            + ", ".join(f"{height:g}" for height in sorted(offered[args.nozzle_mm])))
     proposed_prime_layout = prime_tower_layout(width, height, args.nozzle_mm)
     prime = args.prime_tower == "on" or (
         args.prime_tower == "auto" and proposed_prime_layout["fits"]
@@ -2235,11 +2303,6 @@ def build_config(args) -> tuple[dict, str, Path]:
     slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", slug)
     output = (args.output or args.output_dir / "models" / f"{slug}.3mf").resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    if args.layer_height not in PROCESS_PRESETS[args.nozzle_mm]:
-        raise ValueError(
-            f"Layer height {args.layer_height:g} mm has no installed P2S process preset for a "
-            f"{args.nozzle_mm:g} mm nozzle; available: "
-            + ", ".join(f"{height:g}" for height in sorted(PROCESS_PRESETS[args.nozzle_mm])))
     # Every drawn width below is a cartographic choice floored by what this
     # nozzle can lay, so a coarser nozzle widens a symbol rather than dropping
     # it and a finer one never shrinks it below the width the map intends.
@@ -2292,8 +2355,8 @@ def build_config(args) -> tuple[dict, str, Path]:
         "building_color_overrides": args.building_colors,
         "plate_translation_mm": translation, "nozzle_mm": args.nozzle_mm, "wall_generator": "arachne",
         "layer_height_mm": args.layer_height,
-        "process_preset": PROCESS_PRESETS[args.nozzle_mm][args.layer_height],
-        "machine_preset": machine_preset(args.nozzle_mm),
+        "process_preset": offered[args.nozzle_mm][args.layer_height],
+        "machine_preset": presets["machines"][args.nozzle_mm],
         # The first layer sets the phase of every slicing plane above it, so the
         # meshes are quantized against it and the sliced profile must repeat it.
         "first_layer_height_mm": FIRST_LAYER_HEIGHT_MM,
@@ -2327,7 +2390,7 @@ def main() -> None:
         if not reference.exists():
             raise FileNotFoundError(f"Required clean Bambu project-settings template is missing: {reference}")
         if not profiles.exists():
-            raise FileNotFoundError(f"Bambu Studio P2S profiles were not found beside {slicer}")
+            raise FileNotFoundError(f"Bambu Studio profiles were not found beside {slicer}")
         if args.slice and not slicer.exists():
             raise FileNotFoundError(f"Bambu Studio executable is missing: {slicer}")
         Pipeline(args, config, args.output_dir.resolve() / "jobs" / slug, output, reference, profiles, slicer).run()

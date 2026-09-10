@@ -55,7 +55,8 @@ Run commands from the repository root. Use Python 3.12 and install
   there. A model's sliced project, `<model>.gcode.3mf`, is the exception that
   proves the rule: it is a deliverable of the model rather than of a job, so it
   sits beside the model it was sliced from and doubles as that model's estimate
-  cache.
+  cache. It holds toolpaths and no mesh, which is what makes Bambu Studio treat
+  it as a sliced file to print rather than a project to reslice.
 - A stage script run outside a job writes to a private temporary directory that
   is deleted when the process exits, because `map_common` resolves `MAP_WORK_DIR`,
   `NYC_VALID_DIR`, `NYC_PROCESSED_DIR`, and `NYC_ANALYSIS_DIR` to one per-process
@@ -74,6 +75,11 @@ Run commands from the repository root. Use Python 3.12 and install
   fixtures; they must not silently read a developer's ignored caches or create
   fake manifests marked production-ready. Put full real-data checks in an
   explicitly marked, separately provisioned integration workflow.
+- Printer specifics belong to the installed profile, not to code: the printer is
+  named by `data/bambu/project_settings.json`, and its nozzle sizes, layer
+  heights, machine and process preset names, and vendor model id are read from
+  the profiles beside the Bambu Studio executable. Do not restate one printer's
+  catalogue in a constant, and keep tests off it so they stay hermetic.
 - Preserve the distinction between EPSG:2263 source geometry, metre-valued
   NAVD88 elevations, and millimetre-valued print geometry.
 
@@ -120,8 +126,9 @@ CI runs the same command on Ubuntu with Python 3.12. For documentation changes,
 also check local Markdown links, run affected CLIs with `--help`, and use
 `git diff --check`.
 
-Generating a complete 3MF requires source caches and the installed Bambu Lab
-P2S profiles for the selected `--nozzle-mm` (0.4 mm by default). Use parser,
+Generating a complete 3MF requires source caches and the profiles Bambu Studio
+installs for the printer named in `data/bambu/project_settings.json`, for the
+selected `--nozzle-mm` (the template's own nozzle by default). Use parser,
 unit, and validation tests when a full geospatial build would be
 disproportionate.
 

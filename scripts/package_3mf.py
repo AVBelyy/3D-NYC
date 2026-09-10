@@ -1,7 +1,7 @@
 """Write a four-part Bambu-compatible 3MF with explicit filament assignments.
 
 The supplied project's palette/settings are a starting point. Executable hooks are
-cleared, and machine G-code templates are taken from the installed official P2S preset.
+cleared, and machine G-code templates are taken from the installed official preset.
 This script exports a project only; it never connects to or starts a printer.
 """
 import argparse,io,json,re,shlex,uuid,zipfile
@@ -31,6 +31,8 @@ SURFACE_ROLES=['Ivory - road ribbons, default buildings and structural bridge ro
 # "Top surfaces", "Topmost surface" and "All solid layer"; note they are not
 # PrusaSlicer's, which spells the first "none" and has no "no ironing".
 IRONING_TYPES=('no ironing','top','topmost','solid')
+# The material is the map's choice; which vendor preset spells it is the profile's.
+FILAMENT_MATERIAL='Bambu PLA Matte'
 
 
 def part_names():
@@ -84,8 +86,15 @@ def settings(template,profiles):
     # reported by name: it means Bambu Studio does not ship that combination,
     # or ships it under a name this build does not know.
     nozzle=float(CFG['nozzle_mm'])
-    machine_name=CFG.get('machine_preset',f'Bambu Lab P2S {nozzle:g} nozzle')
     process_name=CFG['process_preset']
+    machine_name=CFG.get('machine_preset')
+    if not machine_name:
+        raise ValueError('The job config names no machine_preset; regenerate it with generate_3mf.py')
+    # Bambu suffixes a preset with its nozzle only when that is not the printer's
+    # default size, so what remains of the process preset's own name is the family
+    # every other preset for this printer is named after.
+    family=process_name.split(' @',1)[1].removesuffix(f' {nozzle:g} nozzle') if ' @' in process_name else ''
+    filament_name=f'{FILAMENT_MATERIAL} @{family}' if family else FILAMENT_MATERIAL
     for kind,name in (('process',process_name),('machine',machine_name)):
         if not (profiles/kind/(name+'.json')).exists():
             raise ValueError(
@@ -98,7 +107,7 @@ def settings(template,profiles):
     machine=preset(profiles,'machine',machine_name)
     for k,v in machine.items():
         if 'gcode' in k:d[k]=v
-    filament=preset(profiles,'filament','Bambu PLA Matte @BBL P2S')
+    filament=preset(profiles,'filament',filament_name)
     for k,v in filament.items():
         if 'gcode' in k:d[k]=v*4 if isinstance(v,list) and len(v)==1 else v
     # Bambu stores each filament's Standard/High Flow variants consecutively.
@@ -123,14 +132,15 @@ def settings(template,profiles):
         raise ValueError(
             f'ironing_type {ironing!r} is not one of the values Bambu Studio accepts '
             f'({", ".join(IRONING_TYPES)}); an unrecognized value is silently replaced by its default')
-    d.update({'print_settings_id':f'NYC map - {CFG["layer_height_mm"]:g}mm detail @BBL P2S {nozzle:g} nozzle',
-        'printer_settings_id':machine_name,'printer_model':'Bambu Lab P2S','printer_variant':f'{nozzle:g}',
+    d.update({'print_settings_id':f'NYC map - {CFG["layer_height_mm"]:g}mm detail @{family} {nozzle:g} nozzle',
+        'printer_settings_id':machine_name,'printer_model':machine.get('printer_model',''),
+        'printer_variant':f'{nozzle:g}',
         'layer_height':str(CFG['layer_height_mm']),
         # The mesh was quantized onto the planes this height sets the phase of,
         # so the two cannot be chosen independently.
         'initial_layer_print_height':f'{CFG.get("first_layer_height_mm",FIRST_LAYER_HEIGHT_MM):g}',
         'filament_colour':CFG['colors'],'filament_type':['PLA']*4,
-        'filament_settings_id':['Bambu PLA Matte @BBL P2S']*4,
+        'filament_settings_id':[filament_name]*4,
         'wall_generator':CFG['wall_generator'],'detect_thin_wall':'1','wall_loops':str(CFG.get('wall_loops',2)),
         # Every map color is a separate volume. Without interface shells the
         # slicer treats a horizontal color change as an ordinary internal
@@ -170,7 +180,7 @@ def metadata_config(meshes,source_file):
             etree.SubElement(part,'metadata',key=k,value=v)
         etree.SubElement(part,'mesh_stat',face_count=str(len(m.faces)),edges_fixed='0',degenerate_facets='0',facets_removed='0',facets_reversed='0',backwards_edges='0')
     plate=etree.SubElement(root,'plate')
-    # These are physical nozzle assignments, not AMS slot numbers: P2S has one nozzle.
+    # These are physical nozzle assignments, not AMS slot numbers: the printer has one nozzle.
     for k,v in [('plater_id','1'),('plater_name',CFG['name']),('locked','false'),('filament_map_mode','Auto For Flush'),('filament_maps','1 1 1 1'),('filament_volume_maps','0 0 0 0')]:etree.SubElement(plate,'metadata',key=k,value=v)
     inst=etree.SubElement(plate,'model_instance')
     for k,v in [('object_id','9'),('instance_id','0'),('identify_id','1')]:etree.SubElement(inst,'metadata',key=k,value=v)
