@@ -1,11 +1,14 @@
 """Report per-filament use and print time for a 3MF, slicing it locally when it is not sliced."""
-import argparse,hashlib,json,re,shutil,zipfile
+import argparse,hashlib,json,re,shutil,tempfile,zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from map_common import OUTPUT_DIR
+from cache_common import Progress
 from slice_3mf import SLICER,run_slice
 
 SPOOL_G=1000.
+SLICED_SUFFIX='.gcode.3mf'
+STATS_MEMBER='Metadata/print_stats.json'
+CARRIED=('Metadata/generation_command.json',)
 DURATION=re.compile(r'(\d+(?:\.\d+)?)\s*([dhms])')
 UNITS={'d':86400.,'h':3600.,'m':60.,'s':1.}
 LIST_KEYS={'filament_colour':'colour','filament_type':'type','filament_cost':'cost_per_kg',
@@ -111,42 +114,87 @@ def sha256(path):
     with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
 
 
-def job_slice_root(model):
-    """Derived slices belong to the job that produced the model, beside its other validation."""
-    job=OUTPUT_DIR/'jobs'/model.stem
-    if not job.is_dir():
-        raise SystemExit(f'{model.name} does not match a job under {OUTPUT_DIR/"jobs"}; '
-            'pass --slice-dir to say where its derived slices go')
-    return job/'validation'/'estimates'
+def sliced_path(model):
+    """The sliced project belongs beside the model it was sliced from."""
+    return model.with_suffix(SLICED_SUFFIX)
 
 
-def slice_dir(model,root,replace,slicer):
-    """Slice the model, reusing a cached slice of byte-identical input unless replace is set."""
-    digest=sha256(model)
-    output=root/f'{model.stem}-{digest[:12]}'
-    if output.exists() and replace:shutil.rmtree(output)
-    if (output/'plate_1.gcode').exists():return output,digest,True
-    if output.exists():shutil.rmtree(output)
-    record=run_slice(model,output,slicer)
+def read_embedded_stats(project,digest=None):
+    """Return the totals embedded when we sliced, unless they describe some other model."""
+    if not project.exists():return None
+    with zipfile.ZipFile(project) as archive:
+        if STATS_MEMBER not in archive.namelist():return None
+        payload=json.loads(archive.read(STATS_MEMBER))
+    if digest is not None and payload.get('source_sha256')!=digest:return None
+    extra=payload.get('extra') or {}
+    if 'model_g' in extra:extra['model_g']={int(key):value for key,value in extra['model_g'].items()}
+    return payload['stats'],extra
+
+
+def embed_stats(project,model,payload):
+    """Carry our own totals and the model's provenance into the sliced project.
+
+    Bambu's export keeps neither, and a rerun that can read both needs no reslice.
+    """
+    with zipfile.ZipFile(model) as archive:
+        carried={name:archive.read(name) for name in CARRIED if name in archive.namelist()}
+    with zipfile.ZipFile(project,'a',zipfile.ZIP_DEFLATED) as archive:
+        present=set(archive.namelist())
+        for name,data in {STATS_MEMBER:json.dumps(payload,indent=2).encode(),**carried}.items():
+            if name not in present:archive.writestr(name,data)
+
+
+def slice_model(model,digest,slicer):
+    """Slice into a throwaway directory, keeping only the sliced project beside the model.
+
+    The G-code is not written twice: the copy inside the exported project is the one we keep.
+    A failed slice leaves its temporary directory behind, because its log is the evidence.
+    """
+    folder=Path(tempfile.mkdtemp(prefix='print-stats-'))
+    output=folder/'slice'
+    record=run_slice(model,output,slicer,export_project=True,announce=False)
     if record['exit_code']!=0:
         raise RuntimeError(f"Slicing failed ({record['exit_code']}); see {output/'slice.log'}")
-    return output,digest,False
+    gcodes=sorted(output.glob('plate_*.gcode'))
+    stats=parse_gcode(gcodes[0]);stats['plates']=len(gcodes)
+    extra=parse_result(output/'result.json') if (output/'result.json').exists() else {}
+    project=sliced_path(model)
+    shutil.move(str(output/f'{model.stem}{SLICED_SUFFIX}'),project)
+    embed_stats(project,model,{'schema_version':1,'source_sha256':digest,'stats':stats,'extra':extra})
+    shutil.rmtree(folder,ignore_errors=True)
+    return stats,extra,project
 
 
-def collect(model,root,replace,force_slice,slicer):
-    """Produce one model's filament and time estimate, slicing only when the file lacks one."""
-    stats=None if force_slice else parse_sliced_3mf(model)
-    source='sliced 3MF metadata';reused=False;extra={}
-    if stats is None:
-        output,digest,reused=slice_dir(model,root,replace,slicer)
-        gcodes=sorted(output.glob('plate_*.gcode'))
-        stats=parse_gcode(gcodes[0]);stats['plates']=len(gcodes)
-        extra=parse_result(output/'result.json') if (output/'result.json').exists() else {}
-        source=str(output)
-    else:
-        digest=sha256(model)
+def unique_models(models):
+    """Drop a sliced project whose own model is on the same command line, which a *.3mf glob picks up twice."""
+    given={model.resolve() for model in models}
+    return [model for model in models if not (model.name.endswith(SLICED_SUFFIX)
+        and model.with_suffix('').with_suffix('.3mf').resolve() in given)]
+
+
+def cached_stats(model,digest,replace,force_slice):
+    """Find totals that need no slicer: ours, a matching sliced project, or the model's own metadata.
+
+    Every lookup is a hash and a zip read, so a whole batch resolves in well
+    under a second and only the models that truly need a slice reach the bar.
+    """
+    if force_slice:return None,None
+    found=read_embedded_stats(model)
+    if found is not None:return found,str(model)
+    if not replace:
+        project=sliced_path(model)
+        found=read_embedded_stats(project,digest)
+        if found is not None:return found,str(project)
+    direct=parse_sliced_3mf(model)
+    if direct is not None:return (direct,{}),f'{model} slice metadata'
+    return None,None
+
+
+def build_entry(model,digest,stats,extra,source,reused):
+    """Shape one model's totals into the record the reports and the JSON share."""
     labels=part_labels(model)
     model_g=extra.get('model_g',{})
+    project=sliced_path(model)
     filaments=[]
     for position,weight in enumerate(stats['weight_g'],start=1):
         colour=(stats.get('colour') or [])[position-1:position]
@@ -159,12 +207,40 @@ def collect(model,root,replace,force_slice,slicer):
             'length_m':stats['length_mm'][position-1]/1000 if position<=len(stats.get('length_mm',[])) else None,
             'cost_usd':weight/SPOOL_G*float(cost[0]) if cost else None})
     return {'model':str(model),'sha256':digest,'source':source,'reused_slice':reused,
+        'sliced_project':str(project) if project.exists() else None,
         'printer':(stats.get('printer') or [None])[0],'nozzle_mm':(stats.get('nozzle_mm') or [None])[0],
         'layer_mm':(stats.get('layer_mm') or [None])[0],'layers':stats.get('layers'),
         'plates':stats.get('plates',1),'seconds':stats['seconds'],
         'model_seconds':stats.get('model_seconds'),'flush_seconds':extra.get('flush_seconds'),
         'filament_changes':extra.get('changes'),'warnings':extra.get('warnings',[]),
         'filaments':filaments}
+
+
+def collect_all(models,replace,force_slice,slicer):
+    """Estimate every model, resolving the cache first so the bar counts slices alone.
+
+    A cache hit lands in milliseconds and a slice takes minutes, so counting
+    both in one bar makes its remaining time a fiction. Resolving first also
+    means a fully cached batch prints no bar at all.
+    """
+    resolved=[]
+    for model in unique_models(models):
+        digest=sha256(model)
+        resolved.append((model,digest)+cached_stats(model,digest,replace,force_slice))
+    pending=sum(1 for entry in resolved if entry[2] is None)
+    progress=Progress('slicing',pending,unit='models') if pending else None
+    entries=[];sliced=0
+    for model,digest,found,source in resolved:
+        reused=found is not None
+        if found is None:
+            progress.update(sliced,detail=model.name,force=True)
+            stats,extra,project=slice_model(model,digest,slicer)
+            found=(stats,extra);source=str(project);sliced+=1
+        entries.append(build_entry(model,digest,*found,source,reused))
+    if progress:
+        progress.update(sliced,force=True)
+        progress.close()
+    return entries
 
 
 def gram(value):
@@ -217,10 +293,8 @@ def report(entries):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('models',nargs='+',type=Path,help='3MF files to estimate')
-    parser.add_argument('--slice-dir',type=Path,
-        help='Directory holding derived slices, reused when the input bytes match '
-            '(default: the producing job, output/jobs/<job-id>/validation/estimates)')
-    parser.add_argument('--replace',action='store_true',help='Reslice even when a cached slice matches')
+    parser.add_argument('--replace',action='store_true',
+        help='Reslice even when a sliced project beside the model matches')
     parser.add_argument('--force-slice',action='store_true',
         help='Slice locally even if the 3MF already carries slice metadata')
     parser.add_argument('--slicer',type=Path,default=SLICER)
@@ -228,8 +302,7 @@ def main():
     args=parser.parse_args()
     if not args.slicer.exists():
         raise SystemExit(f'Bambu Studio executable is missing: {args.slicer}')
-    entries=[collect(model,args.slice_dir or job_slice_root(model),
-        args.replace,args.force_slice,args.slicer) for model in args.models]
+    entries=collect_all(args.models,args.replace,args.force_slice,args.slicer)
     report(entries)
     if args.json:args.json.write_text(json.dumps(entries,indent=2)+'\n')
 

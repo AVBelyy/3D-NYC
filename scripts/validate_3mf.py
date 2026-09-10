@@ -128,7 +128,6 @@ def main():
             )
         report['parts'][str(i)]={'vertices':len(v),'triangles':len(f),'watertight':True,'consistent_winding':True,
             'zero_area_triangles':zero,'volume_mm3':float(m.volume),'bounds_mm':m.bounds.tolist()}
-        m.export(a.report_dir/f'roundtrip_material_{i}.ply')
         if not a.skip_booleans:bodies.append(solid(m))
         parsed.append(i);state.clear();del m;gc.collect();print('Serialized part',i,'passed',flush=True)
     with zipfile.ZipFile(a.model) as z:

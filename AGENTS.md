@@ -52,7 +52,10 @@ Run commands from the repository root. Use Python 3.12 and install
   each under the directory that owns it: `output/jobs/<job-id>/` for a
   generation and everything derived from its model, `output/plans/<plan-id>/`
   for a chunk plan, `output/models/` for finished 3MFs. Nothing else belongs
-  there.
+  there. A model's sliced project, `<model>.gcode.3mf`, is the exception that
+  proves the rule: it is a deliverable of the model rather than of a job, so it
+  sits beside the model it was sliced from and doubles as that model's estimate
+  cache.
 - A stage script run outside a job writes to a private temporary directory that
   is deleted when the process exits, because `map_common` resolves `MAP_WORK_DIR`,
   `NYC_VALID_DIR`, `NYC_PROCESSED_DIR`, and `NYC_ANALYSIS_DIR` to one per-process
@@ -61,7 +64,7 @@ Run commands from the repository root. Use Python 3.12 and install
   named for the question of the moment rather than for a job. Report the
   findings; do not leave the evidence behind in the project.
 - When such a run does need to outlive it, say so explicitly: set those
-  environment variables, or pass `--slice-dir`, `--report-dir`, or `--report`.
+  environment variables, or pass `--report-dir` or `--report`.
   Point them at a directory of your own such as `$(mktemp -d)`, never into
   `output/`. These artifacts are large, they are not reproducible from the
   repository, and a name like `diag_now` means nothing a week later.

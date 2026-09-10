@@ -40,13 +40,14 @@ def audit_sliced_gcode(path):
             for tool,value in sorted(starts.items())}}
 
 
-def run_slice(model,output,slicer=SLICER,export_project=False):
+def run_slice(model,output,slicer=SLICER,export_project=False,announce=True):
     """Slice one model offline into output and record the invocation; never contacts a printer."""
     output.mkdir(parents=True,exist_ok=False)
     command=[str(slicer),'--datadir',str(CACHE_DIR/'bambu_profile'),
         '--debug','3','--arrange','0','--orient','0','--slice','1',
         '--mtcpp','10000000','--mstpp','7200','--outputdir',str(output)]
-    if export_project:command+=['--export-3mf',str(output/'sliced.3mf')]
+    # --export-3mf is resolved under --outputdir, so an absolute path here yields a bad concatenation.
+    if export_project:command+=['--export-3mf',f'{model.stem}.gcode.3mf']
     command.append(str(model.resolve()))
     with model.open('rb') as f:sha=hashlib.file_digest(f,'sha256').hexdigest()
     record={'command':command,'input':str(model.resolve()),'input_sha256':sha,
@@ -54,7 +55,7 @@ def run_slice(model,output,slicer=SLICER,export_project=False):
         'started':datetime.datetime.now().astimezone().isoformat(),'result':'running',
         'purpose':'Offline validation only. No printer connection or print command.'}
     write_json(output/'run.json',record)
-    print('Slicer log:',output/'slice.log',flush=True)
+    if announce:print('Slicer log:',output/'slice.log',flush=True)
     started=time.monotonic()
     with (output/'slice.log').open('w') as log:
         result=subprocess.run(command,stdout=log,stderr=subprocess.STDOUT)
@@ -71,7 +72,7 @@ def main():
     parser.add_argument('--slicer',type=Path,default=SLICER)
     parser.add_argument('--name',default='slice_'+datetime.datetime.now().strftime('%Y%m%dT%H%M%S'))
     parser.add_argument('--replace',action='store_true',help='Replace an existing derived slice directory')
-    parser.add_argument('--export-project',action='store_true',help='Also ask Bambu to export its sliced 3MF; its macOS CLI thumbnail renderer may abort.')
+    parser.add_argument('--export-project',action='store_true',help='Also write <model>.gcode.3mf, a sliced project that Bambu Studio opens ready to print')
     args=parser.parse_args()
     output=VALID/args.name
     if output.exists() and args.replace:shutil.rmtree(output)

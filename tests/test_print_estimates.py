@@ -4,10 +4,12 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
-from estimate_print_stats import (format_duration,parse_duration,parse_gcode,parse_result,
-    parse_sliced_3mf,part_labels)
+import estimate_print_stats as print_stats
+from estimate_print_stats import (collect_all,embed_stats,format_duration,parse_duration,parse_gcode,
+    parse_result,parse_sliced_3mf,part_labels,read_embedded_stats,sha256,sliced_path,unique_models)
 
 GCODE='''; HEADER_BLOCK_START
 ; model printing time: 6h 19m 15s; total estimated time: 6h 26m 17s
@@ -128,6 +130,99 @@ class ResultTests(unittest.TestCase):
         self.assertEqual(summary['warnings'],['floating regions'])
         self.assertAlmostEqual(summary['model_g'][2],3.3)
         self.assertAlmostEqual(summary['flush_seconds'],9057.9)
+
+
+class SlicedProjectTests(unittest.TestCase):
+    def project(self,folder,digest):
+        model=write_3mf(folder,**{'Metadata/generation_command.json':'{"argv":["generate"]}'})
+        project=Path(folder)/'sliced.gcode.3mf'
+        with zipfile.ZipFile(project,'w') as archive:archive.writestr('Metadata/plate_1.gcode','G1\n')
+        embed_stats(project,model,{'schema_version':1,'source_sha256':digest,
+            'stats':{'weight_g':[13.68],'seconds':600},'extra':{'model_g':{1:5.19},'changes':4}})
+        return model,project
+
+    def test_names_the_project_beside_its_model(self):
+        self.assertEqual(sliced_path(Path('output/models/a.3mf')),Path('output/models/a.gcode.3mf'))
+
+    def test_reads_back_the_totals_it_embedded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _,project=self.project(folder,'abc')
+            stats,extra=read_embedded_stats(project,'abc')
+        self.assertEqual(stats['weight_g'],[13.68])
+        self.assertEqual(extra['model_g'],{1:5.19})  # keys survive the JSON round trip as integers
+        self.assertEqual(extra['changes'],4)
+
+    def test_carries_the_model_provenance_into_the_project(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _,project=self.project(folder,'abc')
+            with zipfile.ZipFile(project) as archive:
+                self.assertEqual(json.loads(archive.read('Metadata/generation_command.json')),
+                    {'argv':['generate']})
+                self.assertEqual(archive.read('Metadata/plate_1.gcode'),b'G1\n')
+
+    def test_rejects_totals_left_by_a_different_model(self):
+        with tempfile.TemporaryDirectory() as folder:
+            _,project=self.project(folder,'abc')
+            self.assertIsNone(read_embedded_stats(project,'other'))
+
+    def test_ignores_a_project_without_embedded_totals(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=write_3mf(folder,**{'Metadata/slice_info.config':SLICED_INFO})
+            self.assertIsNone(read_embedded_stats(path))
+            self.assertIsNone(read_embedded_stats(Path(folder)/'missing.gcode.3mf'))
+
+
+class InputListTests(unittest.TestCase):
+    def test_drops_a_sliced_project_whose_model_is_also_listed(self):
+        models=[Path('out/a.3mf'),Path('out/a.gcode.3mf'),Path('out/b.gcode.3mf')]
+        self.assertEqual(unique_models(models),[Path('out/a.3mf'),Path('out/b.gcode.3mf')])
+
+
+class BatchTests(unittest.TestCase):
+    """A batch resolves its cache before slicing, so the bar counts slices alone."""
+
+    STATS={'weight_g':[13.68],'length_mm':[4308.72],'seconds':3600.,'colour':['#F2F0E8'],
+        'cost_per_kg':['24.99'],'type':['PLA'],'layers':98}
+
+    def batch(self,folder,cached,uncached):
+        """Write models, giving only the cached ones a sliced project that carries their totals."""
+        models=[]
+        for name in [*cached,*uncached]:
+            model=Path(folder)/f'{name}.3mf'
+            with zipfile.ZipFile(model,'w') as archive:
+                archive.writestr('Metadata/model_settings.config',MODEL_SETTINGS)
+            if name in cached:
+                project=sliced_path(model)
+                with zipfile.ZipFile(project,'w') as archive:archive.writestr('keep','')
+                embed_stats(project,model,{'schema_version':1,'source_sha256':sha256(model),
+                    'stats':self.STATS,'extra':{}})
+            models.append(model)
+        return models
+
+    def run_batch(self,models):
+        """Collect the batch with the slicer stubbed out, reporting how the bar was sized."""
+        def fake_slice(model,digest,slicer):
+            return self.STATS,{},sliced_path(model)
+        with patch.object(print_stats,'slice_model',side_effect=fake_slice) as sliced, \
+                patch.object(print_stats,'Progress') as progress:
+            entries=collect_all(models,False,False,Path('slicer'))
+        return entries,sliced,progress
+
+    def test_bar_counts_only_the_models_that_need_slicing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            models=self.batch(folder,['a','b'],['c'])
+            entries,sliced,progress=self.run_batch(models)
+        self.assertEqual(sliced.call_count,1)
+        self.assertEqual(progress.call_args.args,('slicing',1))
+        self.assertEqual([entry['reused_slice'] for entry in entries],[True,True,False])
+
+    def test_a_fully_cached_batch_shows_no_bar(self):
+        with tempfile.TemporaryDirectory() as folder:
+            models=self.batch(folder,['a','b'],[])
+            entries,sliced,progress=self.run_batch(models)
+        self.assertEqual(sliced.call_count,0)
+        progress.assert_not_called()
+        self.assertEqual(len(entries),2)
 
 
 if __name__=='__main__':unittest.main()

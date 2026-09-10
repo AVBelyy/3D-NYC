@@ -2,7 +2,7 @@
 import argparse,json,statistics
 from pathlib import Path
 from slice_3mf import SLICER
-from estimate_print_stats import collect,format_duration,job_slice_root,SPOOL_G
+from estimate_print_stats import collect_all,format_duration,SPOOL_G
 
 
 def aggregate(entries):
@@ -59,10 +59,8 @@ def report(summary):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('models',nargs='+',type=Path,help='3MF files to summarize')
-    parser.add_argument('--slice-dir',type=Path,
-        help='Directory holding derived slices, reused when the input bytes match '
-            '(default: the producing job, output/jobs/<job-id>/validation/estimates)')
-    parser.add_argument('--replace',action='store_true',help='Reslice even when a cached slice matches')
+    parser.add_argument('--replace',action='store_true',
+        help='Reslice even when a sliced project beside the model matches')
     parser.add_argument('--force-slice',action='store_true',
         help='Slice locally even if the 3MF already carries slice metadata')
     parser.add_argument('--slicer',type=Path,default=SLICER)
@@ -70,8 +68,7 @@ def main():
     args=parser.parse_args()
     if not args.slicer.exists():
         raise SystemExit(f'Bambu Studio executable is missing: {args.slicer}')
-    entries=[collect(model,args.slice_dir or job_slice_root(model),
-        args.replace,args.force_slice,args.slicer) for model in args.models]
+    entries=collect_all(args.models,args.replace,args.force_slice,args.slicer)
     summary=aggregate(entries)
     report(summary)
     if args.json:args.json.write_text(json.dumps(summary,indent=2)+'\n')
