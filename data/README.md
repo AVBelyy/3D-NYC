@@ -38,8 +38,8 @@ inputs are `bambu/project_settings.json` and the reusable crop polygons in
 `nyc_geosearch` is a runtime request cache, so it has no download/cache script
 pair. All other cache directories are created by `scripts/cache_X.py`; their
 raw source is fetched by `scripts/download_X.py` (the building-footprint cache
-streams the official feature service by default and uses its downloaded CSV
-only with `--building-source csv`).
+is the exception: it always streams the official feature service, and its
+downloaded CSV is a generator fallback rather than a cache input).
 
 The default generator requires the LiDAR cache. For other datasets it prefers a
 complete, production-ready cache and can fall back to raw data during an online

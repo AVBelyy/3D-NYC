@@ -187,7 +187,6 @@ class VectorResumeTests(unittest.TestCase):
             skip_output_hashes=True,
             force=False,
             limit_building_pages=None,
-            building_source="api",
         )
 
     def test_api_resumes_at_first_uncommitted_page(self):

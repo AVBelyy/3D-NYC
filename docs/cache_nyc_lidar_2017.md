@@ -29,8 +29,15 @@ scripts/cache_nyc_lidar_2017.py    -> data/cache/nyc_lidar_2017/
 ```
 
 The download command also creates `data/raw/nyc_lidar_2017/index.geojson`, which
-the cache builder requires. For a large build with limited disk space, let the
-cache builder fetch and remove each raw LAZ after its last use:
+the cache builder requires. `--index-only` writes just that index and skips the
+tiles; paired with `--download-missing` on the cache command, the builder then
+fetches the LAZ it actually needs, which is how `scripts/download_all.sh` and
+`scripts/cache_all.sh` split the work. Omitting `--bounds` from the download
+command instead selects every indexed tile, so reach for it only when every LAZ
+really does belong on disk.
+
+For a large build with limited disk space, let the cache builder fetch and
+remove each raw LAZ after its last use:
 
 ```bash
 .venv/bin/python scripts/cache_nyc_lidar_2017.py \

@@ -65,8 +65,6 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--coverage", type=Path, default=DEFAULT_COVERAGE)
     value.add_argument("--bounds", type=float, nargs=4, metavar=("XMIN", "YMIN", "XMAX", "YMAX"))
     value.add_argument("--planimetrics", type=Path, default=DATA / "raw/nyc_planimetrics_2022/Planimetric_2022.gdb")
-    value.add_argument("--building-source", choices=("api", "csv"), default="api")
-    value.add_argument("--building-csv", type=Path, default=DATA / "raw/nyc_building_footprints/buildings.csv")
     value.add_argument("--tile-span-ft", type=float, default=10000.0)
     value.add_argument("--api-page-size", type=int, default=2000)
     value.add_argument(
@@ -140,13 +138,11 @@ def building_configuration(
 ) -> dict[str, Any]:
     return {
         "version": 1,
-        "source": args.building_source,
         "source_signature": source_signature,
         "coverage_bounds": list(map(float, coverage.bounds)),
         "crs": CRS,
         "tile_span_ft": args.tile_span_ft,
-        "api_page_size": args.api_page_size if args.building_source == "api" else None,
-        "csv_chunk_rows": 100000 if args.building_source == "csv" else None,
+        "api_page_size": args.api_page_size,
     }
 
 
@@ -432,94 +428,6 @@ def build_buildings_api(
     )
 
 
-def build_buildings_csv(
-    destination: Path,
-    coverage,
-    args: argparse.Namespace,
-    configuration: dict[str, Any],
-) -> tuple[list[dict[str, Any]], int]:
-    destination.mkdir(parents=True, exist_ok=True)
-    hash_outputs = not args.skip_output_hashes
-    completed = None if args.force else reusable_building_cache(
-        destination, configuration, hash_outputs=hash_outputs
-    )
-    if completed is not None:
-        print(f"Reusing completed building cache: {destination}", flush=True)
-        return completed
-    staging = destination / "staging"
-    progress_path = destination / "progress.json"
-    if args.force:
-        (destination / "manifest.json").unlink(missing_ok=True)
-        progress_path.unlink(missing_ok=True)
-        if staging.exists():
-            shutil.rmtree(staging)
-    checkpoint = read_json(progress_path)
-    if checkpoint and checkpoint.get("configuration") != configuration:
-        raise RuntimeError(
-            f"Building resume state uses a different source/configuration: {progress_path}. "
-            "Use the matching command, a different --cache-root, or --force to discard it."
-        )
-    if not checkpoint and staging.exists() and any(staging.iterdir()):
-        raise RuntimeError(
-            f"Building staging fragments have no compatible CSV checkpoint: {staging}. "
-            "Refusing to overwrite them; inspect them or pass --force."
-        )
-    if checkpoint:
-        remove_fragment_batch(staging, int(checkpoint["next_batch"]))
-    elif staging.exists():
-        shutil.rmtree(staging)
-    writer = TiledGeoParquetWriter(destination, tile_span_ft=args.tile_span_ft)
-    next_chunk = int(checkpoint.get("next_chunk", 0)) if checkpoint else 0
-    retained = int(checkpoint.get("retained", 0)) if checkpoint else 0
-    offset = int(checkpoint.get("next_offset", 0)) if checkpoint else 0
-    writer.batch = int(checkpoint.get("next_batch", 0)) if checkpoint else 0
-    source = args.building_csv.resolve()
-    total_bytes = source.stat().st_size
-    progress = Progress("buildings CSV", total_bytes, unit="bytes")
-    if next_chunk:
-        print(
-            f"Resuming building CSV after {next_chunk:,} committed chunks "
-            f"({offset:,} rows, {retained:,} retained features).",
-            flush=True,
-        )
-    for chunk_index, chunk in enumerate(pd.read_csv(source, dtype=str, chunksize=100000)):
-        if chunk_index < next_chunk:
-            continue
-        chunk.columns = [re.sub(r"[^a-z0-9]+", "_", str(column).lower()).strip("_") for column in chunk]
-        geometry = shapely.from_wkt(chunk["the_geom"].fillna("").to_numpy(), on_invalid="ignore")
-        valid = ~pd.isna(geometry)
-        if valid.any():
-            frame = gpd.GeoDataFrame(
-                chunk.loc[valid].drop(columns=["the_geom"]), geometry=geometry[valid], crs=4326,
-            ).to_crs(CRS)
-            frame["geometry"] = frame.geometry.translate(xoff=0.4005, yoff=-3.0135)
-            retained += add_building_batch(writer, frame, coverage, offset)
-        offset += len(chunk)
-        next_chunk = chunk_index + 1
-        atomic_json(progress_path, {
-            "configuration": configuration,
-            "next_chunk": next_chunk,
-            "next_offset": offset,
-            "retained": retained,
-            "next_batch": writer.batch,
-            "updated_at": utc_now(),
-        })
-        # pandas does not expose exact stream position; the input row ratio is
-        # close enough for a monotonic byte progress estimate.
-        estimated = min(int(total_bytes * offset / max(offset + 100000, 1)), total_bytes - 1)
-        progress.update(estimated, detail=f"rows={offset:,} kept={retained:,}")
-    progress.update(total_bytes, detail=f"rows={offset:,} kept={retained:,}")
-    progress.close(detail=f"rows={offset:,} kept={retained:,}")
-    _, outputs = writer.finalize(
-        deduplicate_by=["doitt_id"], source_order=["source_order"],
-        hash_outputs=hash_outputs, cleanup_staging=False,
-    )
-    return publish_building_cache(
-        destination, configuration, outputs, retained, hash_outputs=hash_outputs,
-        production_ready=args.limit_building_pages is None and getattr(args, "bounds", None) is None,
-    )
-
-
 def write_vector(frame: gpd.GeoDataFrame, path: Path, component_dir: Path, hash_outputs: bool):
     if frame.crs is None:
         frame = frame.set_crs(CRS)
@@ -604,16 +512,9 @@ def main_for(dataset: str) -> None:
     production_ready = bounds is None
 
     if dataset == "nyc_building_footprints":
-        source_signature = (
-            {"service": BUILDING_SERVICE, "snapshot_refresh": "use --force"}
-            if args.building_source == "api"
-            else file_signature(args.building_csv.resolve(), with_hash=args.hash_sources)
-        )
-        if args.building_source == "csv" and not args.building_csv.is_file():
-            raise FileNotFoundError(args.building_csv)
+        source_signature = {"service": BUILDING_SERVICE, "snapshot_refresh": "use --force"}
         configuration = building_configuration(args, coverage, source_signature)
-        builder = build_buildings_api if args.building_source == "api" else build_buildings_csv
-        _, count = builder(component_dir, coverage, args, configuration)
+        _, count = build_buildings_api(component_dir, coverage, args, configuration)
         print(f"Completed cache: {component_dir} ({count:,} features)")
         return
 

@@ -25,6 +25,34 @@ rebuilt by the scripts below, although live sources can change between builds.
 | `new_york_osm` | `download_new_york_osm.py` | `cache_new_york_osm.py` |
 | `nyc_lidar_2017` | `download_nyc_lidar_2017.py` | `cache_nyc_lidar_2017.py` |
 
+`scripts/download_all.sh` and `scripts/cache_all.sh` run that whole table from
+the repository root, and neither one asks for an area:
+
+```bash
+scripts/download_all.sh
+scripts/cache_all.sh
+```
+
+`download_all.sh` fetches the citywide sources and the LiDAR tile index, and
+stops there: the LAZ tiles are large and selected by area, so `cache_all.sh`
+streams exactly the ones its raster chunks need. All of NYC is then simply the
+extent of that index, not a bounding box anyone has to look up.
+
+A citywide LiDAR build reads far more LAZ than it is worth keeping, so
+`cache_all.sh` streams each source in and deletes it after its last use,
+staying under the builder's resident-source cap. Pass `--keep-lidar-sources` to
+retain them instead, and `--skip-lidar` to leave an existing LiDAR cache alone
+and rebuild only the rest. `cache_all.sh` builds LiDAR before anything else,
+because the remaining builders read its catalog for their coverage.
+
+Neither script downloads the building-footprints CSV, because the footprint
+cache is built from the official feature service and never reads it.
+
+Those are the only options. Both scripts run `.venv/bin/python` unless `PYTHON`
+names another interpreter, and print each command before running it. Anything
+else is a job for the individual pairs below: caching a smaller area than the
+whole city, and the LiDAR controls.
+
 Run a pair from the repository root, for example:
 
 ```bash
@@ -35,8 +63,11 @@ Run a pair from the repository root, for example:
 The vector cache builders use the NYC 2017 LiDAR catalog to define citywide
 coverage, so build `nyc_lidar_2017` first. Planimetrics automatically extracts
 its downloaded FileGDB archive. The building-footprint cache is the exception
-to the normal pair: it streams the official feature service by default, so its
-download command is needed only when building with `--building-source csv`.
+to the normal pair: it is always built by streaming the official feature
+service, and never reads `data/raw/nyc_building_footprints`. Its download
+script remains because `generate_3mf.py` falls back to that CSV during an
+online run when no footprint cache exists and the service call fails; nothing
+in the cache path uses it.
 
 LiDAR is large and region-selective. Follow the dedicated
 [LiDAR cache guide](cache_nyc_lidar_2017.md).

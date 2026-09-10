@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download NYC 2017 LiDAR tiles for an EPSG:2263 bounding box."""
+"""Download the NYC 2017 LiDAR tile index, and tiles for an area or the whole city."""
 
 import argparse
 import json
@@ -41,15 +41,28 @@ def download_index(path: Path) -> gpd.GeoDataFrame:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bounds", type=float, nargs=4, required=True, metavar=("XMIN", "YMIN", "XMAX", "YMAX"))
+    parser.add_argument(
+        "--bounds", type=float, nargs=4, metavar=("XMIN", "YMIN", "XMAX", "YMAX"),
+        help="Optional EPSG:2263 bounds; every indexed tile is selected without them",
+    )
+    parser.add_argument(
+        "--index-only", action="store_true",
+        help="Write the tile index and stop, leaving the tiles to the cache builder",
+    )
     parser.add_argument("--tile-index", type=Path, default=DEFAULT_INDEX)
     parser.add_argument("--tile-dir", type=Path, default=DEFAULT_LAZ)
     args = parser.parse_args()
     index = download_index(args.tile_index.resolve()).to_crs(2263)
-    xmin, ymin, xmax, ymax = args.bounds
-    selected = index.cx[xmin:xmax, ymin:ymax]
-    if selected.empty:
-        raise SystemExit("No NYC 2017 LiDAR tiles intersect those EPSG:2263 bounds")
+    if args.index_only:
+        print(f"Tile index ready: {args.tile_index} ({len(index)} tiles)")
+        return
+    if args.bounds:
+        xmin, ymin, xmax, ymax = args.bounds
+        selected = index.cx[xmin:xmax, ymin:ymax]
+        if selected.empty:
+            raise SystemExit("No NYC 2017 LiDAR tiles intersect those EPSG:2263 bounds")
+    else:
+        selected = index
     for number, row in enumerate(selected.itertuples(), 1):
         tile_id = str(row.LAS_ID)
         print(f"Tile {number}/{len(selected)}: {tile_id}", flush=True)

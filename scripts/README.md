@@ -72,8 +72,22 @@ For example:
 .venv/bin/python scripts/cache_nyc_land_cover_2017.py
 ```
 
-The building-footprint cache streams the official feature service by default;
-its download script is needed only for the CSV mode. LiDAR has additional
+`download_all.sh` and `cache_all.sh` run every dataset pair, with no area to
+choose:
+
+```bash
+scripts/download_all.sh
+scripts/cache_all.sh
+```
+
+They cover all of NYC, which is the extent of the LiDAR tile index, and LiDAR
+is built first because the other builders take their coverage from its catalog.
+Caching a smaller area means running the individual pairs; see the
+[cache runbook](../docs/cache_source_datasets.md).
+
+The building-footprint cache is always built by streaming the official feature
+service; its downloaded CSV is a `generate_3mf.py` fallback, not a cache input.
+LiDAR has additional
 coverage and streaming controls. Use the [cache runbook](../docs/cache_source_datasets.md)
 instead of assuming every dataset has identical requirements.
 

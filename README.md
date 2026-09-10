@@ -29,9 +29,16 @@ source .venv/bin/activate
 python -m pip install -r scripts/requirements.txt
 ```
 
-Source data is downloaded separately and cached locally. Follow the
-[source-cache guide](docs/cache_source_datasets.md) once before generating your
-first model.
+Source data is downloaded and cached locally once, before your first model:
+
+```bash
+scripts/download_all.sh
+scripts/cache_all.sh
+```
+
+That covers all of NYC and is a long one-time build, safe to rerun and safe to
+interrupt. See the [source-cache guide](docs/cache_source_datasets.md) for the
+per-dataset commands behind it, caching a smaller area, and offline options.
 
 ## Generate a 3MF
 
