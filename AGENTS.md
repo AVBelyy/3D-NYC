@@ -8,7 +8,10 @@ single-model entry point, and `scripts/plan_map_chunks.py` splits a larger
 polygon into gap-free neighboring plates.
 
 Run commands from the repository root. Use Python 3.12 and install
-`scripts/requirements.txt` in `.venv`.
+`scripts/requirements.txt` in `.venv`. That virtualenv is uv-managed and has no
+`pip` in it, so install and add dependencies with `uv pip`. CI provisions its
+own interpreter and installs the same file with plain `pip`; a step working
+there is not evidence that `.venv` accepts it.
 
 ## Documentation rules
 
@@ -17,7 +20,8 @@ Run commands from the repository root. Use Python 3.12 and install
   architecture, troubleshooting, or implementation reference.
 - Put generation details in `docs/generate_3mf.md`, multi-plate planning in
   `docs/plan_map_chunks.md`, and cache procedures in
-  `docs/cache_source_datasets.md`.
+  `docs/cache_source_datasets.md`, with the per-collection LiDAR procedures in
+  `docs/cache_nyc_lidar_2021.md` and `docs/cache_nyc_lidar_2017.md`.
 - Update the relevant guide whenever behavior, defaults, paths, required data,
   output contracts, or CLI options change.
 - Verify example commands against current `--help` output and repository paths.
@@ -42,7 +46,10 @@ Run commands from the repository root. Use Python 3.12 and install
   name; do not add a `__main__` guard to one to settle the question.
 - Dataset pairs follow `download_X.py` to `data/raw/X/` and `cache_X.py` to
   `data/cache/X/`, with documented exceptions such as streamed Building
-  Footprints and the region-selective 2017 LiDAR collection.
+  Footprints and the borough-selective LiDAR collections. The generator reads
+  the 2021 LiDAR cache by default; the 2017 collection is still reachable
+  through `--lidar-source laz`. Land cover is a 2017/2021 pair chosen by
+  `--land-cover-dataset`, and that choice is part of the stage variant.
 - `data/raw/`, `data/cache/`, and `output/` are ignored, potentially large, and
   may contain expensive user-generated state. Do not delete or rebuild them
   unless the task explicitly requires it.
@@ -64,6 +71,12 @@ Run commands from the repository root. Use Python 3.12 and install
   analysis — comparison slices, diagnostic renders, scratch reports, anything
   named for the question of the moment rather than for a job. Report the
   findings; do not leave the evidence behind in the project.
+- Such a run also reads a default, which is the easier half to miss:
+  `map_common` resolves `MAP_CONFIG` to `scripts/map_config.example.json` when
+  it is unset, so a stage launched by hand measures the example prototype's AOI
+  and scale rather than the chunk being investigated, and says nothing about the
+  substitution. Point `MAP_CONFIG` at the job's own `config.json` before
+  treating any standalone measurement as evidence about that job.
 - When such a run does need to outlive it, say so explicitly: set those
   environment variables, or pass `--report-dir` or `--report`.
   Point them at a directory of your own such as `$(mktemp -d)`, never into
@@ -105,13 +118,48 @@ it is never a fact about that chunk. Fix the rule, not the instance.
 - Cover the fix with a hermetic test that reproduces the failing measurements,
   and confirm the symmetric case — a genuine defect of the same shape must
   still be rejected. Reproducing on the original chunk is evidence, not proof.
-- Stage caching in `generate_3mf.py` keys on the config hash and the stage
-  `variant` only; it never hashes the code that produced the outputs. Changing
-  what a stage builds therefore requires bumping that stage's version constant,
-  or existing jobs silently reuse stale outputs and appear to ignore the fix.
-  Confirm a rerun really re-executed the stage — check the log for
-  `stage_started`, not `stage_skipped`, and look for a field the new code
-  writes — before concluding anything about whether a fix worked.
+
+### Stage caching and version constants
+
+A stage is skipped when the config hash, the stage `variant`, and the output
+list all match its last completed run and those outputs still exist. The code
+that produced them is never hashed, so a version constant is the only way a
+stage can announce that its own outputs changed. Get that wrong and the job
+reuses stale geometry, ships what the fix was meant to replace, and looks like
+the fix did nothing.
+
+- Bump every stage whose code changed, less any already downstream of another
+  in that set. `stage_variants` embeds each stage's inputs in its key, so a bump
+  restales everything below it; bumping those as well only re-extracts sources
+  for nothing.
+- Derive that set from what imports the module you edited, not from the stage
+  you had in mind. `road_symbols` reaches `prepare_details`, `build_fields`,
+  `validate_crossing_fields` and `build_meshes`; `crossings` reaches
+  `build_fields` and `build_meshes`. One bump covers a chain, never a pair of
+  branches: `validate_crossing_fields` and `build_meshes` both read the fields
+  and neither reads the other, so a change to both needs
+  `CROSSING_VALIDATION_VERSION` and `MESH_PIPELINE_VERSION`, and a mesh bump
+  alone leaves crossing validation running the code you replaced.
+- Shared code that feeds the hashed config bypasses the constants entirely.
+  `crossings.structural_roof_thickness_mm` sets the tunnel-cover and
+  bridge-deck bounds, and `PIPELINE_VERSION` travels there too, so changing
+  either restales every stage of every job with no bump at all.
+- Six stages have no constant. `prepare_vectors`, `extract_citygml` and
+  `extract_osm` key only on their source cache identity, `prepare_landcover` on
+  that plus the dataset name, `prepare_lidar` deliberately carries no key, and
+  `render_preview` rides the mesh key. Changing what one of them builds
+  invalidates nothing: say so in the change, and rerun with `--force`.
+- `--force` reruns every stage of the job, expensive LiDAR and extraction
+  included, so prefer the constants when an existing job should be rerun
+  surgically. The two also differ in scope: `--force` is about the job in front
+  of you, a bump says everyone else's cached jobs are stale too.
+- A new stage needs its own `stage_variants` entry with its inputs declared, or
+  it caches on the config alone and survives every later bump upstream of it.
+  `tests/test_stage_cache_keys.py` is the executable spec: what each bump
+  reaches, what it leaves alone, and that every wired stage declares a key.
+- Confirm the rerun actually happened — the log says `stage_started`, not
+  `stage_skipped`, and a field the new code writes is present — before
+  concluding anything about whether a fix worked.
 
 ## Validation
 
@@ -122,7 +170,17 @@ handoff when practical:
 .venv/bin/python -m pytest
 ```
 
-CI runs the same command on Ubuntu with Python 3.12. For documentation changes,
+That command skips the real-data integration tests and still exits zero, so a
+green run is not on its own a full pass. They are gated on an environment
+variable and need a populated `data/cache`:
+
+```bash
+NYC_CHUNK_INTEGRATION=1 .venv/bin/python -m pytest
+```
+
+CI runs the ungated command on Ubuntu with Python 3.12, so those tests do not
+run there either; run them locally before handing off a change to planning,
+chunk geometry, or the generator's argument contract. For documentation changes,
 also check local Markdown links, run affected CLIs with `--help`, and use
 `git diff --check`.
 
