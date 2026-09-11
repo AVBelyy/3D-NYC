@@ -31,6 +31,7 @@ inputs are `bambu/project_settings.json` and the reusable crop polygons in
 | `nyc_parks_trails` | NYC Parks Trails |
 | `nyc_parks_structures` | NYC Parks Structures |
 | `mta_subway_entrances_2024` | MTA Subway Entrances and Exits (2024) |
+| `nyc_land_cover_2021` | NYC 2021 Land Cover (default) |
 | `nyc_land_cover_2017` | NYC 2017 Land Cover |
 | `new_york_osm` | Geofabrik New York OpenStreetMap extract |
 | `nyc_geosearch` | Responses cached lazily from NYC Planning GeoSearch |

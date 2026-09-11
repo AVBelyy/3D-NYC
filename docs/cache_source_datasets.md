@@ -21,6 +21,7 @@ rebuilt by the scripts below, although live sources can change between builds.
 | `nyc_parks_trails` | `download_nyc_parks_trails.py` | `cache_nyc_parks_trails.py` |
 | `nyc_parks_structures` | `download_nyc_parks_structures.py` | `cache_nyc_parks_structures.py` |
 | `mta_subway_entrances_2024` | `download_mta_subway_entrances_2024.py` | `cache_mta_subway_entrances_2024.py` |
+| `nyc_land_cover_2021` | `download_nyc_land_cover_2021.py` | `cache_nyc_land_cover_2021.py` |
 | `nyc_land_cover_2017` | `download_nyc_land_cover_2017.py` | `cache_nyc_land_cover_2017.py` |
 | `new_york_osm` | `download_new_york_osm.py` | `cache_new_york_osm.py` |
 | `nyc_lidar_2021` | `download_nyc_lidar_2021.py` | `cache_nyc_lidar_2021.py` |
@@ -85,6 +86,24 @@ additions:
 Point the generator at one with `--lidar-cache-dir`, the planner with
 `--lidar-dataset`, and `cache_all.sh` with `--lidar-dataset`.
 
+Land cover is the other dataset published as two collections, and they are
+likewise alternatives rather than additions. Both carry the same eight-class
+six-inch legend in EPSG:2263, so one cache layout serves either and nothing
+downstream changes when you switch:
+
+* `nyc_land_cover_2021` (**default**) is the current survey, a 1.6 GB GeoTIFF.
+  It is not on the city's open-data portal: it was produced for the city by
+  TNC/UVM and published on Zenodo under CC BY-NC-SA 4.0, a narrower licence
+  than the raster it supersedes.
+* `nyc_land_cover_2017` is the previous city-published survey, distributed as
+  an ERDAS IMG inside a ZIP whose companion file is about 98 GB. The builder
+  streams it through `/vsizip` rather than extracting it.
+
+Select one with `--land-cover-dataset`, which the generator, the planner,
+`download_all.sh`, and `cache_all.sh` all accept. Only classes 1 and 2 are
+read, so a plate built from either survey differs only where the vegetation
+itself changed between 2017 and 2021.
+
 Non-LiDAR cache manifests record source identity, configuration, output
 inventory, and whether the cache is production-ready. Bounded non-LiDAR caches
 are deliberately not production-ready and are rejected by the generator. The
@@ -100,7 +119,7 @@ LiDAR cache builder and the resulting dataset directory as
 LiDAR options point at `nyc_lidar_2021` (or `nyc_lidar_2017`) itself.
 
 For a cache-only offline generation run, cache the eight non-LiDAR datasets
-in the table plus one LiDAR collection.
+in the table (one land-cover collection, not both) plus one LiDAR collection.
 
 To choose seams, `scripts/plan_map_chunks.py` reads complete, production-ready
 caches for LiDAR, Planimetrics, building footprints, and OpenStreetMap, and uses

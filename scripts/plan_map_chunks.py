@@ -30,6 +30,7 @@ from shapely.geometry import Polygon
 
 import _chunk_geometry as geometry
 from _chunk_cost import (
+    LAND_COVER_DATASETS,
     LIDAR_DATASETS,
     CostWeights,
     SourceDataError,
@@ -377,6 +378,12 @@ def command_for(chunk: dict, shared: dict, paths: dict) -> list[str]:
     foundation = shared.get("foundation_color", 0)
     if foundation:
         command += ["--foundation-color", MATERIAL_NAMES[foundation]]
+    # Seams were scored against one land-cover survey, so the plates have to be
+    # built from the same one. Pinned only when it is not the generator's own
+    # default, so an ordinary plan's commands stay unchanged.
+    land_cover = shared.get("land_cover_dataset", LAND_COVER_DATASETS[0])
+    if land_cover != LAND_COVER_DATASETS[0]:
+        command += ["--land-cover-dataset", land_cover]
     if shared["offline"]:
         command.append("--offline")
     if shared["no_preview"]:
@@ -641,6 +648,11 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--output-dir", type=Path, default=ROOT / "output",
                         help="Root for generated plans and models")
+    result.add_argument(
+        "--land-cover-dataset", choices=LAND_COVER_DATASETS, default=LAND_COVER_DATASETS[0],
+        help="Cached land-cover collection the cut-cost surface scores vegetation from. "
+             "Both publish the same eight-class legend; the plan records which one it used.",
+    )
     result.add_argument("--no-land-cover", action="store_true",
                         help="Skip the land-cover raster when scoring open ground")
     result.add_argument("--preview", action=argparse.BooleanOptionalAction, default=True,
@@ -820,6 +832,7 @@ def run(args, log) -> dict:
         frame, target_ft,
         cache_dir=resolved["cache_dir"],
         lidar_dataset=args.lidar_dataset,
+        land_cover_dataset=args.land_cover_dataset,
         resolution_m=args.cost_resolution_m,
         weights=weights,
         use_land_cover=not args.no_land_cover,
@@ -903,6 +916,7 @@ def run(args, log) -> dict:
         "terrain_relief_factor": relief.factor,
         "source_padding_m": args.source_padding_m,
         "prime_tower": args.prime_tower,
+        "land_cover_dataset": args.land_cover_dataset,
         "offline": args.offline,
         "no_preview": args.generate_no_preview,
         "model_dir": str(args.output_dir / "models"),

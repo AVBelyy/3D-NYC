@@ -29,6 +29,11 @@ and any dataset-specific terms:
 - [NYC 2022 Planimetric Database](https://www.arcgis.com/home/item.html?id=4b01b78d9eda44819f6c757ec00d0669)
 - [NYC Parks Trails](https://data.cityofnewyork.us/d/vjbm-hsyr)
 - [NYC Parks Structures](https://data.cityofnewyork.us/d/n8q6-i44s)
+- [NYC 2021 Land Cover](https://doi.org/10.5281/zenodo.14053441) by The Nature
+  Conservancy and the University of Vermont Spatial Analysis Lab, licensed
+  CC BY-NC-SA 4.0. This is the default land-cover source, and its licence is
+  non-commercial and share-alike; build with `--land-cover-dataset
+  nyc_land_cover_2017` if those terms do not suit your use.
 - [NYC 2017 Land Cover](https://data.cityofnewyork.us/d/he6d-2qns)
 - [NYC 2017 LiDAR](https://maps.nyc.gov/lidar/2017/)
 - [NYC Planning GeoSearch](https://geosearch.planninglabs.nyc/) (used only

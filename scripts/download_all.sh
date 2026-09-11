@@ -18,24 +18,30 @@ PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
 # Datasets downloaded by a plain scripts/download_X.py call, in the order of the
 # runbook table. Building footprints is deliberately absent: its cache is built
 # by streaming the official feature service and never reads a download.
+# LAND_COVER is a placeholder that --land-cover-dataset substitutes below, so
+# only the survey being fetched changes and the order stays the runbook's.
 DATASETS=(
   nyc_3d_buildings_2014
   nyc_planimetrics_2022
   nyc_parks_trails
   nyc_parks_structures
   mta_subway_entrances_2024
-  nyc_land_cover_2017
+  LAND_COVER
   new_york_osm
 )
 
 usage() {
   cat <<'USAGE'
-Usage: scripts/download_all.sh
+Usage: scripts/download_all.sh [options]
 
 Download every raw source dataset into data/raw/, then run
 scripts/cache_all.sh to build the caches scripts/generate_3mf.py reads.
 
 Options:
+  --land-cover-dataset NAME
+        Which land-cover survey to fetch: nyc_land_cover_2021 (default, a
+        1.6 GB GeoTIFF) or nyc_land_cover_2017 (a much larger archive). Pass
+        the same name to scripts/cache_all.sh.
   -h, --help
         Show this help.
 
@@ -60,8 +66,19 @@ run() {
   "$@"
 }
 
+land_cover_dataset=nyc_land_cover_2021
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --land-cover-dataset)
+      [[ $# -ge 2 ]] || die '--land-cover-dataset needs a value'
+      case $2 in
+        nyc_land_cover_2021|nyc_land_cover_2017) land_cover_dataset=$2 ;;
+        *) die "unknown --land-cover-dataset $2" ;;
+      esac
+      shift 2
+      continue
+      ;;
     -h | --help)
       usage
       exit 0
@@ -77,6 +94,8 @@ done
   die "no interpreter at $PYTHON; create .venv as README.md describes or set PYTHON"
 
 cd "$ROOT"
+
+DATASETS=("${DATASETS[@]/LAND_COVER/$land_cover_dataset}")
 
 for dataset in "${DATASETS[@]}"; do
   run "$PYTHON" "scripts/download_$dataset.py"

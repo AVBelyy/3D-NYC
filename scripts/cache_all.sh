@@ -16,14 +16,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="${PYTHON:-$ROOT/.venv/bin/python}"
 
-# Built after LiDAR, in the order of the runbook table.
+# Built after LiDAR, in the order of the runbook table. LAND_COVER is a
+# placeholder: --land-cover-dataset substitutes the chosen collection into it
+# below, so the survey changes without disturbing the build order.
 DATASETS=(
   nyc_3d_buildings_2014
   nyc_planimetrics_2022
   nyc_parks_trails
   nyc_parks_structures
   mta_subway_entrances_2024
-  nyc_land_cover_2017
+  LAND_COVER
   new_york_osm
   nyc_building_footprints
 )
@@ -47,6 +49,10 @@ Options:
         Which LiDAR collection to build and take citywide coverage from:
         nyc_lidar_2021 (default, published rasters) or nyc_lidar_2017
         (point cloud, and the only one with bathymetry).
+  --land-cover-dataset NAME
+        Which land-cover survey to build: nyc_land_cover_2021 (default) or
+        nyc_land_cover_2017. Both carry the same eight-class legend, so the
+        generator and the planner read either one unchanged.
   -h, --help
         Show this help.
 
@@ -72,6 +78,7 @@ run() {
 
 skip_lidar=0
 lidar_dataset=nyc_lidar_2021
+land_cover_dataset=nyc_land_cover_2021
 keep_sources=0
 
 while [[ $# -gt 0 ]]; do
@@ -85,6 +92,15 @@ while [[ $# -gt 0 ]]; do
       case $2 in
         nyc_lidar_2021|nyc_lidar_2017) lidar_dataset=$2 ;;
         *) die "unknown --lidar-dataset $2" ;;
+      esac
+      shift 2
+      continue
+      ;;
+    --land-cover-dataset)
+      [[ $# -ge 2 ]] || die '--land-cover-dataset needs a value'
+      case $2 in
+        nyc_land_cover_2021|nyc_land_cover_2017) land_cover_dataset=$2 ;;
+        *) die "unknown --land-cover-dataset $2" ;;
       esac
       shift 2
       continue
@@ -135,6 +151,8 @@ fi
 # The vector builders take their citywide extent from the LiDAR catalog, so they
 # have to read the one just built rather than the default.
 coverage=("--coverage" "data/cache/$lidar_dataset/catalog.geojson")
+
+DATASETS=("${DATASETS[@]/LAND_COVER/$land_cover_dataset}")
 
 for dataset in "${DATASETS[@]}"; do
   # Only the vector builders derive their extent from the LiDAR catalog; the

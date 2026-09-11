@@ -32,6 +32,7 @@ from rasterio.features import rasterize
 from rasterio.warp import Resampling, reproject
 from shapely.geometry import Polygon, box
 
+from _cache_land_cover import LAND_COVER_DATASETS
 from _chunk_geometry import (
     AXIS_X,
     FT,
@@ -60,9 +61,10 @@ CHEAP_SURFACE_LAYERS = ("ROADBED", "MEDIAN", "PLAZA", "PARKING_LOT")
 WATER_LAYER = "HYDROGRAPHY"
 PARK_LAYER = "PARK"
 STRUCTURE_LAYER = "TRANSPORT_STRUCTURE"
-# The only nyc_land_cover_2017 classes with a documented in-repo meaning are 1
-# (tree canopy) and 1|2 (vegetation), per build_map_fields.py. Nothing else in
-# that raster's legend is relied on here.
+# The only land-cover classes with a documented in-repo meaning are 1 (tree
+# canopy) and 1|2 (vegetation), per build_map_fields.py. Nothing else in that
+# raster's legend is relied on here, and both published surveys share it, so
+# the two collections are interchangeable for this purpose.
 VEGETATION_CLASSES = (1, 2)
 
 
@@ -289,9 +291,11 @@ def _lidar_mosaics(cache_dir: Path, grid: FrameGrid,
     return result
 
 
-def _land_cover_vegetation(cache_dir: Path, grid: FrameGrid) -> np.ndarray | None:
+def _land_cover_vegetation(
+    cache_dir: Path, grid: FrameGrid, dataset: str = LAND_COVER_DATASETS[0]
+) -> np.ndarray | None:
     """Majority-resample the documented vegetation classes, or return None."""
-    path = cache_dir / "nyc_land_cover_2017" / "landcover_native.tif"
+    path = cache_dir / dataset / "landcover_native.tif"
     if not path.is_file():
         return None
     classes = np.zeros(grid.shape, np.uint8)
@@ -779,6 +783,7 @@ def build_cost_surface(
     *,
     cache_dir: Path,
     lidar_dataset: str = LIDAR_DATASETS[0],
+    land_cover_dataset: str = LAND_COVER_DATASETS[0],
     resolution_m: float = 4.0,
     margin_m: float = 60.0,
     weights: CostWeights | None = None,
@@ -794,8 +799,8 @@ def build_cost_surface(
                      "nyc_building_footprints", "new_york_osm")
     }
     if use_land_cover:
-        sources["nyc_land_cover_2017"] = cache_signature(
-            cache_dir, "nyc_land_cover_2017", required=False
+        sources[land_cover_dataset] = cache_signature(
+            cache_dir, land_cover_dataset, required=False
         )
     key = surface_key(frame, target_ft, resolution_m, weights, sources)
     if log:
@@ -846,7 +851,10 @@ def build_cost_surface(
     layers["park"] = _burn(grid, parks.geometry.values)
     crossings = _osm_crossings(cache_dir, grid, buffer_ft)
     layers["osm_structure"] = _burn(grid, crossings.geometry.values)
-    vegetation = _land_cover_vegetation(cache_dir, grid) if use_land_cover else None
+    vegetation = (
+        _land_cover_vegetation(cache_dir, grid, land_cover_dataset)
+        if use_land_cover else None
+    )
     if vegetation is not None:
         layers["vegetation"] = vegetation
 

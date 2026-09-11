@@ -21,6 +21,13 @@ DATASETS = {
         "https://data.cityofnewyork.us/download/he6d-2qns/application%2Fzip",
         "nyc_land_cover_2017/Land_Cover.zip",
     ),
+    # The 2021 survey is not on the city's open-data portal. It was produced
+    # for the city by TNC/UVM and published on Zenodo under CC BY-NC-SA 4.0,
+    # which is a narrower licence than the 2017 raster it supersedes.
+    "nyc_land_cover_2021": (
+        "https://zenodo.org/api/records/14053441/files/landcover_nyc_2021_6in.tif/content",
+        "nyc_land_cover_2021/landcover_nyc_2021_6in.tif",
+    ),
     "new_york_osm": (
         "https://download.geofabrik.de/north-america/us/new-york-latest.osm.pbf",
         "new_york_osm/new-york-latest.osm.pbf",

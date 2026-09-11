@@ -46,6 +46,11 @@ from rasterio.warp import Resampling, reproject
 from scipy.ndimage import distance_transform_edt
 from shapely.geometry import Point, Polygon, box, shape
 
+from _cache_land_cover import (
+    LAND_COVER_DATASETS,
+    COLLECTIONS as LAND_COVER_COLLECTIONS,
+    gdal_dataset as land_cover_dataset_path,
+)
 from _datasets import DATASETS
 from download_data import MIN_FREE, ROOT, download
 from cache_common import read_tiled_geoparquet
@@ -176,7 +181,7 @@ CORE_DOWNLOADS = {
     "buildings": DATASETS["nyc_building_footprints"],
     "planimetrics": DATASETS["nyc_planimetrics_2022"],
     "trails": DATASETS["nyc_parks_trails"],
-    "landcover": DATASETS["nyc_land_cover_2017"],
+    "landcover": DATASETS[LAND_COVER_DATASETS[0]],
     "osm": DATASETS["new_york_osm"],
     "parks_structures": DATASETS["nyc_parks_structures"],
     "mta_entrances": DATASETS["mta_subway_entrances_2024"],
@@ -302,7 +307,7 @@ def count_osm_semantic_features(
     }
 
 
-def stage_variants(cache_identity):
+def stage_variants(cache_identity, land_cover_dataset: str = LAND_COVER_DATASETS[0]):
     """Every stage's cache key, including the keys of the stages it reads.
 
     A stage is skipped when the config hash and this key both match what its
@@ -326,7 +331,8 @@ def stage_variants(cache_identity):
     # a key.  Naming it None here keeps it that way while still recording that
     # the fields are built from it.
     lidar = None
-    landcover = {"cache": cache_identity("nyc_land_cover_2017")}
+    landcover = {"dataset": land_cover_dataset,
+                 "cache": cache_identity(land_cover_dataset)}
     osm = {"cache": cache_identity("new_york_osm")}
     details = {"detail_pipeline_version": DETAIL_PIPELINE_VERSION, "caches": {
         name: cache_identity(name) for name in (
@@ -378,6 +384,12 @@ class Pipeline:
             else (self.data_dir / "cache").resolve()
         )
         self.lidar_source = args.lidar_source
+        # The land-cover collection is selectable, so the download that
+        # backs an uncached run has to follow the selection rather than
+        # the module default.
+        self.land_cover_dataset = args.land_cover_dataset
+        self.downloads = dict(CORE_DOWNLOADS,
+                              landcover=DATASETS[self.land_cover_dataset])
         configured_lidar_cache = config.get("lidar_cache_dir")
         if configured_lidar_cache:
             self.lidar_cache_dir = Path(configured_lidar_cache).resolve()
@@ -517,7 +529,7 @@ class Pipeline:
             raise
 
     def ensure_download(self, key: str) -> Path:
-        url, relative = CORE_DOWNLOADS[key]
+        url, relative = self.downloads[key]
         path = self.raw / relative
         if path.exists() and path.stat().st_size > 0:
             self.log.info("download_cache_hit", dataset=key, path=str(path), bytes=path.stat().st_size)
@@ -662,7 +674,7 @@ class Pipeline:
             "buildings": "nyc_building_footprints",
             "planimetrics": "nyc_planimetrics_2022",
             "trails": "nyc_parks_trails",
-            "landcover": "nyc_land_cover_2017",
+            "landcover": self.land_cover_dataset,
             "osm": "new_york_osm",
             "parks_structures": "nyc_parks_structures",
             "mta_entrances": "mta_subway_entrances_2024",
@@ -671,7 +683,7 @@ class Pipeline:
             component for component in set(cached_sources.values())
             if self.cached_dataset(component) is not None
         }
-        for key in CORE_DOWNLOADS:
+        for key in self.downloads:
             component = cached_sources.get(key)
             if component in available_components:
                 self.log.info("cached_source_ready", dataset=key, component=component)
@@ -689,7 +701,7 @@ class Pipeline:
             atomic_json(
                 self.job / "raw_ready.json",
                 {
-                    "datasets": list(CORE_DOWNLOADS),
+                    "datasets": list(self.downloads),
                     "lidar_source": "cache",
                     "lidar_cache_dir": str(cache),
                     "lidar_cache_tiles": len(catalog),
@@ -716,7 +728,7 @@ class Pipeline:
             )
         atomic_json(
             self.job / "raw_ready.json",
-            {"datasets": list(CORE_DOWNLOADS), "lidar_tiles": selected.LAS_ID.astype(str).tolist()},
+            {"datasets": list(self.downloads), "lidar_tiles": selected.LAS_ID.astype(str).tolist()},
         )
 
     def fetch_buildings_api(self) -> gpd.GeoDataFrame:
@@ -1468,15 +1480,17 @@ class Pipeline:
         with rasterio.open(reference_path) as reference:
             shape, transform, crs = reference.shape, reference.transform, reference.crs
             profile = reference.profile.copy()
-        cached = self.cached_dataset("nyc_land_cover_2017")
+        collection = LAND_COVER_COLLECTIONS[self.land_cover_dataset]
+        cached = self.cached_dataset(collection.name)
         if cached is not None:
             cache, _ = cached
             source_path = str(cache / "landcover_native.tif")
             source_kind = "cache"
         else:
-            archive = self.ensure_download("landcover")
-            source_path = f"/vsizip/{archive}/Land_Cover/NYC_2017_LiDAR_LandCover.img"
-            source_kind = "source_zip"
+            # Uncached, the published download is read in place: 2017 through
+            # /vsizip into the archive, 2021 as the plain GeoTIFF it ships as.
+            source_path = land_cover_dataset_path(collection, self.ensure_download("landcover"))
+            source_kind = "source_download"
         with rasterio.Env(GDAL_CACHEMAX=256 * 1024**2), rasterio.open(source_path) as source:
             classes = np.zeros(shape, dtype=np.uint8)
             reproject(
@@ -1490,6 +1504,7 @@ class Pipeline:
             target.write(classes.astype(np.uint8), 1)
         values, counts = np.unique(classes, return_counts=True)
         atomic_json(self.analysis / "landcover.json", {
+            "dataset": collection.name,
             "classes": dict(zip(values.tolist(), counts.tolist())),
             "source": source_kind,
             "cache": str(cached[0]) if cached else None,
@@ -1654,7 +1669,7 @@ class Pipeline:
             self.download_sources,
             cacheable=False,
         )
-        variants = stage_variants(self.cache_identity)
+        variants = stage_variants(self.cache_identity, self.land_cover_dataset)
         vector_outputs = [self.processed / f"planimetrics_{name}_aoi.parquet" for name in PLANIMETRIC_LAYERS]
         vector_outputs += [
             self.processed / "buildings_projected_aoi.parquet",
@@ -2147,6 +2162,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "--lidar-cache-dir", type=Path,
         help="LiDAR raster cache directory (defaults to <cache-dir>/nyc_lidar_2021)",
+    )
+    result.add_argument(
+        "--land-cover-dataset", choices=LAND_COVER_DATASETS, default=LAND_COVER_DATASETS[0],
+        help="Land-cover collection used for vegetated ground and canopy "
+             "(default nyc_land_cover_2021). Both publish the same eight-class legend.",
     )
     result.add_argument(
         "--project-settings-template", type=Path,

@@ -19,7 +19,7 @@ from generate_3mf import stage_variants  # noqa: E402
 
 
 SOURCES = ("nyc_planimetrics_2022", "nyc_building_footprints", "nyc_parks_trails",
-           "nyc_3d_buildings_2014", "nyc_land_cover_2017", "new_york_osm",
+           "nyc_3d_buildings_2014", "nyc_land_cover_2021", "new_york_osm",
            "nyc_parks_structures", "mta_subway_entrances_2024")
 # Stages built from the fused fields, directly or through the mesh and the 3MF.
 DERIVED_FROM_FIELDS = ("build_fields", "validate_crossing_fields", "build_meshes",

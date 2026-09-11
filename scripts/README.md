@@ -68,8 +68,8 @@ cache_X.py    -> data/cache/X/     # reusable generator input
 For example:
 
 ```bash
-.venv/bin/python scripts/download_nyc_land_cover_2017.py
-.venv/bin/python scripts/cache_nyc_land_cover_2017.py
+.venv/bin/python scripts/download_nyc_land_cover_2021.py
+.venv/bin/python scripts/cache_nyc_land_cover_2021.py
 ```
 
 `download_all.sh` and `cache_all.sh` run every dataset pair, with no area to
