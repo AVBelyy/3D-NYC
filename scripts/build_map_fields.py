@@ -822,9 +822,21 @@ def main():
     # ``printable_material_index`` carries the rule and the reasoning; the index
     # it returns re-seats the surface height and the absolute-terrain flag with
     # the material, since a cell that changes colour takes that colour's surface.
+    # One exception, and it is about what a thin region *means* rather than how
+    # wide it is.  The rule absorbs any colour a bead cannot fit inside, which is
+    # right for the stray patches it was written for: those are leftovers, and a
+    # leftover that cannot print has nothing to say.  A tan kerb or pavement
+    # strip beside a carriageway is not a leftover, it is the separator that
+    # makes the road read as a road, and absorbing it merges the carriageway into
+    # whatever it runs past -- houses lose their frontage, a median becomes
+    # chunks.  Sub-bead, such a strip prints as a groove rather than as colour,
+    # and a groove still separates; an absorbed one does not.  Only cells still
+    # carrying the tan they were drawn with are held, so a strip since painted
+    # over by another feature is absorbed with everything else.
+    drawn_street_separators=(sidewalk_mask|tan_pavement_mask)&aoi_mask&(material==3)
     printable_source,printable_width_cleanups=printable_material_index(
         material,aoi_mask,nozzle_mm=CFG['nozzle_mm'],grid_step_mm=STEP,
-        protected=protected_transport_surface)
+        protected=protected_transport_surface|drawn_street_separators)
     material[...]=material[printable_source]
     top[...]=top[printable_source]
     absolute_terrain_surface_mask[...]=absolute_terrain_surface_mask[printable_source]
