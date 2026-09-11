@@ -144,6 +144,29 @@ class RectilinearPathTests(unittest.TestCase):
         )
         self.assertTrue(bool(np.abs(v / 25 - np.round(v / 25)).max() < 1e-9))
 
+    def test_jogs_land_on_the_snap_lattice_too(self):
+        """Where a cut jogs matters as much as which level it jogs to.
+
+        The along-coordinate comes from evenly spaced samples, so an unsnapped
+        jog can sit a fraction of a step from a seam already running the other
+        way, stranding a strip of plate between the two too narrow to print.
+        The ends stay where the region ends; only the jogs move.
+        """
+        u, _ = geometry.rectilinear_path(
+            self.u, self.v, snap_ft=25, min_run_ft=120, min_jog_ft=25
+        )
+        self.assertGreater(len(u), 2, "this fixture should produce a jog")
+        interior = u[1:-1]
+        self.assertTrue(bool(np.abs(interior / 25 - np.round(interior / 25)).max() < 1e-9))
+        self.assertAlmostEqual(u[0], self.u[0])
+        self.assertAlmostEqual(u[-1], self.u[-1])
+
+    def test_snapping_a_jog_keeps_the_path_monotone(self):
+        u, v = geometry.rectilinear_path(
+            self.u, self.v, snap_ft=25, min_run_ft=120, min_jog_ft=25
+        )
+        self.assertTrue(bool(np.all(np.diff(u) >= -1e-9)))
+
     def test_mismatched_inputs_are_rejected(self):
         with self.assertRaises(PlanGeometryError):
             geometry.rectilinear_path(
@@ -249,6 +272,36 @@ class CompactionTests(unittest.TestCase):
         combined, _ = geometry.compact_chunks(pieces, limits_ft=limits)
         self.assertEqual(len(combined), 2)
 
+    def test_chunks_are_not_joined_across_a_pinch(self):
+        """Fill is blind to a sliver glued on by its short end.
+
+        Area over bounding box barely moves whichever neighbour absorbs a
+        sliver, so the pass will hang one off a contact a millimetre wide. That
+        sliver becomes a finger too thin to print on one plate and a slot of
+        the same width on the plate wrapped around it.
+        """
+        sliver = box(100.0, 0.0, 101.0, 60.0)
+        above = box(0.0, 60.0, 200.0, 130.0)        # meets the sliver end-on
+        merged, notes = geometry.compact_chunks(
+            [sliver, above], limits_ft=(260.0, 260.0), min_contact_ft=4.0
+        )
+        self.assertEqual(len(merged), 2, "a 1-wide contact must not be merged")
+        self.assertEqual(notes, [])
+
+    def test_a_long_enough_contact_still_merges(self):
+        left, right = box(0.0, 0.0, 100.0, 100.0), box(100.0, 0.0, 200.0, 100.0)
+        merged, notes = geometry.compact_chunks(
+            [left, right], limits_ft=(260.0, 260.0), min_contact_ft=4.0
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(len(notes), 1)
+
+    def test_the_guard_is_off_by_default(self):
+        sliver = box(100.0, 0.0, 101.0, 60.0)
+        above = box(0.0, 60.0, 200.0, 130.0)
+        merged, _ = geometry.compact_chunks([sliver, above], limits_ft=(260.0, 260.0))
+        self.assertEqual(len(merged), 1)
+
     def test_compaction_preserves_total_area(self):
         limits = (100.0, 100.0)
         pieces = [box(0, 0, 30, 90), box(30, 0, 60, 90), box(60, 0, 90, 90)]
@@ -337,6 +390,54 @@ class CutChooserTests(unittest.TestCase):
         )
         with self.assertRaises(PlanGeometryError):
             geometry._validated_path([[0.0, 50.0]], request)
+
+
+class ContinuationTests(unittest.TestCase):
+    """Which already-placed cut a new cut is picking up, and at which end."""
+
+    def placed(self, axis=geometry.AXIS_X, u_start=0.0, u_end=100.0,
+               v_start=50.0, v_end=50.0):
+        return [geometry.PlacedCut(axis, u_start, u_end, v_start, v_end)]
+
+    def levels(self, placed, axis=geometry.AXIS_X, u_start=100.0, u_end=200.0,
+               v_nominal=52.0, deviation_ft=20.0):
+        return geometry.continuing_levels(
+            placed, axis, u_start, u_end, v_nominal, deviation_ft
+        )
+
+    def test_a_cut_ending_where_this_one_starts_is_met_at_the_start(self):
+        self.assertEqual(self.levels(self.placed(v_end=45.0)), (45.0, None))
+
+    def test_a_cut_starting_where_this_one_ends_is_met_at_the_end(self):
+        placed = self.placed(u_start=200.0, u_end=300.0, v_start=45.0)
+        self.assertEqual(self.levels(placed), (None, 45.0))
+
+    def test_a_cut_on_the_other_axis_never_meets(self):
+        self.assertEqual(self.levels(self.placed(axis=geometry.AXIS_Y)), (None, None))
+
+    def test_a_cut_elsewhere_along_the_axis_is_a_different_street(self):
+        self.assertEqual(self.levels(self.placed(u_start=-500.0, u_end=-400.0)),
+                         (None, None))
+
+    def test_a_level_out_of_reach_is_not_one_this_cut_can_meet(self):
+        self.assertEqual(self.levels(self.placed(v_end=900.0)), (None, None))
+
+    def test_the_staircase_between_two_regions_is_within_tolerance(self):
+        # Sibling bounding boxes overlap by however far the cut separating them
+        # wandered, which is bounded by twice the deviation budget.
+        self.assertEqual(self.levels(self.placed(u_end=135.0)), (50.0, None))
+        self.assertEqual(self.levels(self.placed(u_end=145.0)), (None, None))
+
+    def test_a_cut_beside_this_one_over_the_same_ground_is_a_second_cut(self):
+        # Same span, so the two run side by side through one band rather than
+        # continuing each other, and neither anchors the other.
+        placed = self.placed(u_start=100.0, u_end=200.0, v_start=50.0, v_end=50.0)
+        self.assertEqual(self.levels(placed), (None, None))
+
+    def test_the_nearest_cut_wins_when_several_meet_one_end(self):
+        placed = (self.placed(u_end=90.0, v_end=45.0)
+                  + self.placed(u_end=100.0, v_end=55.0))
+        self.assertEqual(self.levels(placed), (55.0, None))
 
 
 class SplitTests(unittest.TestCase):

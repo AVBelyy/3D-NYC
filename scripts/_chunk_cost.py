@@ -436,6 +436,21 @@ class CostSurface(CutChooser):
             band = np.where(shapely.contains_xy(request.region, x, y), band, 0.0)
         nominal_index = int(np.argmin(np.abs(v - request.v_nominal)))
         centering = self.weights.centering * reference
+        along_step = float(u[1] - u[0]) if len(u) > 1 else request.step_ft
+        minimum_run = max(1, int(round(request.min_run_ft / max(along_step, 1e-9))))
+        # Priced in the same units as a run: a jog must save at least
+        # `straightness` runs' worth of the band's mean cost to be worth it.
+        jog_penalty = self.weights.straightness * reference * minimum_run
+        min_jog_levels = max(1, int(round(request.min_jog_ft / level_ft)))
+
+        def meets(level: float | None) -> int | None:
+            """Band index of a cut this one continues, if it is within reach."""
+            if level is None or not v[0] <= level <= v[-1]:
+                return None
+            return int(np.argmin(np.abs(v - level)))
+
+        enters_at = meets(request.continues_from)
+        leaves_at = meets(request.continues_into)
 
         if self.style == "axis":
             # One straight line parallel to the frame axis. In a frame aligned
@@ -445,20 +460,24 @@ class CostSurface(CutChooser):
             score = priced.sum(axis=0) + centering * np.abs(
                 np.arange(len(v)) - nominal_index
             ) * band.shape[0]
+            for anchor in (enters_at, leaves_at):
+                score = score + _meeting_penalty(
+                    len(v), anchor, jog_penalty, min_jog_levels
+                )
+            if not np.isfinite(score).any():
+                score = priced.sum(axis=0)
             level = float(v[int(np.argmin(score))])
             return np.asarray([[request.u_start, level], [request.u_end, level]])
 
-        along_step = float(u[1] - u[0]) if len(u) > 1 else request.step_ft
-        minimum_run = max(1, int(round(request.min_run_ft / max(along_step, 1e-9))))
         levels = staircase_path(
             band,
             minimum_run=minimum_run,
             nominal_index=nominal_index,
-            # Priced in the same units as a run: a jog must save at least
-            # `straightness` runs' worth of the band's mean cost to be worth it.
-            jog_penalty=self.weights.straightness * reference * minimum_run,
+            jog_penalty=jog_penalty,
             centering_penalty=centering,
-            min_jog_levels=max(1, int(round(request.min_jog_ft / level_ft))),
+            min_jog_levels=min_jog_levels,
+            enters_at=enters_at,
+            leaves_at=leaves_at,
         )
         path_u, path_v = rectilinear_path(
             u, v[levels], snap_ft=level_ft, min_run_ft=0.0, min_jog_ft=0.0
@@ -636,6 +655,26 @@ class CostSurface(CutChooser):
         }
 
 
+def _meeting_penalty(
+    levels: int, anchor: int | None, jog_penalty: float, min_jog_levels: int
+) -> np.ndarray:
+    """Price for meeting a cut this one continues at anything but its level.
+
+    Picking the neighbouring cut's line up exactly is free.  Leaving it is a
+    jog like any other: it costs one, and it has to clear the level by
+    ``min_jog_levels`` in the same way a jog made mid-cut does.  A step too
+    small to read as deliberate is the defect that shows up as a stubby side on
+    the plate the two cuts share, and this is the rule that already forbids one
+    inside a single cut, applied where two of them meet.
+    """
+    penalty = np.zeros(levels)
+    if anchor is None:
+        return penalty
+    offset = np.abs(np.arange(levels) - anchor)
+    return np.where(offset == 0, 0.0,
+                    np.where(offset >= max(1, min_jog_levels), jog_penalty, np.inf))
+
+
 def staircase_path(
     band: np.ndarray,
     *,
@@ -644,6 +683,8 @@ def staircase_path(
     jog_penalty: float,
     centering_penalty: float,
     min_jog_levels: int,
+    enters_at: int | None = None,
+    leaves_at: int | None = None,
 ) -> np.ndarray:
     """Cheapest street-following staircase through a cut band.
 
@@ -681,7 +722,10 @@ def staircase_path(
     # A state is either free to jog, or locked for k more steps at its level.
     free = _State.empty(levels)
     locked = [_State.empty(levels) for _ in range(run)]
-    start = _State(step_cost[0].copy(), np.zeros(levels, np.int32),
+    # The ends are jogs away from the cuts this one continues, so the band is
+    # entered and left under the same rule that governs a jog mid-cut.
+    entry = _meeting_penalty(levels, enters_at, jog_penalty, min_jog_levels)
+    start = _State(step_cost[0] + entry, np.zeros(levels, np.int32),
                    np.full(levels, -1, np.int32))
     if run == 1:
         free = start
@@ -709,7 +753,10 @@ def staircase_path(
             state.add(step_cost[step])
         history_start[step], history_origin[step] = free.start, free.origin
 
-    level = int(np.argmin(free.cost))
+    finish = free.cost + _meeting_penalty(levels, leaves_at, jog_penalty, min_jog_levels)
+    # Both ends can be pinned to levels a sub-minimum step apart, which leaves
+    # nowhere legal to finish. The seam this cut has to make is better than none.
+    level = int(np.argmin(finish if np.isfinite(finish).any() else free.cost))
     path = np.empty(steps, dtype=int)
     cursor = steps - 1
     while cursor >= 0:

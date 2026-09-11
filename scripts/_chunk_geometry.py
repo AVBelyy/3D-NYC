@@ -220,6 +220,11 @@ class CutRequest:
     # chooser needs the region so terrain beyond it neither attracts nor
     # repels the cut.
     region: Polygon | None = None
+    # Where an already-placed cut on this axis leaves off at each end of this
+    # region, or None where nothing continues into it.  A chooser meets that
+    # level or treats the step as the jog it is; see :func:`continuing_levels`.
+    continues_from: float | None = None
+    continues_into: float | None = None
 
     @property
     def samples(self) -> np.ndarray:
@@ -299,6 +304,15 @@ def rectilinear_path(
     runs = _absorb_short_runs(runs, min_run_ft)
     runs = _merge_small_jogs(runs, min_jog_ft, snap_ft)
     runs = _absorb_short_runs(runs, min_run_ft)
+    # Jogs land on the same lattice as levels. The along-coordinate comes from
+    # evenly spaced samples, so without this a jog can sit a fraction of a step
+    # from a seam already running the other way and stranding a strip of plate
+    # between the two, far too narrow to print. Snapping cannot reorder the
+    # runs: each boundary is held at or after the one before it.
+    for index in range(1, len(runs)):
+        boundary = round(runs[index][0] / snap_ft) * snap_ft
+        boundary = min(max(boundary, runs[index - 1][0]), runs[index][1])
+        runs[index - 1][1] = runs[index][0] = boundary
     points: list[tuple[float, float]] = [(runs[0][0], runs[0][2])]
     for index, (start, end, level) in enumerate(runs):
         if index:
@@ -409,6 +423,58 @@ class PartitionResult:
     notes: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class PlacedCut:
+    """A finished cut, kept so a later cut can pick its line up where it ended."""
+
+    axis: int
+    u_start: float
+    u_end: float
+    v_start: float
+    v_end: float
+
+
+def continuing_levels(
+    placed: Sequence[PlacedCut],
+    axis: int,
+    u_start: float,
+    u_end: float,
+    v_nominal: float,
+    deviation_ft: float,
+) -> tuple[float | None, float | None]:
+    """Where an already-placed cut meets each end of this region, if one does.
+
+    A guillotine hands one street to two sibling regions, so the same avenue is
+    chosen twice from nominals that can differ by less than a single snap step.
+    A cut that ends where this region begins, or begins where it ends, is that
+    same seam carrying on, and the level it holds there is the one to meet.
+
+    Regions are matched on their bounding boxes.  The cut that separates two of
+    them is itself a staircase and may wander a full deviation budget either
+    way, so their boxes can overlap by twice that budget and no more; that is
+    the tolerance, and it is a bound rather than a tuned number.  A cut running
+    beside this one over the same ground is further off than that and is a
+    second cut through the same band, not the same seam carrying on.
+
+    The budget bounds the across match too: a level this cut could not reach is
+    not one it can meet.
+    """
+    reach = 2 * deviation_ft
+    best: list[tuple[float, float] | None] = [None, None]
+    for cut in placed:
+        if cut.axis != axis:
+            continue
+        if cut.u_start + cut.u_end < u_start + u_end:
+            index, gap, level = 0, abs(cut.u_end - u_start), cut.v_end
+        else:
+            index, gap, level = 1, abs(cut.u_start - u_end), cut.v_start
+        if gap > reach or abs(level - v_nominal) > deviation_ft:
+            continue
+        if best[index] is None or gap < best[index][0]:
+            best[index] = (gap, level)
+    return tuple(None if end is None else end[1] for end in best)
+
+
 def _extent(polygon: Polygon, axis: int) -> float:
     minx, miny, maxx, maxy = polygon.bounds
     return (maxx - minx) if axis == AXIS_X else (maxy - miny)
@@ -484,6 +550,7 @@ def partition(
     chooser = chooser or StraightCuts()
     snap_ft = snap_ft or sample_step_ft
     result = PartitionResult(polygons=[])
+    placed: list[PlacedCut] = []
     queue: list[Polygon] = _components(target)
     if not queue:
         raise PlanGeometryError("The target polygon is empty")
@@ -501,12 +568,13 @@ def partition(
             result.polygons.append(region)
             continue
         axis = AXIS_X if over_x >= over_y else AXIS_Y
-        low, high, record = _apply_cut(
+        low, high, record, cut = _apply_cut(
             region, axis, limits_ft, deviation_ft, chooser,
             snap_ft=snap_ft, min_run_ft=min_run_ft, min_jog_ft=min_jog_ft,
-            sample_step_ft=sample_step_ft,
+            sample_step_ft=sample_step_ft, placed=placed,
         )
         result.cuts.append(record)
+        placed.append(cut)
         queue = low + high + queue
     result.polygons = _order_polygons(result.polygons)
     return result
@@ -523,7 +591,8 @@ def _apply_cut(
     min_run_ft: float,
     min_jog_ft: float,
     sample_step_ft: float,
-) -> tuple[list[Polygon], list[Polygon], dict]:
+    placed: Sequence[PlacedCut] = (),
+) -> tuple[list[Polygon], list[Polygon], dict, PlacedCut]:
     minx, miny, maxx, maxy = region.bounds
     v_lo, v_hi = (minx, maxx) if axis == AXIS_X else (miny, maxy)
     u_lo, u_hi = (miny, maxy) if axis == AXIS_X else (minx, maxx)
@@ -543,9 +612,13 @@ def _apply_cut(
             (v_nominal - v_lo) * 0.45,
             (v_hi - v_nominal) * 0.45,
         )
+        continues_from, continues_into = continuing_levels(
+            placed, axis, u_lo, u_hi, v_nominal, deviation_ft
+        )
         request = CutRequest(
             axis, u_lo, u_hi, v_nominal, max(allowance, 0.0), sample_step_ft,
             snap_ft=snap_ft, min_run_ft=min_run_ft, min_jog_ft=min_jog_ft, region=region,
+            continues_from=continues_from, continues_into=continues_into,
         )
         path_u, path_v = _validated_path(chooser.choose(request), request)
         trial = LineString(to_points(axis, path_u, path_v)).intersection(region)
@@ -588,9 +661,13 @@ def _apply_cut(
         "seam_length_ft": float(seam.length),
         "style": getattr(chooser, "style", "nominal"),
         "blocked_samples": int(chooser.blocked(seam)),
+        "continues_from_ft": request.continues_from,
+        "continues_into_ft": request.continues_into,
         **chooser.describe(seam),
     }
-    return low, high, record
+    cut = PlacedCut(axis, float(u_lo), float(u_hi),
+                    float(path_v[0]), float(path_v[-1]))
+    return low, high, record, cut
 
 
 def _validated_path(vertices, request: CutRequest) -> tuple[np.ndarray, np.ndarray]:
@@ -651,6 +728,7 @@ def compact_chunks(
     polygons: Sequence[Polygon],
     *,
     limits_ft: tuple[float, float],
+    min_contact_ft: float = 0.0,
     maximum_passes: int = 200,
 ) -> tuple[list[Polygon], list[str]]:
     """Greedily combine neighbors that still fit one plate.
@@ -659,6 +737,14 @@ def compact_chunks(
     plates that could have shared one build. Each pass takes the merge that
     packs the plate best, so the plan converges on fewer, fuller plates without
     ever producing a chunk the generator would reject.
+
+    Two chunks that touch over less than ``min_contact_ft`` are left alone.
+    Fill is area over bounding box, which barely moves when a sliver is glued
+    on by its short end, so without this the pass will happily hang a chunk off
+    a contact a millimetre wide: the sliver becomes an unprintable finger on
+    one plate and a slot of the same width on the one wrapped around it. A
+    sliver reached this way always has a longer edge somewhere, and
+    :func:`merge_small_chunks` folds it in along that one instead.
     """
     working = list(polygons)
     notes: list[str] = []
@@ -666,7 +752,7 @@ def compact_chunks(
         best = None
         best_fill = -1.0
         for left, right in _neighbours(working):
-            if working[left].intersection(working[right]).length <= 0:
+            if working[left].intersection(working[right]).length <= max(min_contact_ft, 0.0):
                 continue
             union = shapely.union_all([working[left], working[right]])
             if union.geom_type != "Polygon" or not _fits(union, limits_ft):

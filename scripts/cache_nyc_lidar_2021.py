@@ -324,6 +324,31 @@ def planned_tiles(sources: list[BoroughSource], requested: shapely.Geometry | No
     return tiles
 
 
+def published_tiles(output: Path, configuration: dict[str, Any]) -> list[dict[str, Any]]:
+    """Every completed tile on disk built to this configuration.
+
+    The catalog describes the cache, not the run that last touched it. Building a
+    bounded area is a normal way to extend or repair one, so reading the tiles
+    back is what keeps a partial rebuild from orphaning everything outside its
+    bounds -- which it silently did before, leaving rasters on disk that no
+    consumer could see.
+    """
+    tiles = []
+    for path in sorted((output / "tiles").glob("*.json")):
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if record.get("status") != "completed":
+            continue
+        if record.get("configuration") != configuration:
+            continue
+        if not all((output / record[role]["path"]).is_file() for role in ("ground", "upper")):
+            continue
+        tiles.append(record)
+    return tiles
+
+
 def write_catalog(output: Path, results: list[dict[str, Any]]) -> None:
     features = []
     for result in results:
@@ -386,6 +411,14 @@ def main() -> None:
 
     output.mkdir(parents=True, exist_ok=True)
     manifest_path = output / "manifest.json"
+    previous = {}
+    if manifest_path.is_file():
+        try:
+            previous = json.loads(manifest_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+        if previous.get("configuration") not in (None, configuration):
+            previous = {}
     atomic_json(manifest_path, {"status": "building", "configuration": configuration})
 
     results = []
@@ -402,29 +435,43 @@ def main() -> None:
         results.append(process_tile(tile_x, tile_y, sources, output,
                                     args.chunk_cells, fill_cells, configuration))
 
-    write_catalog(output, results)
-    complete = args.bounds is None and len(sources) == len(BOROUGH_ALIASES)
+    # The catalog and manifest describe every tile the cache holds, not only the
+    # ones this run rewrote, so a bounded rebuild extends the cache instead of
+    # truncating it.
+    published = published_tiles(output, configuration)
+    write_catalog(output, published)
+    # Which boroughs the cache has ever converted, accumulated across runs: a
+    # bounded top-up of a complete cache must not demote it, and a cache that
+    # never saw a borough must never claim to be citywide.
+    converted = set(previous.get("boroughs") or []) | {source.name for source in sources}
+    whole_city = converted >= set(BOROUGH_ALIASES)
+    unbounded = args.bounds is None or bool(previous.get("production_ready"))
+    complete = whole_city and unbounded
     atomic_json(manifest_path, {
         "status": "complete",
         "configuration": configuration,
         "coverage_mode": "all" if args.bounds is None else "bounds",
         "requested_bounds_epsg2263_ft": list(args.bounds) if args.bounds else None,
-        "boroughs": [source.name for source in sources],
-        "chunks": len(results),
-        "ground_bytes": sum(result["ground"]["bytes"] for result in results),
-        "upper_bytes": sum(result["upper"]["bytes"] for result in results),
+        "boroughs": sorted(converted),
+        "boroughs_this_run": [source.name for source in sources],
+        "chunks": len(published),
+        "chunks_this_run": len(results),
+        "ground_bytes": sum(record["ground"]["bytes"] for record in published),
+        "upper_bytes": sum(record["upper"]["bytes"] for record in published),
         "catalog": "catalog.geojson",
         "completed_at": datetime.now(timezone.utc).isoformat(),
-        "tiles": [f"tiles/{result['key']}.json" for result in results],
+        "tiles": [f"tiles/{record['key']}.json" for record in published],
         "component": "nyc_lidar_2021",
         "production_ready": complete,
     })
-    print(f"Cache ready: {output} ({len(results)} tiles)")
+    print(f"Cache ready: {output} ({len(published)} tiles, {len(results)} built this run)")
     if not complete:
+        missing = sorted(set(BOROUGH_ALIASES) - converted)
         print(
-            "Note: this cache is partial (bounded, or missing boroughs). It is usable "
-            "for generation over its own extent, but the chunk planner and the vector "
-            "cache builders require a production-ready citywide cache."
+            "Note: this cache is partial"
+            + (f" (never converted: {', '.join(missing)})" if missing else " (bounded)")
+            + ". It is usable for generation over its own extent, but the chunk "
+            "planner and the vector cache builders require a citywide cache."
         )
 
 

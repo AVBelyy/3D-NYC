@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import shapely
-from shapely.geometry import box
+from shapely.geometry import Polygon, box
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -195,6 +195,211 @@ class StraightenTests(unittest.TestCase):
         surface = a_surface(np.ones((20, 20)), style="angled")
         points = np.asarray([[0.0, 0.0], [10.0, 0.0]])
         self.assertEqual(len(surface.straighten(geometry.AXIS_Y, points, min_side_ft=0.0)), 2)
+
+
+class CutContinuityTests(unittest.TestCase):
+    """Two cuts down one street have to meet where they touch.
+
+    A guillotine splits an avenue between sibling regions, so the same street
+    is chosen twice from nominals that can differ by less than one snap step.
+    Centering outweighs the cost difference between two lanes of that street,
+    so without an anchor the two halves land a single level apart and the plate
+    they share grows a stubby side.
+    """
+
+    CORRIDOR = 180.0        # the cheaper of the street's two lanes
+    NEIGHBOUR = 190.0       # the other one, a single level away
+
+    def a_corridor(self, cheap=18, dearer=19):
+        cost = np.full((40, 40), 50.0)
+        cost[:, cheap] = 1.0
+        if dearer is not None:
+            cost[:, dearer] = 1.2
+        return a_surface(cost, resolution_m=10.0 * geometry.FT)
+
+    def a_request(self, nominal, **meets):
+        return geometry.CutRequest(
+            geometry.AXIS_X, 0.0, 300.0, nominal, 60.0, 10.0,
+            snap_ft=10.0, min_run_ft=50.0, min_jog_ft=30.0, **meets,
+        )
+
+    def level_chosen(self, surface, nominal, **meets):
+        path = surface.choose(self.a_request(nominal, **meets))
+        levels = sorted(set(path[:, 1].tolist()))
+        self.assertEqual(len(levels), 1, f"expected one level, got {levels}")
+        return levels[0]
+
+    def test_sibling_nominals_pull_one_street_onto_two_levels(self):
+        # The defect: the northern half's nominal sits nearer the dearer lane
+        # and centering outweighs the difference in cost between the two.
+        surface = self.a_corridor()
+        self.assertEqual(self.level_chosen(surface, 196.0), self.NEIGHBOUR)
+        self.assertEqual(self.level_chosen(surface, 184.0), self.CORRIDOR)
+
+    def test_a_cut_meets_the_one_it_continues_at_either_end(self):
+        surface = self.a_corridor()
+        self.assertEqual(
+            self.level_chosen(surface, 196.0, continues_from=self.CORRIDOR),
+            self.CORRIDOR,
+        )
+        self.assertEqual(
+            self.level_chosen(surface, 196.0, continues_into=self.CORRIDOR),
+            self.CORRIDOR,
+        )
+
+    def test_an_anchor_out_of_reach_is_ignored(self):
+        # Beyond the deviation budget there is no level to meet, and the cut
+        # falls back on its own corridor.
+        surface = self.a_corridor()
+        self.assertEqual(
+            self.level_chosen(surface, 196.0, continues_from=1000.0), self.NEIGHBOUR
+        )
+
+    def test_a_corridor_worth_a_real_jog_still_wins(self):
+        # Meeting is a jog's worth of preference, not a constraint: a street
+        # that is genuinely elsewhere is still followed.
+        surface = self.a_corridor(cheap=30, dearer=None)
+        self.assertEqual(
+            self.level_chosen(surface, 300.0, continues_from=self.CORRIDOR), 300.0
+        )
+
+    def test_a_jog_clear_of_the_anchor_stays_available(self):
+        # Only steps too small to read as deliberate are refused; this corridor
+        # is a full min_jog_ft away and remains reachable.
+        surface = self.a_corridor(cheap=21, dearer=None)
+        self.assertEqual(
+            self.level_chosen(surface, 196.0, continues_from=self.CORRIDOR), 210.0
+        )
+
+    def test_a_blocked_anchor_is_left_rather_than_cut_through(self):
+        # Meeting a cut must never be worth driving a seam through a keep-out.
+        cost = np.full((40, 40), 50.0)
+        cost[:, 18] = np.inf
+        cost[:, 22] = 1.0
+        surface = a_surface(cost, resolution_m=10.0 * geometry.FT)
+        self.assertEqual(
+            self.level_chosen(surface, 196.0, continues_from=self.CORRIDOR), 220.0
+        )
+
+    def test_an_axis_cut_meets_the_same_anchor(self):
+        surface = self.a_corridor()
+        surface.style = "axis"
+        self.assertEqual(
+            self.level_chosen(surface, 196.0, continues_from=self.CORRIDOR),
+            self.CORRIDOR,
+        )
+
+    def test_anchors_a_sub_minimum_step_apart_still_yield_a_cut(self):
+        # Both ends pinned to levels no legal jog can join: the cut still has
+        # to divide its region, so it makes the best seam it can.
+        surface = self.a_corridor()
+        path = surface.choose(self.a_request(
+            196.0, continues_from=self.CORRIDOR, continues_into=self.NEIGHBOUR
+        ))
+        self.assertGreaterEqual(len(path), 2)
+        self.assertTrue(bool(np.all(np.isfinite(path))))
+
+
+class PartitionContinuityTests(unittest.TestCase):
+    """The rule over a whole partition, not one cut in isolation.
+
+    A guillotine cuts one street from several regions, so what matters is the
+    finished plates: two that meet down one avenue either share a full edge or
+    only a corner.  Sharing a sliver means the two cuts chose different lanes
+    of the same street, and the plate that later absorbs both grows a side too
+    short to read.
+    """
+
+    LEVEL_FT = 10.0          # one raster cell, and one snap level
+    MIN_JOG_FT = 40.0
+    STREET_PITCH = 20        # cells between street centre lines
+    EXTENT_FT = 6000.0
+    LIMITS_FT = (1500.0, 1500.0)
+
+    def a_city(self, cells=600):
+        """A regular grid whose lanes are cheap but not equally cheap.
+
+        Near-ties are the point: where two lanes of one street cost almost the
+        same, the choice falls to centering, which is anchored on a nominal
+        that differs between the regions sharing that street.
+        """
+        cost = np.full((cells, cells), 100.0)
+        for offset, lane in enumerate((1.3, 1.0, 1.05, 1.25)):
+            for axis in (0, 1):
+                view = cost[offset::self.STREET_PITCH, :] if axis == 0 \
+                    else cost[:, offset::self.STREET_PITCH]
+                np.minimum(view, lane, out=view)
+        return a_surface(cost, resolution_m=self.LEVEL_FT * geometry.FT, style="angled")
+
+    def a_target(self, insets=(0.0, 91.0, 44.0, 17.0)):
+        """A rectangle with a ragged edge, the way a shoreline is ragged.
+
+        A square splits into regions that are mirror images, so every sibling
+        shares one nominal and the tie never arises. Real coastlines give
+        siblings nominals a fraction of a level apart, which is the whole
+        problem, so the target has to be irregular to exercise it.
+        """
+        band = self.EXTENT_FT / len(insets)
+        edge = [point for index, inset in enumerate(insets)
+                for point in ((inset, index * band), (inset, (index + 1) * band))]
+        return Polygon([(self.EXTENT_FT, 0.0), (self.EXTENT_FT, self.EXTENT_FT)]
+                       + edge[::-1])
+
+    def a_partition(self):
+        return geometry.partition(
+            self.a_target(), limits_ft=self.LIMITS_FT, deviation_ft=150.0,
+            chooser=self.a_city(), snap_ft=self.LEVEL_FT, min_run_ft=150.0,
+            min_jog_ft=self.MIN_JOG_FT, sample_step_ft=self.LEVEL_FT,
+        )
+
+    def slivers(self, polygons):
+        """Pairs sharing a boundary too short to be an edge at all."""
+        return sorted(
+            round(float(left.intersection(right).length), 2)
+            for index, left in enumerate(polygons) for right in polygons[index + 1:]
+            if 1e-6 < left.intersection(right).length < self.MIN_JOG_FT - 1e-6
+        )
+
+    def seam_steps(self, polygons):
+        """Interior sides of a shared edge shorter than a readable jog.
+
+        Interior only: a short side at the end of a shared edge is a T-junction
+        with a third plate, which is a different shape of problem.
+        """
+        steps = []
+        for index, left in enumerate(polygons):
+            for right in polygons[index + 1:]:
+                shared = left.intersection(right)
+                for part in getattr(shared, "geoms", [shared]):
+                    if part.geom_type != "LineString" or len(part.coords) < 4:
+                        continue
+                    sides = np.hypot(*np.diff(np.asarray(part.coords), axis=0).T)
+                    steps += [round(float(side), 2) for side in sides[1:-1]
+                              if 1e-6 < side < self.MIN_JOG_FT - 1e-6]
+        return sorted(steps)
+
+    def test_plates_down_one_street_share_an_edge_or_a_corner(self):
+        result = self.a_partition()
+        self.assertGreater(len(result.cuts), 8)      # a real partition, not one cut
+        self.assertEqual(self.slivers(result.polygons), [])
+
+    def test_no_seam_steps_by_less_than_a_readable_jog(self):
+        result = self.a_partition()
+        plates, _ = geometry.compact_chunks(result.polygons, limits_ft=self.LIMITS_FT)
+        self.assertEqual(self.seam_steps(plates), [])
+
+    def test_the_partition_is_still_exact(self):
+        result = self.a_partition()
+        coverage = geometry.validate_partition(
+            self.a_target(), result.polygons, tolerance_ft2=1.0
+        )
+        self.assertLessEqual(coverage["uncovered_area_ft2"], coverage["tolerance_ft2"])
+        self.assertLessEqual(coverage["excess_area_ft2"], coverage["tolerance_ft2"])
+
+    def test_seams_still_follow_the_streets(self):
+        # Straightness must not be bought by routing a seam through the blocks.
+        for cut in self.a_partition().cuts:
+            self.assertEqual(cut["blocked_samples"], 0)
 
 
 class CrossingClassificationTests(unittest.TestCase):

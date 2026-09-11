@@ -264,7 +264,11 @@ def plan_partition(target_ft: Polygon, frame: Frame, chooser, options) -> dict:
         min_area_ft2=limits[0] * limits[1] * options.min_chunk_fill,
         min_fill=options.min_chunk_fill,
     )
-    polygons, notes = geometry.compact_chunks(result.polygons, limits_ft=limits)
+    polygons, notes = geometry.compact_chunks(
+        result.polygons, limits_ft=limits,
+        # A contact narrower than a readable jog pinches whatever it joins.
+        min_contact_ft=frame.feet(options.min_jog_mm),
+    )
     polygons, sliver_notes = geometry.merge_small_chunks(
         polygons, limits_ft=limits, **thresholds
     )
