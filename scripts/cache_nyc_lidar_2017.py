@@ -27,7 +27,6 @@ import hashlib
 import json
 import math
 import os
-import shutil
 import sys
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
@@ -44,7 +43,7 @@ from affine import Affine
 from scipy.ndimage import distance_transform_edt
 from shapely.geometry import box, mapping
 
-from download_data import MIN_FREE, ROOT, download
+from download_data import ROOT, download
 
 
 PIPELINE_VERSION = 1
@@ -369,10 +368,6 @@ def process_tile(task: TileTask) -> dict[str, Any]:
     reused = completed_metadata(task, metadata_path)
     if reused is not None:
         return reused
-
-    estimated_uncompressed = task.chunk_cells * task.chunk_cells * 4 * 2
-    if shutil.disk_usage(output).free - estimated_uncompressed < MIN_FREE:
-        raise RuntimeError(f"{task.key}: refusing to reduce free storage below 15 GiB")
 
     halo = task.fill_cells
     expanded_cells = task.chunk_cells + 2 * halo

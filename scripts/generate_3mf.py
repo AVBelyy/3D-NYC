@@ -19,7 +19,6 @@ import math
 import os
 import re
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
@@ -52,7 +51,7 @@ from _cache_land_cover import (
     gdal_dataset as land_cover_dataset_path,
 )
 from _datasets import DATASETS
-from download_data import MIN_FREE, ROOT, download
+from download_data import ROOT, download
 from cache_common import read_tiled_geoparquet
 from crossings import structural_roof_thickness_mm
 from _material_layers import (
@@ -547,9 +546,6 @@ class Pipeline:
         if folder.exists():
             return folder
         with zipfile.ZipFile(archive) as source:
-            expanded = sum(item.file_size for item in source.infolist())
-            if shutil.disk_usage(archive.parent).free - expanded < MIN_FREE:
-                raise RuntimeError("Insufficient disk space to extract Planimetrics while retaining 15 GiB")
             for item in source.infolist():
                 if not (archive.parent / item.filename).resolve().is_relative_to(archive.parent.resolve()):
                     raise RuntimeError(f"Unsafe Planimetrics archive member: {item.filename}")

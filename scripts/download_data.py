@@ -1,5 +1,5 @@
-"""Resumable public downloads, hashes and provenance; refuses to exhaust the disk."""
-import argparse, hashlib, json, os, shutil, time
+"""Resumable public downloads, hashes and provenance."""
+import argparse, hashlib, json, os, time
 from datetime import datetime, timezone
 from pathlib import Path
 import requests
@@ -7,8 +7,6 @@ import requests
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = Path(os.environ.get('NYC_DATA_DIR', ROOT / 'data')).resolve()
 RAW = Path(os.environ.get('NYC_RAW_DIR', DATA_DIR / 'raw')).resolve()
-MIN_FREE = 15 * 1024**3
-
 def download(
     url, relative, expected_size=None, *, raw_dir=None, manifests_dir=None,
     max_resident_bytes=None, resident_bytes_fn=None,
@@ -40,14 +38,10 @@ def download(
                             f'LAZ resident cap exceeded: {resident + total:,} bytes '
                             f'(limit {max_resident_bytes:,})'
                         )
-                if total and shutil.disk_usage(raw_dir).free - (total-offset) < MIN_FREE:
-                    raise RuntimeError(f'Insufficient storage: {total:,} bytes; preserving 15 GiB free')
                 print(f'Download {relative}: {total:,} bytes, resuming at {offset:,}', flush=True)
                 checkpoint = time.monotonic()
                 with part.open('ab' if offset else 'wb') as f:
                     for chunk in r.iter_content(4*1024**2):
-                        if shutil.disk_usage(raw_dir).free < MIN_FREE:
-                            raise RuntimeError('Storage reserve reached')
                         f.write(chunk)
                         if time.monotonic() - checkpoint > 25:
                             print(f'  {relative}: {f.tell():,} bytes', flush=True)
