@@ -41,8 +41,12 @@ Options:
         after its last use. Faster to rebuild from, but the whole city at once
         needs far more free space than the streamed default.
   --skip-lidar
-        Keep the existing data/cache/nyc_lidar_2017 and build only the rest.
-        The other builders still need its catalog, so it has to exist already.
+        Keep the existing LiDAR cache and build only the rest. The other
+        builders still need its catalog, so it has to exist already.
+  --lidar-dataset NAME
+        Which LiDAR collection to build and take citywide coverage from:
+        nyc_lidar_2021 (default, published rasters) or nyc_lidar_2017
+        (point cloud, and the only one with bathymetry).
   -h, --help
         Show this help.
 
@@ -67,6 +71,7 @@ run() {
 }
 
 skip_lidar=0
+lidar_dataset=nyc_lidar_2021
 keep_sources=0
 
 while [[ $# -gt 0 ]]; do
@@ -74,6 +79,15 @@ while [[ $# -gt 0 ]]; do
     --keep-lidar-sources)
       keep_sources=1
       shift
+      ;;
+    --lidar-dataset)
+      [[ $# -ge 2 ]] || die '--lidar-dataset needs a value'
+      case $2 in
+        nyc_lidar_2021|nyc_lidar_2017) lidar_dataset=$2 ;;
+        *) die "unknown --lidar-dataset $2" ;;
+      esac
+      shift 2
+      continue
       ;;
     --skip-lidar)
       skip_lidar=1
@@ -96,9 +110,14 @@ done
 cd "$ROOT"
 
 if [[ $skip_lidar -eq 1 ]]; then
-  printf '\n==> skipping nyc_lidar_2017\n' >&2
-  [[ -f data/cache/nyc_lidar_2017/catalog.geojson ]] ||
-    die 'data/cache/nyc_lidar_2017/catalog.geojson is missing; the other builders read it for coverage'
+  printf '\n==> skipping %s\n' "$lidar_dataset" >&2
+  [[ -f "data/cache/$lidar_dataset/catalog.geojson" ]] ||
+    die "data/cache/$lidar_dataset/catalog.geojson is missing; the other builders read it for coverage"
+elif [[ $lidar_dataset == nyc_lidar_2021 ]]; then
+  # The published rasters cover each borough whole, so there is no per-area
+  # selection and nothing to stream: the builder reads whatever pairs are on
+  # disk and --keep-lidar-sources has nothing to act on.
+  run "$PYTHON" scripts/cache_nyc_lidar_2021.py
 else
   # --coverage all without --bounds is every tile in the index, which is what
   # "all of NYC" means here. --download-missing is not optional in practice:
@@ -113,8 +132,18 @@ else
   run "$PYTHON" "${lidar[@]}"
 fi
 
+# The vector builders take their citywide extent from the LiDAR catalog, so they
+# have to read the one just built rather than the default.
+coverage=("--coverage" "data/cache/$lidar_dataset/catalog.geojson")
+
 for dataset in "${DATASETS[@]}"; do
-  run "$PYTHON" "scripts/cache_$dataset.py"
+  # Only the vector builders derive their extent from the LiDAR catalog; the
+  # land-cover raster is clipped by its own source and takes no --coverage.
+  if "$PYTHON" "scripts/cache_$dataset.py" --help 2>/dev/null | grep -q -- '--coverage'; then
+    run "$PYTHON" "scripts/cache_$dataset.py" "${coverage[@]}"
+  else
+    run "$PYTHON" "scripts/cache_$dataset.py"
+  fi
 done
 
 printf '\nBuilt caches under data/cache/. Next: scripts/generate_3mf.py\n' >&2

@@ -82,6 +82,11 @@ for dataset in "${DATASETS[@]}"; do
   run "$PYTHON" "scripts/download_$dataset.py"
 done
 
+# The 2021 rasters are the default LiDAR source and are fetched whole: about
+# 39 GB, ten files, no per-area selection to make.  The 2017 collection stays
+# available; only its tile index is fetched here, because its LAZ are selected
+# by area and streamed by the cache builder.
+run "$PYTHON" scripts/download_nyc_lidar_2021.py
 run "$PYTHON" scripts/download_nyc_lidar_2017.py --index-only
 
 printf '\nDownloaded raw sources under data/raw/. Next: scripts/cache_all.sh\n' >&2

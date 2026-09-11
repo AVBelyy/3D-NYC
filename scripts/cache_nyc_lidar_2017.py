@@ -54,6 +54,11 @@ RESOLUTION_FT = RESOLUTION_M / FT_TO_M
 CRS = "EPSG:2263"
 GROUND_CLASSES = (2,)
 UPPER_CLASSES = (1, 2, 17, 25)
+# The tile grid and fill reach every LiDAR cache publishes, whatever it was built
+# from.  A second builder writing the same contract reads them from here rather
+# than repeating the numbers, so the two cannot drift apart.
+DEFAULT_CHUNK_CELLS = 4096
+DEFAULT_GROUND_FILL_M = 10.0
 DEFAULT_OUTPUT = ROOT / "data/cache/nyc_lidar_2017"
 DEFAULT_INDEX = ROOT / "data/raw/nyc_lidar_2017/index.geojson"
 DEFAULT_LAZ = ROOT / "data/raw/nyc_lidar_2017/tiles"
@@ -608,8 +613,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--download-missing", action="store_true")
     parser.add_argument("--download-only", action="store_true")
-    parser.add_argument("--chunk-cells", type=int, default=4096)
-    parser.add_argument("--ground-fill-m", type=float, default=10.0)
+    parser.add_argument("--chunk-cells", type=int, default=DEFAULT_CHUNK_CELLS)
+    parser.add_argument("--ground-fill-m", type=float, default=DEFAULT_GROUND_FILL_M)
     parser.add_argument("--point-chunk-size", type=int, default=1_000_000)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument(

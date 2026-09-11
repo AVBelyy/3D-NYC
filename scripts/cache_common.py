@@ -30,7 +30,7 @@ from tqdm import tqdm
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
 DEFAULT_CACHE_ROOT = DATA / "cache"
-DEFAULT_COVERAGE = DATA / "cache/nyc_lidar_2017/catalog.geojson"
+DEFAULT_COVERAGE = DATA / "cache/nyc_lidar_2021/catalog.geojson"
 CRS = "EPSG:2263"
 CACHE_FORMAT_VERSION = 1
 

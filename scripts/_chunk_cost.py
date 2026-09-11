@@ -229,19 +229,26 @@ def _read_planimetrics(cache_dir: Path, layer: str, bounds) -> gpd.GeoDataFrame:
     return gpd.read_parquet(path, bbox=tuple(bounds))
 
 
-def _lidar_mosaics(cache_dir: Path, grid: FrameGrid) -> dict[str, np.ndarray]:
+# The 2021 survey is the default: it is the most recent citywide collection and
+# publishes the same cache contract.  The 2017 topobathymetric collection stays
+# selectable, and is still the only one with bathymetry.
+LIDAR_DATASETS = ("nyc_lidar_2021", "nyc_lidar_2017")
+
+
+def _lidar_mosaics(cache_dir: Path, grid: FrameGrid,
+                   dataset: str = LIDAR_DATASETS[0]) -> dict[str, np.ndarray]:
     """Mosaic cached ground and upper-surface rasters onto the frame grid.
 
     The upper surface is max-pooled and the ground is both mean-pooled (for
     height) and min-pooled (for the shared terrain datum, which must be a true
     lower bound of what the generator will sample at full resolution).
     """
-    root = cache_dir / "nyc_lidar_2017"
+    root = cache_dir / dataset
     catalog_path = root / "catalog.geojson"
     if not catalog_path.is_file():
         raise SourceDataError(
             f"LiDAR catalog is missing at {catalog_path}; build it with "
-            "scripts/cache_nyc_lidar_2017.py"
+            f"scripts/cache_{dataset}.py"
         )
     catalog = gpd.read_file(catalog_path)
     catalog = catalog.set_crs(4326) if catalog.crs is None else catalog
@@ -250,7 +257,7 @@ def _lidar_mosaics(cache_dir: Path, grid: FrameGrid) -> dict[str, np.ndarray]:
     selected = catalog[catalog.intersects(area)]
     if selected.empty:
         raise SourceDataError(
-            "The requested area has no cached NYC 2017 LiDAR coverage; extend the "
+            f"The requested area has no cached {dataset} coverage; extend the "
             "LiDAR cache before planning here"
         )
     plans = (
@@ -771,6 +778,7 @@ def build_cost_surface(
     target_ft: Polygon,
     *,
     cache_dir: Path,
+    lidar_dataset: str = LIDAR_DATASETS[0],
     resolution_m: float = 4.0,
     margin_m: float = 60.0,
     weights: CostWeights | None = None,
@@ -782,7 +790,7 @@ def build_cost_surface(
     grid = FrameGrid.covering(frame, target_ft, resolution_m, margin_m)
     sources = {
         name: cache_signature(cache_dir, name)
-        for name in ("nyc_lidar_2017", "nyc_planimetrics_2022",
+        for name in (lidar_dataset, "nyc_planimetrics_2022",
                      "nyc_building_footprints", "new_york_osm")
     }
     if use_land_cover:
@@ -794,7 +802,7 @@ def build_cost_surface(
         log.info("cost_surface_building", key=key, shape=list(grid.shape),
                  resolution_m=resolution_m)
     world = grid.world_bounds
-    elevation = _lidar_mosaics(cache_dir, grid)
+    elevation = _lidar_mosaics(cache_dir, grid, lidar_dataset)
     upper, ground, ground_min = (
         elevation["upper_max"], elevation["ground_mean"], elevation["ground_min"]
     )

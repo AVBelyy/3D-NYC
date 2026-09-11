@@ -384,7 +384,7 @@ class Pipeline:
         elif args.lidar_cache_dir is not None:
             self.lidar_cache_dir = Path(args.lidar_cache_dir).resolve()
         else:
-            self.lidar_cache_dir = (self.cache_dir / "nyc_lidar_2017").resolve()
+            self.lidar_cache_dir = (self.cache_dir / "nyc_lidar_2021").resolve()
         self.download_manifests = self.raw
         self.reference = reference.resolve()
         self.profiles = profiles.resolve()
@@ -580,7 +580,8 @@ class Pipeline:
             raise FileNotFoundError(
                 "LiDAR cache is missing or incomplete: "
                 f"expected {manifest_path} and {catalog_path}. "
-                "Run scripts/cache_nyc_lidar_2017.py first, or use --lidar-source laz."
+                "Build one with scripts/cache_nyc_lidar_2017.py or "
+                "scripts/cache_nyc_lidar_2021.py, or use --lidar-source laz."
             )
         try:
             manifest = json.loads(manifest_path.read_text())
@@ -591,6 +592,8 @@ class Pipeline:
                 f"LiDAR cache manifest is not complete ({manifest.get('status')!r}): {manifest_path}"
             )
         configuration = manifest.get("configuration", {})
+        # The grid, units and fill every LiDAR cache is sampled on, whichever
+        # collection it was built from.
         required = {
             "pipeline_version": 1,
             "crs": "EPSG:2263",
@@ -598,13 +601,32 @@ class Pipeline:
             "elevation_units": "metres NAVD88",
             "dtype": "float32",
             "ground_fill_max_distance_m": 10.0,
-            "ground_classes": [2],
-            "upper_classes": [1, 2, 17, 25],
-            "ground_aggregation": "arithmetic mean",
-            "upper_aggregation": "maximum",
-            "withheld_points_excluded": True,
             "vertical_quantization": None,
         }
+        # How the two surfaces were measured differs by collection: 2017 bins
+        # individual returns, 2021 publishes vendor-gridded DTM/DSM rasters.
+        # Each derivation is pinned separately, so neither can drift unnoticed
+        # and a raster cache cannot claim per-class point aggregation it never
+        # performed.
+        derivations = {
+            "point cloud": {
+                "ground_classes": [2],
+                "upper_classes": [1, 2, 17, 25],
+                "ground_aggregation": "arithmetic mean",
+                "upper_aggregation": "maximum",
+                "withheld_points_excluded": True,
+            },
+            "published rasters": {
+                "ground_measurement": "published bare-earth DTM",
+                "upper_measurement": "published DSM, raised to the ground where lower",
+            },
+        }
+        source_kind = configuration.get("source_kind", "point cloud")
+        if source_kind not in derivations:
+            raise RuntimeError(
+                f"LiDAR cache declares an unknown source_kind {source_kind!r}: {manifest_path}"
+            )
+        required |= derivations[source_kind]
         incompatible = {
             key: (configuration.get(key), expected)
             for key, expected in required.items()
@@ -2124,7 +2146,7 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument(
         "--lidar-cache-dir", type=Path,
-        help="NYC 2017 LiDAR cache directory (defaults to <cache-dir>/nyc_lidar_2017)",
+        help="LiDAR raster cache directory (defaults to <cache-dir>/nyc_lidar_2021)",
     )
     result.add_argument(
         "--project-settings-template", type=Path,
@@ -2171,7 +2193,7 @@ def build_config(args) -> tuple[dict, str, Path]:
     lidar_cache_dir = (
         Path(args.lidar_cache_dir).resolve()
         if args.lidar_cache_dir is not None
-        else (cache_dir / "nyc_lidar_2017").resolve()
+        else (cache_dir / "nyc_lidar_2021").resolve()
     )
     if not (0.1 <= args.grid_step_mm <= 0.5):
         raise ValueError("Grid step must be between 0.1 and 0.5 mm")

@@ -29,7 +29,13 @@ import structlog
 from shapely.geometry import Polygon
 
 import _chunk_geometry as geometry
-from _chunk_cost import CostWeights, SourceDataError, build_cost_surface, cache_signature
+from _chunk_cost import (
+    LIDAR_DATASETS,
+    CostWeights,
+    SourceDataError,
+    build_cost_surface,
+    cache_signature,
+)
 from _chunk_geometry import Frame, PlanGeometryError
 from cache_common import read_tiled_geoparquet
 from _material_layers import MATERIAL_NAMES
@@ -628,6 +634,11 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--plan-id", help="Plan directory name; derived from the request when omitted")
     result.add_argument("--data-dir", type=Path, default=ROOT / "data", help="Shared input-data root")
     result.add_argument("--cache-dir", type=Path, help="Dataset cache root (defaults to <data-dir>/cache)")
+    result.add_argument(
+        "--lidar-dataset", choices=LIDAR_DATASETS, default=LIDAR_DATASETS[0],
+        help="Cached LiDAR collection the cut-cost surface measures height from. "
+             "Both publish the same contract; the plan records which one it used.",
+    )
     result.add_argument("--output-dir", type=Path, default=ROOT / "output",
                         help="Root for generated plans and models")
     result.add_argument("--no-land-cover", action="store_true",
@@ -808,6 +819,7 @@ def run(args, log) -> dict:
     surface = build_cost_surface(
         frame, target_ft,
         cache_dir=resolved["cache_dir"],
+        lidar_dataset=args.lidar_dataset,
         resolution_m=args.cost_resolution_m,
         weights=weights,
         use_land_cover=not args.no_land_cover,
