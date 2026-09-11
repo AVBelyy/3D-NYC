@@ -84,6 +84,7 @@ but it is the reason the older cache is still selectable.
 | --- | --- |
 | `generate_3mf.py` | `--lidar-cache-dir data/cache/nyc_lidar_2017` |
 | `plan_map_chunks.py` | `--lidar-dataset nyc_lidar_2017` |
+| `download_all.sh` | `--lidar-dataset nyc_lidar_2017` |
 | `cache_all.sh` | `--lidar-dataset nyc_lidar_2017` |
 
 The plan records which collection its cut-cost surface measured height from, in

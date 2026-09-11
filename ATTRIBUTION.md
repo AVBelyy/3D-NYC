@@ -35,7 +35,8 @@ and any dataset-specific terms:
   non-commercial and share-alike; build with `--land-cover-dataset
   nyc_land_cover_2017` if those terms do not suit your use.
 - [NYC 2017 Land Cover](https://data.cityofnewyork.us/d/he6d-2qns)
-- [NYC 2017 LiDAR](https://maps.nyc.gov/lidar/2017/)
+- [NYC 2017 LiDAR](https://maps.nyc.gov/lidar/2017/) (the selectable
+  alternative to the 2021 state collection listed below)
 - [NYC Planning GeoSearch](https://geosearch.planninglabs.nyc/) (used only
   when a building-color override is selected by address)
 
@@ -45,6 +46,11 @@ remains the authoritative source.
 
 ## State of New York / MTA
 
+- [NYC 2021 LiDAR](https://gis.ny.gov/lidar), published by the New York State
+  GIS Program Office. This is the default elevation source; the generator
+  converts the per-borough DTM/DSM rasters distributed under
+  <https://gisdata.ny.gov/elevation/>. Consult the publisher for the terms that
+  apply to it.
 - [MTA Subway Entrances and Exits (2024)](https://data.ny.gov/d/i9wp-a4ja),
   subject to the [OPEN-NY terms of use](https://data.ny.gov/stories/s/Terms-of-Use/4un2-9t8b/).
 

@@ -42,7 +42,7 @@ Run commands from the repository root. Use Python 3.12 and install
   name; do not add a `__main__` guard to one to settle the question.
 - Dataset pairs follow `download_X.py` to `data/raw/X/` and `cache_X.py` to
   `data/cache/X/`, with documented exceptions such as streamed Building
-  Footprints and region-selective LiDAR.
+  Footprints and the region-selective 2017 LiDAR collection.
 - `data/raw/`, `data/cache/`, and `output/` are ignored, potentially large, and
   may contain expensive user-generated state. Do not delete or rebuild them
   unless the task explicitly requires it.

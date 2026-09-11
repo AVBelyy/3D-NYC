@@ -35,17 +35,23 @@ scripts/download_all.sh
 scripts/cache_all.sh
 ```
 
-`download_all.sh` fetches the citywide sources and the LiDAR tile index, and
-stops there: the LAZ tiles are large and selected by area, so `cache_all.sh`
-streams exactly the ones its raster chunks need. All of NYC is then simply the
-extent of that index, not a bounding box anyone has to look up.
+`download_all.sh` fetches the citywide sources plus the LiDAR and land-cover
+collections it was asked for, and nothing else. The default `nyc_lidar_2021`
+surfaces are published per borough, so there is no area to select and nothing
+to stream: about 39 GB in ten files. With `--lidar-dataset nyc_lidar_2017` it
+takes only that collection's tile index instead, because its LAZ are selected
+by area and pulled by its cache builder on demand -- so a 2017 build never
+downloads the 2021 rasters. All of NYC is then simply the extent of the
+catalog, not a bounding box anyone has to look up.
 
-A citywide LiDAR build reads far more LAZ than it is worth keeping, so
-`cache_all.sh` streams each source in and deletes it after its last use,
-staying under the builder's resident-source cap. Pass `--keep-lidar-sources` to
-retain them instead, and `--skip-lidar` to leave an existing LiDAR cache alone
-and rebuild only the rest. `cache_all.sh` builds LiDAR before anything else,
-because the remaining builders read its catalog for their coverage.
+`cache_all.sh` builds LiDAR before anything else, because the remaining builders
+read its catalog for their coverage, and `--skip-lidar` leaves an existing LiDAR
+cache alone and rebuilds only the rest. The streaming controls belong to the
+2017 path alone: a citywide LAZ build reads far more source than it is worth
+keeping, so with `--lidar-dataset nyc_lidar_2017` the builder streams each tile
+in and deletes it after its last use, and `--keep-lidar-sources` retains them
+instead. The 2021 builder reads the borough rasters already on disk, so neither
+option has anything to act on.
 
 Neither script downloads the building-footprints CSV, because the footprint
 cache is built from the official feature service and never reads it.
@@ -83,8 +89,9 @@ additions:
   the only one carrying bathymetry. See the
   [2017 LiDAR cache guide](cache_nyc_lidar_2017.md).
 
-Point the generator at one with `--lidar-cache-dir`, the planner with
-`--lidar-dataset`, and `cache_all.sh` with `--lidar-dataset`.
+Point the generator at one with `--lidar-cache-dir`, and the planner,
+`download_all.sh`, and `cache_all.sh` with `--lidar-dataset`. Pass the same
+name to the download and cache scripts so the pair agrees.
 
 Land cover is the other dataset published as two collections, and they are
 likewise alternatives rather than additions. Both carry the same eight-class

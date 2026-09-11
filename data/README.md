@@ -3,6 +3,23 @@
 `data/` contains inputs used by `scripts/generate_3mf.py`. Generated models,
 jobs, plans, logs, previews, and intermediate files belong in `output/`.
 
+## Filling it
+
+Two scripts populate `data/` for the whole city, in this order:
+
+```bash
+scripts/download_all.sh   # raw sources     -> data/raw/
+scripts/cache_all.sh      # generator input -> data/cache/
+```
+
+Neither asks for an area, and both are resumable: a rerun skips whatever is
+already complete, so an interrupted build is safe to restart. Pass `--help` to
+either for the LiDAR and land-cover choices. To cache a smaller area, run the
+per-dataset pairs below instead; the
+[cache runbook](../docs/cache_source_datasets.md) has the full procedure.
+
+## Dataset naming
+
 The dataset name `X` is deliberately identical throughout the download/cache
 workflow:
 
@@ -24,6 +41,7 @@ inputs are `bambu/project_settings.json` and the reusable crop polygons in
 
 | X | Source represented by the cache |
 | --- | --- |
+| `nyc_lidar_2021` | NYC 2021 LiDAR (default) |
 | `nyc_lidar_2017` | NYC 2017 LiDAR |
 | `nyc_3d_buildings_2014` | NYC 2014 3D Building Model |
 | `nyc_building_footprints` | NYC Building Footprints |

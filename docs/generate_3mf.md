@@ -50,7 +50,7 @@ build plates; see [the planner guide](plan_map_chunks.md).
 | `--data-dir` | `data/` | Checked-in and transient input root |
 | `--cache-dir` | `data/cache/` | Per-dataset reusable caches |
 | `--output-dir` | `output/` | Jobs, default models, plans, and other generated files |
-| `--lidar-cache-dir` | `<cache-dir>/nyc_lidar_2017` | Optional LiDAR cache override |
+| `--lidar-cache-dir` | `<cache-dir>/nyc_lidar_2021` | Optional LiDAR cache override |
 | `--project-settings-template` | `data/bambu/project_settings.json` | Bambu project-settings input |
 
 `--output-dir` controls the generated-data root. It does not change an explicit
@@ -169,11 +169,12 @@ Roads and trails are drawn as raised lines rather than color painted onto the
 pavement. A carriageway line, a trail line on open ground, and the bridge deck
 that carries either across a crossing all stand `road_line_relief_mm` (0.48 mm)
 above the ground below them, while sidewalks, roadbeds, plazas, and surface
-parking stay on the `path_relief_mm` (0.16 mm) pavement pad. A line laid flush
-with that pad is separated from it by color alone, so every junction, marked
-crossing, and kerb overlap reads as a break in a road that is in fact
-continuous; the raised edge is what makes one street read as one line. The
-default height is two layers at the coarsest supported layer height, so the
+parking stay on the `path_relief_mm` pavement pad, a nominal 0.16 mm rounded up
+to a whole number of layers (so 0.24 mm at the default 0.24 mm layer height).
+A line laid flush with that pad is separated from it by color alone, so every
+junction, marked crossing, and kerb overlap reads as a break in a road that is
+in fact continuous; the raised edge is what makes one street read as one line.
+The default height is two layers at the coarsest supported layer height, so the
 same symbol prints raised on every profile, and it is floored — never shrunk —
 at finer layer heights.
 
