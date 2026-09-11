@@ -59,7 +59,7 @@ from road_symbols import TRAIL_HIGHWAYS
 
 PIPELINE_VERSION = 25
 DETAIL_PIPELINE_VERSION = 2
-FIELD_PIPELINE_VERSION = 9
+FIELD_PIPELINE_VERSION = 12
 CROSSING_VALIDATION_VERSION = 2
 MESH_PIPELINE_VERSION = 24
 PACKAGE_PIPELINE_VERSION = 9
@@ -299,6 +299,63 @@ def count_osm_semantic_features(
         "osm_building_footprints_unfiltered": int(building_mask.sum()),
         "osm_motor_road_segments": int(relevant_motor_roads.sum()),
         "osm_motor_road_segments_unfiltered": int(motor_road_mask.sum()),
+    }
+
+
+def stage_variants(cache_identity):
+    """Every stage's cache key, including the keys of the stages it reads.
+
+    A stage is skipped when the config hash and this key both match what its
+    last completed run recorded, and neither hashes the code that produced the
+    outputs.  A version constant is how a stage says its outputs changed -- so
+    a stage that reads another stage's outputs has to carry that stage's key as
+    well as its own.  Without that, bumping a version upstream reruns only the
+    stage that was bumped: everything built from it keeps its cached outputs,
+    the job ships the geometry the fix was meant to replace, and the fix looks
+    like it did nothing.  Declaring the inputs is what keeps that impossible;
+    it is not a summary of the graph, it is the graph.
+
+    ``cache_identity`` maps a dataset name to the identity of its local cache,
+    so a rebuilt source invalidates the same chain a version bump does.
+    """
+    vectors = {"caches": {name: cache_identity(name) for name in (
+        "nyc_planimetrics_2022", "nyc_building_footprints", "nyc_parks_trails",
+    )}}
+    citygml = {"cache": cache_identity("nyc_3d_buildings_2014")}
+    # The LiDAR stage validates its own source every run and has never carried
+    # a key.  Naming it None here keeps it that way while still recording that
+    # the fields are built from it.
+    lidar = None
+    landcover = {"cache": cache_identity("nyc_land_cover_2017")}
+    osm = {"cache": cache_identity("new_york_osm")}
+    details = {"detail_pipeline_version": DETAIL_PIPELINE_VERSION, "caches": {
+        name: cache_identity(name) for name in (
+            "nyc_parks_structures", "mta_subway_entrances_2024",
+        )
+    }}
+    fields = {"field_pipeline_version": FIELD_PIPELINE_VERSION,
+        "details": "parks structures and subway entrances",
+        "inputs": {"prepare_vectors": vectors, "extract_citygml": citygml,
+            "prepare_lidar": lidar, "prepare_landcover": landcover,
+            "extract_osm": osm, "prepare_details": details}}
+    crossings = {"crossing_validation_version": CROSSING_VALIDATION_VERSION,
+        "coverage": "tagged_bridges_and_surface_routes_over_tunnels",
+        "inputs": {"build_fields": fields}}
+    meshes = {"mesh_pipeline_version": MESH_PIPELINE_VERSION,
+        "inputs": {"build_fields": fields}}
+    package = {"package_pipeline_version": PACKAGE_PIPELINE_VERSION,
+        "inputs": {"build_meshes": meshes}}
+    # Validation and slicing read the packaged model, not the mesh directory.
+    validation = {"validation_pipeline_version": VALIDATION_PIPELINE_VERSION,
+        "inputs": {"package_3mf": package}}
+    slicing = {"slice_pipeline_version": SLICE_PIPELINE_VERSION,
+        "inputs": {"package_3mf": package}}
+    return {
+        "prepare_vectors": vectors, "extract_citygml": citygml, "prepare_lidar": lidar,
+        "prepare_landcover": landcover, "extract_osm": osm, "prepare_details": details,
+        "build_fields": fields, "validate_crossing_fields": crossings,
+        "build_meshes": meshes, "render_preview": meshes,
+        "package_3mf": package, "validate_3mf": validation, "slice": slicing,
     }
 
 
@@ -1575,6 +1632,7 @@ class Pipeline:
             self.download_sources,
             cacheable=False,
         )
+        variants = stage_variants(self.cache_identity)
         vector_outputs = [self.processed / f"planimetrics_{name}_aoi.parquet" for name in PLANIMETRIC_LAYERS]
         vector_outputs += [
             self.processed / "buildings_projected_aoi.parquet",
@@ -1584,56 +1642,45 @@ class Pipeline:
         ]
         self.stage(
             "prepare_vectors", vector_outputs, self.prepare_vectors,
-            variant={"caches": {
-                name: self.cache_identity(name) for name in (
-                    "nyc_planimetrics_2022", "nyc_building_footprints", "nyc_parks_trails",
-                )
-            }},
+            variant=variants["prepare_vectors"],
         )
         self.stage("extract_citygml", [
             self.processed / "citygml_buildings_aoi.parquet",
             self.processed / "citygml_surfaces_aoi.parquet",
-        ], self.extract_citygml, variant={"cache": self.cache_identity("nyc_3d_buildings_2014")})
+        ], self.extract_citygml, variant=variants["extract_citygml"])
         self.stage("prepare_lidar", [
             self.processed / "rasters/ground_m.tif",
             self.processed / "rasters/upper_surface_m.tif",
-        ], self.prepare_lidar)
+        ], self.prepare_lidar, variant=variants["prepare_lidar"])
         self.stage(
             "prepare_landcover", [self.processed / "rasters/landcover.tif"], self.prepare_landcover,
-            variant={"cache": self.cache_identity("nyc_land_cover_2017")},
+            variant=variants["prepare_landcover"],
         )
         python = Path(sys.executable)
         self.stage("extract_osm", [self.work / "osm_detail.parquet"], lambda: self.run_command(
             "extract_osm", [str(python), str(SCRIPT_DIR / "extract_osm.py")]
-        ), variant={"cache": self.cache_identity("new_york_osm")})
+        ), variant=variants["extract_osm"])
         self.stage("prepare_details", [
             self.processed / "ivory_road_surface.parquet",
             self.processed / "road_symbol_routes.parquet",
             self.processed / "parks_structures.parquet",
             self.processed / "mta_subway_entrances.parquet",
         ], lambda: self.run_command("prepare_details", [str(python), str(SCRIPT_DIR / "prepare_details.py")]),
-            variant={"detail_pipeline_version": DETAIL_PIPELINE_VERSION, "caches": {
-                name: self.cache_identity(name) for name in (
-                    "nyc_parks_structures", "mta_subway_entrances_2024",
-                )
-            }})
+            variant=variants["prepare_details"])
         self.stage(
             "build_fields",
             [self.work / "map_fields.npz", self.work / "field_build_report.json"],
             lambda: self.build_fields(python),
-            variant={"field_pipeline_version": FIELD_PIPELINE_VERSION,
-                "details": "parks structures and subway entrances"},
+            variant=variants["build_fields"],
         )
         self.stage("validate_crossing_fields", [self.work / "crossing_field_validation.json"],
             lambda: self.run_command("validate_crossing_fields", [
                 str(python), str(SCRIPT_DIR / "validate_bridge_surfaces.py"), "--fields-only",
                 "--report", str(self.work / "crossing_field_validation.json"),
-            ]), variant={"crossing_validation_version": CROSSING_VALIDATION_VERSION,
-                "coverage": "tagged_bridges_and_surface_routes_over_tunnels"})
-        mesh_variant = {"mesh_pipeline_version": MESH_PIPELINE_VERSION}
+            ]), variant=variants["validate_crossing_fields"])
         self.stage("build_meshes", [self.work / "mesh/mesh_report.json"], lambda: self.run_command(
             "build_meshes", [str(python), str(SCRIPT_DIR / "build_map_meshes.py")]
-        ), variant=mesh_variant)
+        ), variant=variants["build_meshes"])
         preview = self.output.with_name(self.output.stem + "_preview.png")
         if not self.args.no_preview:
             self.stage("render_preview", [preview], lambda: self.run_command(
@@ -1641,7 +1688,7 @@ class Pipeline:
                     str(python), str(SCRIPT_DIR / "render_map.py"), "--mesh-dir", str(self.work / "mesh"),
                     "--output", str(preview),
                 ]
-            ), variant=mesh_variant)
+            ), variant=variants["render_preview"])
         package_command = [
             str(python), str(SCRIPT_DIR / "package_3mf.py"), "--mesh-dir", str(self.work / "mesh"),
             "--output", str(self.output),
@@ -1654,9 +1701,9 @@ class Pipeline:
             "package_3mf",
             [self.output],
             lambda: self.run_command("package_3mf", package_command),
-            variant={"package_pipeline_version":PACKAGE_PIPELINE_VERSION,
+            variant={**variants["package_3mf"],
                 "embedded_preview": not self.args.no_preview,
-                "generation_metadata": generation_metadata, **mesh_variant},
+                "generation_metadata": generation_metadata},
         )
         validation_command = [
             str(python), str(SCRIPT_DIR / "validate_3mf.py"), "--model", str(self.output),
@@ -1669,16 +1716,15 @@ class Pipeline:
             "validate_3mf",
             [self.validation / "3mf_validation.json"],
             lambda: self.run_command("validate_3mf", validation_command),
-            variant={"validation_pipeline_version":VALIDATION_PIPELINE_VERSION,
+            variant={**variants["validate_3mf"],
                 "cross_material_booleans": self.args.full_validation,
-                "generation_metadata": generation_metadata, **mesh_variant},
+                "generation_metadata": generation_metadata},
         )
         if self.args.slice:
             self.stage("slice", [self.validation / "slice/result.json"], lambda: self.run_command(
                 "slice", [str(python), str(SCRIPT_DIR / "slice_3mf.py"), "--model", str(self.output),
                           "--slicer", str(self.slicer), "--name", "slice", "--replace"]
-            ), variant={"slice_pipeline_version":SLICE_PIPELINE_VERSION,
-                "package_pipeline_version":PACKAGE_PIPELINE_VERSION, **mesh_variant})
+            ), variant=variants["slice"])
         self.write_manifest()
         self.log.info("pipeline_completed", output=str(self.output), sha256=digest(self.output), manifest=str(self.job / "manifest.json"))
 

@@ -3,7 +3,7 @@
 Rasterization at 0.125 mm is a manufacturing discretization, not source precision.
 Separate underpass solids are constructed later; their footprints are kept here.
 """
-import json,math
+import json,math,re
 import numpy as np,pandas as pd,geopandas as gpd,shapely
 import rasterio
 from affine import Affine
@@ -104,6 +104,135 @@ def small_mask(geom):
     t=TRANSFORM*Affine.translation(c0,r0)
     a=rasterize([(shapely.make_valid(geom),1)],out_shape=(r1-r0,c1-c0),transform=t,dtype='uint8').astype(bool)
     return (slice(r0,r1),slice(c0,c1)),a
+
+def building_identity_keys(frame):
+    """The identity keys a building record can be joined on, most specific first.
+
+    NYC issues a Building Identification Number per building and retires it with
+    the building; whatever replaces it on the same lot receives a new BIN. That
+    is what makes identity, not position, the evidence that a 2014 roof belongs
+    to the building standing there now. ``<borough>000000`` is the placeholder
+    for a record with no BIN assigned, so it identifies nothing and must not
+    join; the footprint id is the fallback for a record that carries one.
+    """
+    def digits(name):
+        if name not in frame:return pd.Series('',index=frame.index,dtype=object)
+        text=frame[name].astype(str).str.strip().str.replace(r'\.0$','',regex=True)
+        return text.where(text.str.fullmatch(r'\d+'),'')
+    bins=digits('bin')
+    unassigned=pd.to_numeric(bins,errors='coerce').fillna(0)%1000000==0
+    return list(zip(bins.mask(unassigned,'').tolist(),digits('doitt_id').replace('0','').tolist()))
+
+def roof_owner_index(roofs,buildings):
+    """The current footprint each 2014 roof surface belongs to, or -1 for none.
+
+    Identity decides first: a surface whose BIN a footprint still carries is
+    that footprint's, so a tall neighbour's roof can never reach across a lot
+    line and raise the building next door. But a retired BIN is not evidence
+    that the building went with it -- the footprint layer re-partitions
+    complexes, and the museum surveyed in 2014 under eight BINs is two polygons
+    carrying two of them today. So a surface whose identity has retired falls
+    back to the footprint it actually sits on. Whether the building recorded
+    there is the one the survey saw is a different question, and
+    ``survey_describes_building`` is what answers it.
+    """
+    index={}
+    for position,keys in enumerate(building_identity_keys(buildings)):
+        for key in keys:
+            if key:index.setdefault(key,[]).append(position)
+    owner=np.full(len(roofs),-1,dtype=np.int64)
+    if not len(buildings):return owner
+    footprints=np.asarray(buildings.geometry.values,dtype=object)
+    surfaces=np.asarray(roofs.geometry.values,dtype=object)
+    beneath=buildings.sindex
+    for position,keys in enumerate(building_identity_keys(roofs)):
+        candidates=next((index[key] for key in keys if key in index),None)
+        if candidates is None:
+            candidates=[int(i) for i in beneath.query(surfaces[position],predicate='intersects')]
+            if not candidates:continue
+        if len(candidates)==1:owner[position]=candidates[0];continue
+        shared=[shapely.area(shapely.intersection(surfaces[position],footprints[i])) for i in candidates]
+        if max(shared)<=0:continue
+        owner[position]=candidates[int(np.argmax(shared))]
+    return owner
+
+def survey_describes_building(described_height,recorded_height):
+    """Whether the 2014 surfaces still account for the building recorded here.
+
+    Two claims arrive about one footprint: a measured surface from 2014, and a
+    roof height the current record states. They agree for almost every building
+    in the city, because the record's height was read off the same survey. When
+    they do not, one of them is describing something that is no longer there,
+    and which one is settled by how much of the building the survey accounts
+    for: a tower on the site of the four buildings it replaced reaches a
+    quarter of its recorded height in the old model, while a museum whose BINs
+    were merely renumbered reaches all of it.
+
+    Keeping the surface while it accounts for at least half the recorded height
+    is the neutral reading of that -- more of the building described than
+    missing. It is a judgement, but not a tuned one: between a quarter and
+    three times, every split sorts all but about one footprint in eighty-five
+    the same way.
+    """
+    described=np.asarray(described_height,dtype=np.float64)
+    recorded=np.asarray(recorded_height,dtype=np.float64)
+    return (described>0)&(recorded-described<=described)
+
+def osm_height_m(tags,key='height'):
+    """One OSM height tag in metres, or None when it is absent or unusable.
+
+    Simple 3D Buildings states heights in metres unless a unit is written out,
+    which is the one thing a reader has to get right: a tower tagged in feet and
+    read as metres is three times too tall.
+    """
+    value=tags.get(key)
+    if value is None:return None
+    match=re.fullmatch(r"\s*([0-9]+(?:\.[0-9]+)?)\s*(m|meter|meters|metre|metres|ft|foot|feet|')?\s*",str(value))
+    if not match:return None
+    magnitude=float(match.group(1));unit=(match.group(2) or 'm').lower()
+    if magnitude<=0:return None
+    return magnitude*FT if unit in ('ft','foot','feet',"'") else magnitude
+
+def building_part_massing(osm,buildings):
+    """OSM 3D massing for buildings, as (owning footprint, height above ground).
+
+    The survey is measured and comes first; this is what a building that the
+    survey no longer describes has instead of a single number. A tower recorded
+    only as one footprint and one roof height prints as a featureless box, and
+    ``building:part`` is a mapped polygon with a mapped height, not an
+    inference about it: the setbacks are drawn, not guessed.
+    """
+    if 'building:part' not in osm:return gpd.GeoDataFrame(columns=['geometry','height_m','owner_fid'],crs=2263)
+    parts=osm[osm['building:part'].notna()&osm.geometry.geom_type.isin(['Polygon','MultiPolygon'])]
+    if not len(parts):return gpd.GeoDataFrame(columns=['geometry','height_m','owner_fid'],crs=2263)
+    heights=[osm_height_m(parse_tags(t)) for t in parts.tags]
+    parts=parts.assign(height_m=heights)
+    parts=parts[parts.height_m.notna()].reset_index(drop=True)
+    if not len(parts):return gpd.GeoDataFrame(columns=['geometry','height_m','owner_fid'],crs=2263)
+    # A part carries no NYC identity, so ownership is the footprint it sits on;
+    # that is what stops one tower's massing describing its neighbour.
+    owner=roof_owner_index(parts,buildings)
+    return parts.assign(owner_fid=owner+1)[lambda f:f.owner_fid>0]
+
+def keep_higher_surface(heights,owners,mask,z,owner_fid):
+    """Keep the highest roof surface per cell, and the owner of the one kept.
+
+    An unset cell holds NaN, which loses every comparison, so the first surface
+    to reach it takes it. Height and owner move together or a cell ends up
+    holding one building's elevation under another building's name.
+    """
+    higher=mask&np.isfinite(z)&~(heights>=z)
+    heights[higher]=z[higher];owners[higher]=owner_fid
+    return int(higher.sum())
+
+def own_roof_cells(roof_grid,roof_owner,bids):
+    """Cells whose 2014 roof belongs to the footprint standing on them.
+
+    Anything else -- a demolished building's roof, or a neighbour's roof
+    reaching across a lot line -- is not evidence about this building, so the
+    cell falls back to the height its own footprint record carries.
+    """
+    return np.isfinite(roof_grid)&(bids>0)&(roof_owner==bids)
 
 def triangles_3d(poly):
     for part in shapely.get_parts(poly):
@@ -430,9 +559,24 @@ def main():
     recreation_green=recreation_green_mask&~bmask&~water_mask&~protected_transport_surface
     material[recreation_green]=1
     report['layers']['recreation_green_cells']=int(recreation_green.sum())
-    roof_grid=np.full(SHAPE,np.nan,np.float32)
+    # The 2014 model is roof detail for the buildings that stood in 2014, never
+    # evidence about the site itself. Applied by position alone, the roofs of a
+    # demolished building decide the height of the tower built in its place --
+    # the tower collapses to the block it replaced, and only the slivers no old
+    # roof happened to cover keep their real height, which is what prints as a
+    # comb of spikes. Carry each surface's owning footprint through to the grid
+    # so a roof only ever describes one building, then judge per footprint
+    # whether the survey still accounts for the building recorded there.
+    surveyed_roofs=len(roofs)
+    owners=roof_owner_index(roofs,b)
+    unplaced_roofs=int((owners<0).sum())
+    roofs=roofs.assign(owner_fid=owners+1)
+    roofs=roofs[roofs.owner_fid>0]
     flat=roofs[(roofs.z_max_ft-roofs.z_min_ft)<.05].sort_values('z_max_ft')
+    # One shape order for both grids, so the surface that wins a cell's height
+    # is the surface whose owner that cell records.
     roof_grid=burn([(r.geometry,float(r.z_max_ft*FT)) for _,r in flat.iterrows()],fill=np.nan)
+    roof_owner=burn([(r.geometry,int(r.owner_fid)) for _,r in flat.iterrows()],dtype='int32')
     ntri=0
     for _,r in roofs[(roofs.z_max_ft-roofs.z_min_ft)>=.05].iterrows():
         for tri in triangles_3d(r.geometry):
@@ -445,9 +589,9 @@ def main():
             sl,mask=found;rr,cc=np.mgrid[sl[0],sl[1]]
             x,y=world_for_cells(rr,cc)
             z=(tri[0,2]-(normal[0]*(x-tri[0,0])+normal[1]*(y-tri[0,1]))/normal[2])*FT
-            window=roof_grid[sl];window[mask]=np.fmax(window[mask],z[mask]);ntri+=1
+            keep_higher_surface(roof_grid[sl],roof_owner[sl],mask,z,int(r.owner_fid));ntri+=1
     # Retain old detailed roofs where the current footprint still covers them; fill new parts only.
-    roof_valid=np.isfinite(roof_grid)&bmask
+    owned=own_roof_cells(roof_grid,roof_owner,bids)
     material[bmask]=0
     park_height_fills=0
     parks_path=PROCESSED/'parks_structures.parquet'
@@ -466,24 +610,78 @@ def main():
         if not np.isfinite(r.height_roof) or r.height_roof<=0:inferred_height_ids.append(str(r.doitt_id))
     fallback_height=height_lookup[bids];fallback_height=np.where(fallback_height>0,fallback_height,6.)
     top[bmask]=ground[bmask]+fallback_height[bmask]
+    # How much of each footprint's recorded height its own 2014 surfaces reach.
+    # A footprint the survey no longer accounts for keeps the flat extrusion
+    # its record states rather than the shape of whatever stood there before.
+    recorded=np.r_[0,np.where(height_lookup[1:]>0,height_lookup[1:],6.)]
+    described=np.zeros(len(b)+1,dtype=np.float64)
+    np.maximum.at(described,bids[owned],(roof_grid-ground)[owned])
+    describes=survey_describes_building(described,recorded);describes[0]=False
+    roof_valid=owned&describes[bids]
+    superseded_sites=[str(r.doitt_id) for i,(_,r) in enumerate(b.iterrows(),start=1)
+        if described[i]>0 and not describes[i]]
+    # A footprint the survey no longer describes is otherwise one polygon and
+    # one number: a featureless box at its tallest point, which is what a
+    # tapered tower prints as. Mapped 3D massing carries its setbacks, and is
+    # read under the same two rules -- it belongs to one footprint, and it is
+    # kept only while it still reaches the height that footprint's record
+    # states. The record stays the authority on the top, so nothing in it can
+    # stand above the recorded roof.
+    massing=building_part_massing(osm,b)
+    part_grid=np.full(SHAPE,np.nan,np.float32);part_owner=np.zeros(SHAPE,np.int32)
+    for _,r in massing.sort_values('height_m').iterrows():
+        found=small_mask(r.geometry)
+        if found is None:continue
+        sl,mask=found
+        keep_higher_surface(part_grid[sl],part_owner[sl],mask,
+            np.full(mask.shape,float(r.height_m)),int(r.owner_fid))
+    part_described=np.zeros(len(b)+1,dtype=np.float64)
+    part_cells=np.isfinite(part_grid)&(bids>0)&(part_owner==bids)
+    if part_cells.any():np.maximum.at(part_described,bids[part_cells],part_grid[part_cells])
+    massed=survey_describes_building(part_described,recorded)&~describes;massed[0]=False
+    part_valid=part_cells&massed[bids]
+    # Mapped massing is drawn to the building outline, not to the print grid, so
+    # the slack left along a footprint edge is rasterization, not a courtyard.
+    # Carry the nearest owned part into it rather than the recorded roof height,
+    # which would stand those cells up as a fin around the tower.
+    slack=(bids>0)&massed[bids]&~part_valid
+    if slack.any() and part_valid.any():
+        nearest=distance_transform_edt(~part_valid,return_distances=False,return_indices=True)
+        source=tuple(axis[slack] for axis in nearest)
+        same=part_owner[source]==bids[slack]
+        rows,cols=np.where(slack)
+        part_grid[rows[same],cols[same]]=part_grid[source[0][same],source[1][same]]
+        part_valid[rows[same],cols[same]]=True
+        del nearest
+    massed_sites=[str(r.doitt_id) for i,(_,r) in enumerate(b.iterrows(),start=1) if massed[i]]
+    top[part_valid]=np.minimum(ground[part_valid]+part_grid[part_valid],
+        ground[part_valid]+fallback_height[part_valid])
     top[roof_valid]=np.maximum(roof_grid[roof_valid],ground[roof_valid]+1)
-    # Restore physically continuous legacy roof coverage across sub-metre footprint-boundary discrepancies.
-    old_near=np.isfinite(roof_grid)&binary_dilation(bmask,iterations=1)&~np.isin(material,[2,3])
-    top[old_near]=np.maximum(roof_grid[old_near],ground[old_near]+1);material[old_near]=0;bmask|=old_near
+    # Restore physically continuous legacy roof coverage across sub-metre
+    # footprint-boundary discrepancies. This is the fringe just outside the
+    # footprints; inside one, a cell is governed by that building's own roofs
+    # or by its recorded height, never by a neighbour's roof reaching over.
+    kept_surface=np.where(describes[roof_owner],roof_grid,np.nan)
+    old_near=np.isfinite(kept_surface)&(bids==0)&binary_dilation(bmask,iterations=1)&~np.isin(material,[2,3])
+    top[old_near]=np.maximum(kept_surface[old_near],ground[old_near]+1);material[old_near]=0;bmask|=old_near
     material_lookup=np.r_[-1,building_materials]
     building_material_grid=material_lookup[bids]
-    legacy_only=old_near&(bids==0)
-    if legacy_only.any() and (building_materials>=0).any():
+    if old_near.any() and (building_materials>=0).any():
         nearest=distance_transform_edt(bids==0,return_distances=False,return_indices=True)
-        building_material_grid[legacy_only]=material_lookup[bids[tuple(nearest[:,legacy_only])]]
+        building_material_grid[old_near]=material_lookup[bids[tuple(nearest[:,old_near])]]
         del nearest
     custom_building_mask=bmask&(building_material_grid>=0)
     custom_counts=[int((custom_building_mask&(building_material_grid==color)).sum()) for color in range(4)]
-    report['layers']['buildings']={'current_footprints':len(b),'historic_objects':len(city),'roof_polygons':len(roofs),
-        'nonflat_roof_triangles':ntri,'cells_with_historic_roof':int(roof_valid.sum()),'fallback_cells':int((bmask&~np.isfinite(roof_grid)).sum()),
+    report['layers']['buildings']={'current_footprints':len(b),'historic_objects':len(city),'roof_polygons':surveyed_roofs,
+        'nonflat_roof_triangles':ntri,'cells_with_historic_roof':int(roof_valid.sum()),'fallback_cells':int(((bids>0)&~roof_valid).sum()),
         'missing_height_building_ids':inferred_height_ids,'parks_structure_height_fills':park_height_fills,
-        'custom_material_footprints':int((building_materials>=0).sum()),'custom_material_cells':custom_counts}
-    print('Roof surfaces',len(roofs),'sloping triangles',ntri,flush=True)
+        'custom_material_footprints':int((building_materials>=0).sum()),'custom_material_cells':custom_counts,
+        'applied_roof_polygons':len(roofs),'roof_surfaces_on_no_footprint':unplaced_roofs,
+        'superseded_site_footprints':len(superseded_sites),'superseded_site_building_ids':superseded_sites,
+        'osm_massing_parts':len(massing),'osm_massed_footprints':len(massed_sites),'osm_massed_building_ids':massed_sites,
+        'roof_identity_join':'BIN, then footprint id, then the footprint the surface sits on; surfaces are kept only where they account for at least half the height the footprint record states'}
+    print('Roof surfaces',len(roofs),'of',surveyed_roofs,'sloping triangles',ntri,
+        'superseded sites',len(superseded_sites),'massed from OSM parts',len(massed_sites),flush=True)
     # Do not infer monument identity or geometry from OSM and sparse LiDAR.
     # Monument augmentation stays disabled until a source supplies both
     # authoritative coordinates and a precise, automatically joinable 3D asset.

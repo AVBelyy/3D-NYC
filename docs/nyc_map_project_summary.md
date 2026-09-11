@@ -19,8 +19,17 @@ substitute for a representative physical test.
 | Blue | Level water surfaces and selected buildings |
 | Tan | Sidewalks, paths, plazas, surface parking, and selected buildings |
 
-The generator retains detailed 2014 CityGML roofs where available, supplements
-them with maintained building footprints and Planimetrics fixtures, and uses
+The generator retains detailed 2014 CityGML roofs, attaching each surface to
+one maintained footprint by BIN, then by footprint id, then by the footprint it
+sits on, and keeping it only where those surfaces still reach at least half the
+roof height that footprint's record states. A demolished building's roofs
+therefore never describe the tower built in its place, while a complex the
+footprint layer has merely renumbered keeps the roof it was surveyed with. It
+supplements them with maintained building footprints and Planimetrics fixtures.
+A building the survey no longer describes takes its shape from mapped
+OpenStreetMap `building:part` massing where that exists, read under the same
+two rules and never allowed above the roof height the footprint record states;
+only a building with neither prints as a plain extrusion. It uses
 LiDAR for ground and upper-surface measurements. Roads, paths, land use,
 bridges, tunnels, and current semantic context combine NYC sources with
 OpenStreetMap. Classified carriageway centerlines become fixed-width ivory
@@ -113,7 +122,20 @@ subject to the generator's grid and elevation-cell limits.
 ## Known limitations
 
 - No free source guarantees current, ornament-level geometry for every
-  building; newer or changed roofs can be simplified.
+  building; newer or changed roofs can be simplified. A building whose 2014
+  surfaces no longer reach half its recorded roof height falls back to mapped
+  OpenStreetMap massing, and to a plain extrusion at that height when no
+  massing is mapped either: the right height and the right outline, without
+  roof shape.
+- Mapped massing is contributed, not surveyed. It is used only where the
+  alternative is a featureless box, it is capped by the recorded roof height,
+  and it is rejected when it no longer reaches half of it, so a wrong height
+  cannot make a building worse than the box it replaces.
+- A building extended upward by less than the height the survey does describe
+  keeps its 2014 roof, so it prints short by the extension. Shape is worth more
+  than the last few feet of height at map scale, and the two sources agree to
+  within a foot for almost every surviving building, so a larger disagreement
+  is the signal rather than the noise.
 - Narrow paths, fixtures, road symbols, and entrance markers may be enlarged to
   remain printable at the selected nozzle, and a color region still too thin to
   print is absorbed into its neighbor rather than drawn.
