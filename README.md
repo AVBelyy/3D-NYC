@@ -19,9 +19,11 @@ and transit entrances into printable material meshes for Bambu Studio.
 
 ## Quick start
 
-You need macOS, Python 3.12, and
+You need Python 3.12 and
 [Bambu Studio](https://bambulab.com/en/download/studio) with the Bambu Lab P2S
-profiles installed.
+profiles installed. The pipeline is pure Python, but it reads those profiles
+from Bambu Studio's macOS app bundle by default; see the
+[generation guide](docs/generate_3mf.md) for `--bambu-studio`.
 
 ```bash
 python3 -m venv .venv
@@ -76,8 +78,8 @@ python scripts/plan_map_chunks.py \
 ```
 
 This writes a preview and the exact per-plate generation commands. Seams are
-routed over streets, water, and open ground, and never through a building or
-bridge. See the [planner guide](docs/plan_map_chunks.md).
+routed over streets, water, and open ground, never cutting along a building,
+bridge, or tunnel. See the [planner guide](docs/plan_map_chunks.md).
 
 ## License and data
 

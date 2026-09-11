@@ -109,6 +109,12 @@ BIN, DoITT ID, and BBL selectors do not use GeoSearch.
 - `--no-preview` skips preview rendering.
 - `--full-validation` enables expensive cross-material checks.
 - `--slice` performs an optional Bambu Studio validation slice.
+- `--bambu-studio` locates the slicer, defaulting to
+  `/Applications/BambuStudio.app/Contents/MacOS/BambuStudio`. Packaging always
+  reads the printer profiles beside it, at `../Resources/profiles`, so the path
+  you pass must sit in that macOS app-bundle shape even though nothing else in
+  the pipeline is platform-specific. The executable itself is only run for
+  `--slice`.
 - `--force` reruns every stage for an existing job ID.
 
 Run `scripts/generate_3mf.py --help` for the complete option reference.
