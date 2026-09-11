@@ -6,9 +6,10 @@
 # into the caches the generator reads. Downloads are resumable and record a
 # manifest, so a rerun skips whatever already arrived complete.
 #
-# There is no area to choose. Every source here is citywide, and LiDAR, the one
-# dataset selected by area, contributes only its tile index: the LAZ tiles are
-# large, so cache_all.sh streams exactly the ones its raster chunks need.
+# There is no area to choose. Every source here is citywide, including the
+# default nyc_lidar_2021 surfaces, which are published per borough and fetched
+# whole. --lidar-dataset and --land-cover-dataset pick which collection of each
+# to fetch; pass the same names to cache_all.sh so the pair agrees.
 
 set -euo pipefail
 
@@ -38,6 +39,11 @@ Download every raw source dataset into data/raw/, then run
 scripts/cache_all.sh to build the caches scripts/generate_3mf.py reads.
 
 Options:
+  --lidar-dataset NAME
+        Which LiDAR collection to fetch: nyc_lidar_2021 (default, about 39 GB
+        of published per-borough rasters) or nyc_lidar_2017, for which only
+        the tile index is fetched here because its LAZ are pulled by area as
+        cache_all.sh builds. Pass the same name to scripts/cache_all.sh.
   --land-cover-dataset NAME
         Which land-cover survey to fetch: nyc_land_cover_2021 (default, a
         1.6 GB GeoTIFF) or nyc_land_cover_2017 (a much larger archive). Pass
@@ -48,11 +54,10 @@ Options:
 Environment:
   PYTHON  Interpreter used for the dataset scripts (default .venv/bin/python).
 
-Two datasets are deliberately left out, both covered by
-docs/cache_source_datasets.md: the building-footprints CSV, because that cache
-is built by streaming the official feature service, and the LiDAR tiles,
-because cache_all.sh fetches those as it builds. Only the LiDAR tile index is
-taken here.
+Only the selected collections are fetched, so choosing nyc_lidar_2017 skips
+the 39 GB of 2021 rasters entirely. The building-footprints CSV is left out
+either way, because that cache is built by streaming the official feature
+service. Both are covered by docs/cache_source_datasets.md.
 USAGE
 }
 
@@ -66,10 +71,20 @@ run() {
   "$@"
 }
 
+lidar_dataset=nyc_lidar_2021
 land_cover_dataset=nyc_land_cover_2021
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --lidar-dataset)
+      [[ $# -ge 2 ]] || die '--lidar-dataset needs a value'
+      case $2 in
+        nyc_lidar_2021|nyc_lidar_2017) lidar_dataset=$2 ;;
+        *) die "unknown --lidar-dataset $2" ;;
+      esac
+      shift 2
+      continue
+      ;;
     --land-cover-dataset)
       [[ $# -ge 2 ]] || die '--land-cover-dataset needs a value'
       case $2 in
@@ -101,11 +116,15 @@ for dataset in "${DATASETS[@]}"; do
   run "$PYTHON" "scripts/download_$dataset.py"
 done
 
-# The 2021 rasters are the default LiDAR source and are fetched whole: about
-# 39 GB, ten files, no per-area selection to make.  The 2017 collection stays
-# available; only its tile index is fetched here, because its LAZ are selected
-# by area and streamed by the cache builder.
-run "$PYTHON" scripts/download_nyc_lidar_2021.py
-run "$PYTHON" scripts/download_nyc_lidar_2017.py --index-only
+# The 2021 rasters are published per borough and fetched whole: about 39 GB,
+# ten files, no per-area selection to make. The 2017 collection contributes
+# only its tile index, because its LAZ are selected by area and pulled on
+# demand by cache_all.sh. Fetching just the selected one keeps a 2017 build
+# from dragging in 39 GB it will never cache.
+if [[ $lidar_dataset == nyc_lidar_2021 ]]; then
+  run "$PYTHON" scripts/download_nyc_lidar_2021.py
+else
+  run "$PYTHON" scripts/download_nyc_lidar_2017.py --index-only
+fi
 
 printf '\nDownloaded raw sources under data/raw/. Next: scripts/cache_all.sh\n' >&2

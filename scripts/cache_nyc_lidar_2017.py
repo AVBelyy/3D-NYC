@@ -594,7 +594,8 @@ def write_catalog(output: Path, results: list[dict[str, Any]]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--tile-index", type=Path, default=DEFAULT_INDEX)
     parser.add_argument("--laz-dir", type=Path, default=DEFAULT_LAZ)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)

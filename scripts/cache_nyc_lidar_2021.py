@@ -1,36 +1,39 @@
 #!/usr/bin/env python3
 """Convert the published NYC 2021 DTM/DSM rasters into the canonical LiDAR cache.
 
-The 2021 survey publishes one bare-earth DTM and one DSM per borough -- at the
-time of writing 2 US survey foot cells in EPSG:6539, with elevations in US survey
-feet, though the converter reads all of that off the rasters rather than assuming
-it -- rather than a point cloud. This resamples that pair onto the global grid
-`cache_nyc_lidar_2017.py` writes, so the generator and the chunk planner can read
-either collection through one contract:
+The 2021 survey publishes one bare-earth DTM and one DSM per borough -- at
+the time of writing 2 US survey foot cells in EPSG:6539, with elevations in
+US survey feet, though the converter reads all of that off the rasters
+rather than assuming it -- rather than a point cloud. This resamples that
+pair onto the global grid `cache_nyc_lidar_2017.py` writes, so the generator
+and the chunk planner can read either collection through one contract:
 
 * the published DTM becomes `ground_m`; and
 * the published DSM becomes `upper_surface_m`.
 
-Only the *measurements* are equivalent, not their derivation. The 2017 cache bins
-individual returns (mean class-2 ground, maximum class 1/2/17/25 upper); these are
-vendor-gridded surfaces. The manifest says so -- `source_kind: published rasters`,
-naming both published products -- rather than claiming per-class point
-aggregation that never happened, so a consumer can tell the two apart.
+Only the *measurements* are equivalent, not their derivation. The 2017
+cache bins individual returns (mean class-2 ground, maximum class
+1/2/17/25 upper); these are vendor-gridded surfaces. The manifest says so
+-- `source_kind: published rasters`, naming both published products --
+rather than claiming per-class point aggregation that never happened, so a
+consumer can tell the two apart.
 
 Four source properties are reconciled here rather than downstream:
 
 * The published projection is reprojected to the cache's EPSG:2263. For
-  EPSG:6539 (NAD83(2011)) that is a null transform in PROJ, so it costs nothing.
+  EPSG:6539 (NAD83(2011)) that is a null transform in PROJ, so it costs
+  nothing.
 * Elevations convert from US survey feet to metres with the project's exact
   1200/3937 factor.
-* Source cells are resampled to the cache resolution. The DTM is a continuous surface
-  and is interpolated; the DSM steps at roof and canopy edges and is sampled
-  without blending, so interpolation cannot invent a ramp up a wall for the mesh
-  to follow.
-* The published DSM is gridded independently of the DTM and dips below it on a
-  small fraction of cells, nearly all by single-digit millimetres. The 2017 upper
-  surface includes class 2 and so is never below ground; the same invariant is
-  restored by raising the upper surface to the ground where the DSM falls below.
+* Source cells are resampled to the cache resolution. The DTM is a
+  continuous surface and is interpolated; the DSM steps at roof and canopy
+  edges and is sampled without blending, so interpolation cannot invent a
+  ramp up a wall for the mesh to follow.
+* The published DSM is gridded independently of the DTM and dips below it
+  on a small fraction of cells, nearly all by single-digit millimetres. The
+  2017 upper surface includes class 2 and so is never below ground; the
+  same invariant is restored by raising the upper surface to the ground
+  where the DSM falls below.
 """
 
 from __future__ import annotations
@@ -370,7 +373,8 @@ def write_catalog(output: Path, results: list[dict[str, Any]]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--source-dir", type=Path, default=DEFAULT_SOURCE)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(

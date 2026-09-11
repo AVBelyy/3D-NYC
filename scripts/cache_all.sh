@@ -6,10 +6,11 @@
 # builders read its catalog to define their coverage. Caches are resumable and
 # reuse a current manifest, so a rerun costs little.
 #
-# This covers all of NYC, which is the extent of the LiDAR tile index rather
-# than a coordinate list anyone has to know. That is a long one-time build, so
-# each LAZ is streamed in and deleted after its last use, keeping resident
-# source data under the builder's own cap.
+# This covers all of NYC, which is the extent of the LiDAR catalog rather than
+# a coordinate list anyone has to know. The default nyc_lidar_2021 builder
+# converts the borough rasters already on disk. With --lidar-dataset
+# nyc_lidar_2017 it is instead a long streaming build: each LAZ is pulled in and
+# deleted after its last use, keeping resident source under the builder's cap.
 
 set -euo pipefail
 
@@ -39,9 +40,11 @@ ready for scripts/generate_3mf.py. It covers all of NYC.
 
 Options:
   --keep-lidar-sources
-        Keep every downloaded LAZ under data/raw/ instead of deleting each one
-        after its last use. Faster to rebuild from, but the whole city at once
-        needs far more free space than the streamed default.
+        Only with --lidar-dataset nyc_lidar_2017: keep every downloaded LAZ
+        under data/raw/ instead of deleting each one after its last use. Faster
+        to rebuild from, but the whole city at once needs far more free space.
+        The default nyc_lidar_2021 builder streams nothing, so this is a no-op
+        for it.
   --skip-lidar
         Keep the existing LiDAR cache and build only the rest. The other
         builders still need its catalog, so it has to exist already.
