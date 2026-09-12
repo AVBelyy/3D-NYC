@@ -36,10 +36,10 @@ preview under `output/plans/`. See the
 Estimate filament and print time for finished models:
 
 ```bash
-.venv/bin/python scripts/estimate_print_stats.py output/models/manhattan_2m_A2.3mf
+.venv/bin/python scripts/compute_print_stats.py output/models/manhattan_2m_A2.3mf
 ```
 
-`estimate_print_stats.py` reports per-filament grams, the share spent on
+`compute_print_stats.py` reports per-filament grams, the share spent on
 tool-change purge, cost, and the slicer's own time prediction. A generated 3MF
 carries no such numbers, so the script runs an offline Bambu Studio slice and
 writes it beside the model as `<model>.gcode.3mf`, a sliced file that Bambu
@@ -49,12 +49,19 @@ to edit, and Studio then discards the G-code and reslices. The mesh stays in the
 `<model>.3mf` beside it. That project is also the cache:
 a rerun reuses it while it still matches the model's SHA-256, and no loose
 G-code is left behind. A project that already carries slice metadata is read
-directly. Pass several models to get a combined per-color spool total, and
-`--json` to keep the machine-readable form. A batch resolves its cached models
-first and shows a progress bar only for the models it still has to slice, so
-the time remaining counts real work and a fully cached batch prints no bar at
-all; `summarize_print_stats.py` reports the same batch as a single
-per-filament total.
+directly. A batch resolves its cached models first and shows a progress bar
+only for the models it still has to slice, so the time remaining counts real
+work and a fully cached batch prints no bar at all.
+
+Several models print a table each and then the batch as one print: per-filament
+totals, the purge share, the spread of per-model times, and any grams the slicer
+never split into model and purge. `--summary-only` prints that batch block
+alone, and `--json` writes both forms as `{"entries": [...], "summary": {...}}`.
+`--update-preview output/plans/<plan-id>/preview.svg` captions a planner
+preview: each plate's label card grows to hold its own print time and filament
+weight, and a band above the map carries the batch totals — split into model
+material and purge — with a chip per filament. Rerunning replaces those captions rather than stacking
+them.
 
 ## Dataset scripts
 

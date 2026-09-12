@@ -1,15 +1,18 @@
 import json
+import re
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
-import estimate_print_stats as print_stats
-from estimate_print_stats import (collect_all,embed_stats,format_duration,parse_duration,parse_gcode,
-    parse_result,parse_sliced_3mf,part_labels,read_embedded_stats,sha256,sliced_path,unique_models)
+import compute_print_stats as print_stats
+from compute_print_stats import (aggregate,band_lines,chunk_caption,chunk_label,collect_all,
+    embed_stats,format_duration,parse_duration,parse_gcode,parse_result,parse_sliced_3mf,part_labels,
+    read_embedded_stats,sha256,sliced_path,strip_band,unique_models,update_preview)
 
 GCODE='''; HEADER_BLOCK_START
 ; model printing time: 6h 19m 15s; total estimated time: 6h 26m 17s
@@ -38,6 +41,21 @@ MODEL_SETTINGS='''<?xml version="1.0" encoding="UTF-8"?>
     </part>
   </object>
 </config>
+'''
+
+PREVIEW='''<?xml version="1.0" encoding="utf-8" standalone="no"?>
+<svg width="400pt" height="300pt" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg" version="1.1">
+ <g id="figure_1">
+  <g id="patch_1"><path d="M 0 300 L 400 300 L 400 0 L 0 0 z" style="fill: #ffffff"/></g>
+  <g id="text_5">
+   <g id="patch_9">
+    <path d="M 100 200 L 180 200 L 180 170 L 100 170 z" style="fill: #ffffff; opacity: 0.82; stroke: #c0392b; stroke-width: 1.13; stroke-linejoin: miter"/>
+   </g>
+   <!-- A1 -->
+   <g style="fill: #1a1a1a" transform="translate(120 190) scale(0.141421 -0.141421)"/>
+  </g>
+ </g>
+</svg>
 '''
 
 SLICED_INFO='''<?xml version="1.0" encoding="UTF-8"?>
@@ -223,6 +241,107 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(sliced.call_count,0)
         progress.assert_not_called()
         self.assertEqual(len(entries),2)
+
+
+class PreviewBandTests(unittest.TestCase):
+    """The caption the planner's preview carries once a batch has been estimated."""
+
+    ENTRIES=[{'model':'output/models/plan_2m_A1.3mf','seconds':3600.,'plates':1,'filaments':[
+        {'extruder':1,'label':'Ivory','colour':'#F2F0E8','total_g':10.,'model_g':8.,'purge_g':2.,'cost_usd':0.25},
+        {'extruder':2,'label':'Green','colour':'#5FAA72','total_g':4.,'model_g':3.,'purge_g':1.,'cost_usd':0.1}]},
+        {'model':'output/models/plan_2m_A2.3mf','seconds':1800.,'plates':1,'filaments':[
+        {'extruder':1,'label':'Ivory','colour':'#F2F0E8','total_g':6.,'model_g':5.,'purge_g':1.,'cost_usd':0.15}]}]
+
+    def preview(self,folder):
+        path=Path(folder)/'preview.svg';path.write_text(PREVIEW)
+        return path
+
+    def test_folds_a_batch_into_one_print(self):
+        summary=aggregate(self.ENTRIES)
+        self.assertEqual((summary['models'],summary['plates']),(2,2))
+        self.assertAlmostEqual(summary['seconds'],5400.)
+        self.assertEqual([f['total_g'] for f in summary['filaments']],[16.,4.])
+        self.assertEqual([f['model_g'] for f in summary['filaments']],[13.,3.])
+
+    def test_caption_carries_time_and_the_weight_split(self):
+        head,chips=band_lines(aggregate(self.ENTRIES))
+        self.assertIn('1h 30m',head)
+        self.assertIn('20 g = 16 g model + 4 g purge',head)
+        self.assertIn('#5FAA72',chips)
+        self.assertIn('Ivory 16 g',chips)
+
+    def test_grams_without_a_split_are_counted_apart(self):
+        entries=[{'model':'output/models/plan_2m_A3.3mf','seconds':60.,'plates':1,'filaments':[
+            {'extruder':1,'label':'Ivory','colour':None,'total_g':5.,'model_g':None,'purge_g':None,'cost_usd':None},
+            *self.ENTRIES[1]['filaments']]}]
+        head,_=band_lines(aggregate(entries))
+        self.assertIn('11 g = 5 g model + 1 g purge + 5 g unsplit',head)
+
+    def test_band_grows_the_canvas_without_covering_the_figure(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=self.preview(folder)
+            update_preview(path,self.ENTRIES,aggregate(self.ENTRIES))
+            text=path.read_text()
+        self.assertIn('<g id="print-stats"',text)
+        self.assertIn('print-stats-shift" transform="translate(0 ',text)
+        self.assertGreater(float(text.split('height="',2)[1].split('pt')[0]),300)
+        self.assertEqual(text.split('viewBox="')[1].split('"')[0].split()[:3],['0','0','400'])
+        ET.fromstring(text.encode())
+
+    def test_reads_a_plate_label_from_its_model_name(self):
+        self.assertEqual(chunk_label({'model':'output/models/manhattan_2m_240_C12.2.3mf'}),'C12.2')
+        self.assertEqual(chunk_label({'model':'output/models/manhattan_2m_240_A1.3mf'}),'A1')
+        self.assertIsNone(chunk_label({'model':'output/models/manhattan_2m_240.3mf'}))
+
+    def test_plate_caption_carries_its_own_time_and_weight(self):
+        caption,length=chunk_caption(self.ENTRIES[0])
+        self.assertIn('1h 00m',caption)
+        self.assertIn('14 g',caption)
+        self.assertGreater(length,len('1h 00m 14 g'))
+        # The model and purge split is the band's to carry, not the plate's.
+        self.assertNotIn('purge',caption)
+
+    def test_a_plate_with_no_split_is_captioned_the_same_way(self):
+        entry={'model':'output/models/plan_2m_A3.3mf','seconds':60.,'plates':1,'filaments':[
+            {'extruder':1,'label':'Ivory','colour':None,'total_g':5.,'model_g':None,
+            'purge_g':None,'cost_usd':None}]}
+        self.assertIn('5 g',chunk_caption(entry)[0])
+
+    def test_every_labelled_plate_is_captioned_where_the_preview_draws_it(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=self.preview(folder)
+            captioned,missing=update_preview(path,self.ENTRIES,aggregate(self.ENTRIES))
+            text=path.read_text()
+        self.assertEqual((captioned,missing),(['A1'],['A2']))
+        chunks=text.split('<g id="print-stats-chunks"')[1]
+        self.assertIn('1h 00m',chunks)
+        # Centred on the label box and written below its old lower edge.
+        self.assertIn('<text x="140.00" y="20',chunks)
+        # The label's own box grew to hold them, keeping its corner radius.
+        box=re.search(r'<rect data-print-stats="A1"[^>]*/>',text).group(0)
+        self.assertGreater(float(re.search(r'height="([\d.]+)"',box).group(1)),30.)
+        self.assertNotIn('<path d="M 100 200',text)
+
+    def test_a_batch_reports_grams_it_could_not_split(self):
+        entries=[{'model':'output/models/plan_2m_A3.3mf','seconds':60.,'plates':1,'filaments':[
+            {'extruder':1,'label':'Filament 1','colour':None,'total_g':5.,'model_g':None,
+            'purge_g':None,'cost_usd':None}]},*self.ENTRIES]
+        summary=aggregate(entries)
+        self.assertEqual(summary['unattributed']['entries'],1)
+        self.assertAlmostEqual(summary['unattributed']['grams'],5.)
+        self.assertEqual(summary['unattributed']['models'],['plan_2m_A3.3mf'])
+        # A real role and colour win over the placeholder an unlabelled model carries.
+        self.assertEqual(summary['filaments'][0]['label'],'Ivory')
+        self.assertEqual(summary['filaments'][0]['colour'],'#F2F0E8')
+
+    def test_rerunning_replaces_the_caption_instead_of_stacking_one(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=self.preview(folder)
+            update_preview(path,self.ENTRIES,aggregate(self.ENTRIES))
+            once=path.read_text()
+            update_preview(path,self.ENTRIES,aggregate(self.ENTRIES))
+            self.assertEqual(path.read_text(),once)
+            self.assertEqual(strip_band(once),PREVIEW)
 
 
 if __name__=='__main__':unittest.main()

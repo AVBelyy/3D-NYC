@@ -137,6 +137,27 @@ stays sharp at any zoom; only the basemap behind them is a raster, at the cut
 surface's own sampling. Zoom in to check exactly where a seam sits relative to
 a kerb. Pass `--preview-format png` or `both` if you need a bitmap as well.
 
+The preview carries no print cost when it is written, because the plates do not
+exist yet. Once they are built and estimated, caption it with what the plan
+actually costs to print:
+
+```bash
+.venv/bin/python scripts/compute_print_stats.py \
+  output/models/manhattan_2m_240_*.3mf \
+  --update-preview output/plans/manhattan_2m_240/preview.svg
+```
+
+Each plate's label card grows to hold one more line — that plate's own print
+time and filament weight — and a band above the map carries the totals for the
+whole plan, split into model material and tool-change purge, with a colour chip
+per filament. Plates are matched to models by the label the model's name
+ends in (`<plan-id>_<label>.3mf`), so estimating a subset captions only those
+plates and the run names any model it could not place.
+
+The band is a strip grown above matplotlib's own canvas rather than an overlay,
+so it hides no map. A rerun restores the boxes the planner drew before
+captioning them again, so the preview never accumulates a second set.
+
 A seam has to cross an elevated road somewhere, and crossing one square costs
 about its width. A seam traveling *along* a structure is the real defect. Each
 crossing is therefore judged against the feature's own narrow width rather than
