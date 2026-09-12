@@ -322,7 +322,6 @@ def band_lines(summary):
     if model or purge:
         head+=f' = {model:.0f} g model + {purge:.0f} g purge'
         if loose>=0.5:head+=f' + {loose:.0f} g unsplit'
-    head+=f" &#183; {total/SPOOL_G:.2f} spools &#183; {summary['plates']} plates"
     # A hairline outline keeps the ivory swatch visible against the white band.
     chips=' &#160; '.join(f'<tspan fill="{filament["colour"] or "#888888"}" stroke="#999999" '
         f'stroke-width="0.3">&#9632;</tspan> {escape(filament["label"])} '
