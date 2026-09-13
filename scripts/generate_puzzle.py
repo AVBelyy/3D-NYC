@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import base64
 import io
+import itertools
 import json
 import math
 import re
@@ -81,6 +82,8 @@ IDENTITY = "1 0 0 0 1 0 0 0 1 0 0 0"
 # Object ids for the assembled pieces live above the per-material mesh ids so
 # the two numbering spaces in one 3MF cannot collide.
 PIECE_ID_BASE = 1000
+# Past this the plate is technically fine but has no room left to nudge.
+DEFAULT_PLATE_WARNING_MM = 250.0
 MAX_PIECES = PIECE_ID_BASE // 4 - 1
 
 # Shape of one jigsaw knob, as fractions of the edge it sits on.  These are the
@@ -1225,6 +1228,85 @@ def unprintable_ceiling(solids, floor_mm: float, profile: PrintProfile):
     return ceiling
 
 
+def plate_colouring(layout: Layout) -> list[int]:
+    """Which plate each piece prints on, so that no two on a plate interlock.
+
+    This is what lets the map keep every millimetre of itself.  A gap wide
+    enough for the slicer has to exist between two pieces printed side by side,
+    and if those two pieces are neighbours in the map there are only three
+    places it can come from: the map surface (a 4.8 m strip of deleted street at
+    this scale), the joint clearance (slop the assembled puzzle would show), or
+    free travel before the lock engages (a puzzle that falls apart).  Measured,
+    all three are bad.
+
+    But the constraint only binds between *neighbours*.  Print a piece with
+    nobody it interlocks with and there is nothing to hold apart, so the cut can
+    be a plane of no width and the map loses nothing at all.  A grid is
+    bipartite, so two plates in a checkerboard almost always suffice; the
+    colouring is done on the real adjacency graph rather than on cell parity
+    because a piece that absorbed a clipped neighbour spans cells of both
+    colours, and that can make the graph need a third.
+    """
+    owner = layout.owner()
+    neighbours = {index: set() for index in range(layout.pieces)}
+    for (row, col), piece in owner.items():
+        for cell in ((row, col + 1), (row + 1, col), (row, col - 1), (row - 1, col)):
+            other = owner.get(cell)
+            if other is not None and other != piece:
+                neighbours[piece].add(other)
+                neighbours[other].add(piece)
+    # Most-constrained first, so the easy pieces fill in around the awkward ones.
+    plates = {}
+    for piece in sorted(neighbours, key=lambda i: -len(neighbours[i])):
+        taken = {plates[other] for other in neighbours[piece] if other in plates}
+        plates[piece] = next(plate for plate in itertools.count() if plate not in taken)
+    return [plates[index] for index in range(layout.pieces)]
+
+
+def plate_offsets(layout: Layout, spacing_mm: float) -> list[tuple]:
+    """Where each piece is set down on the plate, once the seams are opened up.
+
+    The pieces have to print with a gap between them, and there are only two
+    places that gap can come from: the map, or the plate.  Taking it out of the
+    map is the tempting one, because the plate then stays exactly the size of
+    the chunk -- but at 1:5670 a gap wide enough for the slicer is several
+    metres of street, and a hundred-piece cut of a 235 mm map loses 6% of its
+    surface and breaks every feature that crosses a seam.
+
+    So it comes out of the plate instead.  Each piece keeps every scrap of map
+    it was cut with -- its mesh is still in map coordinates, and the meshes
+    still assemble into the original chunk exactly -- and is *placed* one gap
+    further out for each cell between it and the map's origin.  The plate grows
+    by one gap per seam; the map loses nothing.
+
+    A piece that absorbed a clipped neighbour is placed by its top-left cell,
+    which leaves the seams around it wider than asked rather than narrower.
+    """
+    return [(min(col for _, col in group) * spacing_mm,
+             min(row for row, _ in group) * spacing_mm)
+            for group in layout.groups]
+
+
+def plate_extent(layout: Layout, width: float, height: float, spacing_mm: float):
+    """How much plate the spread-out pieces occupy, across and down."""
+    return (width + (layout.grid.cols - 1) * spacing_mm,
+            height + (layout.grid.rows - 1) * spacing_mm)
+
+
+def offset_transform(base: str, dx: float, dy: float) -> str:
+    """A 3MF item transform, moved on the plate by (dx, dy).
+
+    3MF states the matrix row-major with the translation last, so the move is
+    added to the tenth and eleventh numbers and the rotation is left alone.
+    """
+    numbers = base.split()
+    if len(numbers) != 12:
+        raise PuzzleError(f"Cannot place a piece against a {len(numbers)}-number transform")
+    numbers[9] = f"{float(numbers[9]) + dx:.6g}"
+    numbers[10] = f"{float(numbers[10]) + dy:.6g}"
+    return " ".join(numbers)
+
+
 def seat_polygons(layout: Layout, low, clearance: float) -> list[Polygon]:
     """Each piece's own cells, inset by half the clearance where a neighbour meets it.
 
@@ -1347,8 +1429,14 @@ def piece_label(row: int, col: int) -> str:
 
 
 def write_project(output: Path, source: SourceProject, pieces, layout: Layout, plan: dict,
-                  project: bytes, thumbnail: bytes | None = None):
-    """Write one 3MF holding every piece as its own printable object."""
+                  project: bytes, thumbnail: bytes | None = None, offsets=None):
+    """Write one 3MF holding every piece as its own printable object.
+
+    The meshes stay in map coordinates, so the archive still holds the chunk
+    exactly as it was cut; where each piece is *placed* is the build item's own
+    transform.  That is what opens the seams on the plate without taking a
+    millimetre out of the map.
+    """
     grid = layout.grid
     identity = f"{source.title}|{grid.rows}x{grid.cols}|{len(pieces)}|{plan['seed']}"
     uid = lambda name: str(uuid.uuid5(uuid.NAMESPACE_URL, "3d-nyc/puzzle/" + identity + "/" + name))
@@ -1372,8 +1460,10 @@ def write_project(output: Path, source: SourceProject, pieces, layout: Layout, p
         resources.append(
             f'<object id="{object_id}" type="model" name="{escape(piece["name"])}" '
             f'p:UUID="{uid(f"piece/{piece['index']}")}"><components>\n{components}</components></object>')
+        placement = source.transform if offsets is None else \
+            offset_transform(source.transform, *offsets[piece["index"]])
         build.append(
-            f'<item objectid="{object_id}" transform="{source.transform}" printable="1" '
+            f'<item objectid="{object_id}" transform="{placement}" printable="1" '
             f'p:UUID="{uid(f"instance/{piece['index']}")}"/>')
 
     wrapper = f'''<?xml version="1.0" encoding="UTF-8"?>
@@ -1608,7 +1698,7 @@ def matches_cavity(cavity, known, tolerance: float = 0.02) -> bool:
 
 def validate_puzzle(output: Path, source: SourceProject, expected, footprint, *,
                     clearance_mm: float, vertical_clearance_mm: float,
-                    layout: Layout, labels, solids=None):
+                    layout: Layout, labels, solids=None, offsets=None):
     """Re-read the written 3MF and audit it the way `validate_3mf` audits a map.
 
     Independent of everything above it: the archive is reopened, the meshes are
@@ -1628,8 +1718,15 @@ def validate_puzzle(output: Path, source: SourceProject, expected, footprint, *,
     import manifold3d as md
 
     grid = layout.grid
-    count = layout.pieces
-    separation_mm = min(clearance_mm, vertical_clearance_mm)
+    # One plate at a time: the archive holds the pieces of this plate only, and
+    # which pieces those are is what the caller passed in.
+    indices = sorted(expected["indices"])
+    count = len(indices)
+    # A knob lying under a neighbour's surface is the one place two pieces come
+    # closer than the seam clearance, and on a coloured plate that never
+    # happens: the neighbour it reaches under is on the other plate. So what
+    # every pair here has to keep is the full seam clearance.
+    separation_mm = clearance_mm
     report = {"model": str(output), "pieces": {}, "clearance_mm": clearance_mm,
               "knob_recess_mm": vertical_clearance_mm, "required_separation_mm": separation_mm}
     crumb = expected["crumb_mm3"]
@@ -1739,7 +1836,7 @@ def validate_puzzle(output: Path, source: SourceProject, expected, footprint, *,
         parsed.setdefault(piece, []).append(to_manifold(vertices, triangles))
         seen.setdefault(piece, []).append(material)
 
-    if sorted(parsed) != list(range(count)):
+    if sorted(parsed) != indices:
         raise PuzzleError(f"The archive carries meshes for {len(parsed)} of {count} pieces")
 
     assemblies, sealed = {}, {}
@@ -1770,6 +1867,12 @@ def validate_puzzle(output: Path, source: SourceProject, expected, footprint, *,
                 f"{top:.2f} mm top: no section there is {written.minimum_printable_width_mm:.2f} mm "
                 "across, which is the narrowest the slicer will lay an extrusion into. Bambu "
                 "refuses an object with an empty layer.")
+        # The meshes are in map coordinates, where neighbours touch by design.
+        # What has to be held apart is where they are *placed*, so the piece is
+        # moved onto its plate position before any of that is measured.
+        if offsets is not None:
+            dx, dy = offsets[piece]
+            assembly = assembly.translate([dx, dy, 0.0])
         assemblies[piece] = assembly
         progress.update(len(assemblies), detail=labels[piece])
         report["pieces"][labels[piece]] = {
@@ -1781,37 +1884,35 @@ def validate_puzzle(output: Path, source: SourceProject, expected, footprint, *,
 
     progress.close()
 
+    # Everything on this plate prints at once, so every pair of pieces on it
+    # has to be held apart -- not just the ones that are neighbours in the map.
+    # The colouring means neighbours are on different plates, so the closest
+    # pair here is usually two pieces meeting at a diagonal corner.
     gaps = []
-    owner = layout.owner()
-    checked = set()
-    for (row, col), piece in owner.items():
-        here = assemblies[piece]
-        for neighbour in ((row, col + 1), (row + 1, col)):
-            # Two cells of the same piece are not neighbours to hold apart, and
-            # one pair of pieces need only be measured once however many cell
-            # boundaries they happen to share.
-            if owner.get(neighbour, piece) != piece and (
-                    pair := (min(piece, owner[neighbour]), max(piece, owner[neighbour]))
-            ) not in checked:
-                checked.add(pair)
-                other = assemblies[owner[neighbour]]
-                overlap = float((here ^ other).volume())
-                if overlap > crumb:
-                    raise PuzzleError(
-                        f"Pieces {labels[piece]} and {labels[owner[neighbour]]} overlap by "
-                        f"{overlap:g} mm3; they would print fused")
-                # Neighbours meet in two places with two different clearances:
-                # side by side across the seam, and a knob lying under the
-                # other's surface. The tighter of the two is what has to hold.
-                gap = float(here.min_gap(other, 4 * separation_mm))
-                gaps.append(gap)
-                if gap < separation_mm - PLACEMENT_TOLERANCE_MM:
-                    raise PuzzleError(
-                        f"Pieces {labels[piece]} and {labels[owner[neighbour]]} come within "
-                        f"{gap:g} mm of each other, inside the {separation_mm:g} mm the joint "
-                        f"is built to ({clearance_mm:g} mm across the seam, "
-                        f"{vertical_clearance_mm:g} mm under the surface); they would print "
-                        "welded together")
+    boxes = {piece: assembly.bounding_box() for piece, assembly in assemblies.items()}
+
+    def apart(a, b):
+        """A cheap lower bound on the distance between two pieces."""
+        first, second = boxes[a], boxes[b]
+        return math.hypot(max(first[0] - second[3], second[0] - first[3], 0.0),
+                          max(first[1] - second[4], second[1] - first[4], 0.0))
+
+    for first, second in itertools.combinations(sorted(assemblies), 2):
+        if apart(first, second) > 2 * separation_mm:
+            continue                       # far enough that no Boolean is needed
+        here, other = assemblies[first], assemblies[second]
+        overlap = float((here ^ other).volume())
+        if overlap > crumb:
+            raise PuzzleError(
+                f"Pieces {labels[first]} and {labels[second]} overlap by "
+                f"{overlap:g} mm3; they would print fused")
+        gap = float(here.min_gap(other, 4 * separation_mm))
+        gaps.append(gap)
+        if gap < separation_mm - PLACEMENT_TOLERANCE_MM:
+            raise PuzzleError(
+                f"Pieces {labels[first]} and {labels[second]} come within {gap:g} mm of each "
+                f"other on plate, inside the {separation_mm:g} mm two pieces printed side "
+                "by side need; they would print welded together")
     report["minimum_neighbour_gap_mm"] = min(gaps) if gaps else None
 
     # Only now, and only if something turned up, is it worth the one big Boolean
@@ -1894,6 +1995,13 @@ def build_parser():
                         help="Total gap between neighbouring pieces; two outer-wall line widths "
                              "when omitted, the room a bead laid on a sub-bead map detail needs "
                              "on each side of the seam before the slicer calls it a collision")
+    parser.add_argument("--surface-kerf-mm", type=float, default=0.0,
+                        help="How much of the map surface a seam eats. Zero by default, which "
+                             "keeps the map whole and opens the gap on the plate instead; raise "
+                             "it to trade map for plate area")
+    parser.add_argument("--warn-plate-mm", type=float, default=DEFAULT_PLATE_WARNING_MM,
+                        help="Warn once the spread-out pieces pass this size on the plate "
+                             f"(default {DEFAULT_PLATE_WARNING_MM:g})")
     parser.add_argument("--tab-size", type=float, default=DEFAULT_TAB_SIZE,
                         help="Knob reach, as a fraction of the edge it sits on "
                              f"(default {DEFAULT_TAB_SIZE:g})")
@@ -1942,6 +2050,15 @@ def main(argv=None):
           f"{profile.plate_mm[0]:g} x {profile.plate_mm[1]:g} mm plate", flush=True)
 
     clearance = profile.clearance_mm if args.clearance_mm is None else args.clearance_mm
+    # What the map gives up at a seam. Zero by default: the surface is cut on a
+    # plane of no width, so every piece keeps every millimetre of map it was
+    # cut with, and the gap the slicer needs is found on the plate instead.
+    surface_kerf = args.surface_kerf_mm
+    # Pieces that interlock never share a plate, so the only same-plate contact
+    # left is the corner where two diagonal pieces meet. Moving every piece out
+    # by one step per cell parts those corners along the diagonal, so a step of
+    # clearance/sqrt(2) puts exactly the clearance between them.
+    spacing = max(0.0, clearance - surface_kerf) / math.sqrt(2)
     # The undercut is derived once the knob's size is known, further down.
     undercut = args.tab_undercut_mm
     plate_w, plate_h = args.plate_mm or profile.plate_mm
@@ -2064,12 +2181,27 @@ def main(argv=None):
             f"{knob_thickness:.3g} mm knob, under two {profile.layer_height_mm:g} mm layers. "
             "Lower --knob-recess-mm, or raise --floor-mm if you know this map's base.")
 
+    spread_w, spread_h = plate_extent(layout, width, height, spacing)
+    if spread_w > usable_w + 1e-6 or spread_h > usable_h + 1e-6:
+        raise PuzzleError(
+            f"Opening {grid.cols - 1} x {grid.rows - 1} seams by {spacing:g} mm grows the "
+            f"{width:.1f} x {height:.1f} mm map to {spread_w:.1f} x {spread_h:.1f} mm on the "
+            f"plate, past the {usable_w:g} x {usable_h:g} mm usable. Ask for fewer pieces, "
+            "regenerate the chunk smaller, or raise --plate-mm.")
+    if spread_w > args.warn_plate_mm or spread_h > args.warn_plate_mm:
+        print(f"warning: the pieces spread to {spread_w:.1f} x {spread_h:.1f} mm on the plate, "
+              f"over {args.warn_plate_mm:g} mm. That still fits {plate_w:g} x {plate_h:g} mm, but "
+              "it leaves little room to nudge the plate; fewer pieces or a smaller chunk would "
+              "give it back.", flush=True)
+
     rng = np.random.default_rng(args.seed)
     curves = cut_curves(grid, rng, size=args.tab_size, neck=args.tab_neck,
                         undercut=undercut, samples=samples)
     polygons = floor_polygons(layout, curves, clearance, local, profile.nozzle_mm)
     placed = [shapely.affinity.translate(polygon, low[0], low[1]) for polygon in polygons]
-    seats = seat_polygons(layout, low, clearance)
+    seats = seat_polygons(layout, low, surface_kerf)
+    offsets = plate_offsets(layout, spacing)
+    colouring = plate_colouring(layout)
     labels = [piece_label(row, col) for row, col in layout.seeds]
     merged = sum(1 for group in layout.groups if len(group) > 1)
     smallest = min(polygon.area for polygon in polygons)
@@ -2085,10 +2217,16 @@ def main(argv=None):
     print(f"Knob: {knob_thickness:.3g} mm thick "
           f"({knob_thickness / profile.layer_height_mm:.0f} layers), recessed {recess:g} mm "
           f"under its neighbour's surface, head {head_ratio:.2f} x its own neck", flush=True)
+    tally = [sum(1 for plate in colouring if plate == which)
+             for which in sorted(set(colouring))]
+    print(f"Plates: {len(tally)} x {spread_w:.1f} x {spread_h:.1f} mm holding "
+          f"{', '.join(str(n) for n in tally)} pieces. No two pieces on a plate interlock, so "
+          f"the map surface is cut on a plane of no width and keeps all "
+          f"{footprint.area:,.0f} mm2 of itself; the pieces are set down {spacing:.2f} mm "
+          "further apart per cell to part their diagonal corners.", flush=True)
 
     puzzle_id = args.puzzle_id or f"{args.input.stem}_{layout.pieces}"
     directory = args.output_dir / puzzle_id
-    output = directory / f"{puzzle_id}.3mf"
     plan = {
         "puzzle_id": puzzle_id,
         "schema_version": 1,
@@ -2158,8 +2296,14 @@ def main(argv=None):
     print(f"Surfaces split on the {grid.rows} x {grid.cols} grid "
           f"({time.time() - started:.0f}s)", flush=True)
     ceiling = float(high[2]) - floor + 2.0
-    seat_prisms = [cross_section(seat).extrude(ceiling).translate([0.0, 0.0, floor])
-                   for seat in seats]
+    # At zero kerf a seat is exactly the cells the surface was split on, so
+    # intersecting with it would ask a Boolean to cut along a plane the mesh
+    # already ends on. That is the one thing a coincident-surface Boolean is
+    # worst at: it answers with slivers of 1e-16 mm2 that no export repair can
+    # heal. The split has already done the work, so the seat is only needed
+    # when it actually differs from the cells.
+    seat_prisms = ([cross_section(seat).extrude(ceiling).translate([0.0, 0.0, floor])
+                    for seat in seats] if surface_kerf > 0 else None)
 
     import manifold3d as md
     pieces = []
@@ -2179,7 +2323,7 @@ def main(argv=None):
                 # The seat is where this piece's own surface stands. Its knobs
                 # reach past it, but only through the floor, which is cut from
                 # the slab below rather than from here.
-                solid = region ^ seat_prisms[index]
+                solid = region if seat_prisms is None else region ^ seat_prisms[index]
             if material == foundation:
                 if solid.is_empty():
                     raise PuzzleError(
@@ -2252,34 +2396,44 @@ def main(argv=None):
               flush=True)
     thumbnail = (plate_thumbnail(basemap, grid, placed, low) if basemap is not None
                  else source.thumbnail)
-    mesh_ids = write_project(output, source, pieces, layout, plan, project, thumbnail)
-    print(f"{output} {output.stat().st_size:,} bytes, {len(pieces)} pieces, "
-          f"{sum(plan['piece_triangles']):,} triangles ({time.time() - started:.0f}s)", flush=True)
+    plan["plates"] = []
+    for plate in sorted(set(colouring)):
+        on_plate = [piece for piece in pieces if colouring[piece["index"]] == plate]
+        output = directory / f"{puzzle_id}_plate{plate + 1}.3mf"
+        mesh_ids = write_project(output, source, on_plate, layout, plan, project, thumbnail,
+                                 offsets=offsets)
+        triangles = sum(len(mesh.faces) for piece in on_plate for _, mesh in piece["meshes"])
+        print(f"{output} {output.stat().st_size:,} bytes, {len(on_plate)} pieces, "
+              f"{triangles:,} triangles ({time.time() - started:.0f}s)", flush=True)
+        record = {"plate": plate + 1, "model": str(output), "pieces": len(on_plate),
+                  "labels": [labels[piece["index"]] for piece in on_plate],
+                  "triangles": triangles}
 
-    if args.validate:
-        expected = {
-            "mesh_ids": list(mesh_ids.values()),
-            "owner": {identifier: key for key, identifier in mesh_ids.items()},
-            "counts": {mesh_ids[(piece["index"], material)]:
-                       (len(mesh.vertices), len(mesh.faces))
-                       for piece in pieces for material, mesh in piece["meshes"]},
-            "by_piece": {piece["index"]: [mesh_ids[(piece["index"], material)]
-                                          for material, _ in piece["meshes"]]
-                         for piece in pieces},
-            "crumb_mm3": crumb_mm3,
-            "nozzle_mm": profile.nozzle_mm,
-            "layer_height_mm": profile.layer_height_mm,
-            "floor_mm": floor,
-        }
-        validation = validate_puzzle(output, source, expected, footprint,
-                                     clearance_mm=clearance, vertical_clearance_mm=recess,
-                                     layout=layout, labels=labels, solids=solids)
-        write_manifest(directory / "validation.json", validation)
-        print(f"Validation passed: {layout.pieces} pieces, closest neighbours "
-              f"{validation['minimum_neighbour_gap_mm']:.3f} mm apart "
-              f"({time.time() - started:.0f}s)", flush=True)
-        plan["validation"] = {"result": "passed",
-                              "minimum_neighbour_gap_mm": validation["minimum_neighbour_gap_mm"]}
+        if args.validate:
+            expected = {
+                "mesh_ids": list(mesh_ids.values()),
+                "owner": {identifier: key for key, identifier in mesh_ids.items()},
+                "counts": {mesh_ids[(piece["index"], material)]:
+                           (len(mesh.vertices), len(mesh.faces))
+                           for piece in on_plate for material, mesh in piece["meshes"]},
+                "by_piece": {piece["index"]: [mesh_ids[(piece["index"], material)]
+                                              for material, _ in piece["meshes"]]
+                             for piece in on_plate},
+                "indices": [piece["index"] for piece in on_plate],
+                "crumb_mm3": crumb_mm3,
+                "nozzle_mm": profile.nozzle_mm,
+                "layer_height_mm": profile.layer_height_mm,
+                "floor_mm": floor,
+            }
+            validation = validate_puzzle(output, source, expected, footprint, offsets=offsets,
+                                         clearance_mm=clearance, vertical_clearance_mm=recess,
+                                         layout=layout, labels=labels, solids=solids)
+            write_manifest(directory / f"validation_plate{plate + 1}.json", validation)
+            print(f"Plate {plate + 1} validation passed: {len(on_plate)} pieces, closest "
+                  f"{validation['minimum_neighbour_gap_mm']:.3f} mm apart "
+                  f"({time.time() - started:.0f}s)", flush=True)
+            record["minimum_neighbour_gap_mm"] = validation["minimum_neighbour_gap_mm"]
+        plan["plates"].append(record)
 
     write_manifest(directory / "puzzle.json", plan)
     return 0

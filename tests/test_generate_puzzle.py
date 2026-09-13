@@ -11,6 +11,7 @@ leaves a puzzle that falls apart in the hand.
 """
 
 import json
+import math
 import re
 import sys
 import unittest
@@ -24,6 +25,7 @@ from shapely.geometry import box
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import generate_puzzle  # noqa: E402
 from generate_puzzle import (Grid, Layout, PrintProfile, PuzzleError,  # noqa: E402
+                             plate_colouring, plate_offsets, plate_extent, offset_transform,
                              choose_layout, cut_curves, floor_polygons, knob_interference,
                              cell_box, knob_profile, layout_for, matches_cavity, piece_label,
                              seat_polygons,
@@ -353,6 +355,92 @@ class CavityTests(unittest.TestCase):
 
     def test_nothing_is_excused_when_the_map_has_no_chambers(self):
         self.assertFalse(matches_cavity((0.459, 0.234), []))
+
+
+class PlateTests(unittest.TestCase):
+    """The map keeps every millimetre of itself, and the plate pays instead.
+
+    A gap wide enough for the slicer has to exist between two pieces printed
+    side by side. If they are neighbours in the map it can only come out of the
+    map surface, the joint clearance or the lock -- all three measurably bad. So
+    neighbours are not printed together, and then there is nothing to pay.
+    """
+
+    @staticmethod
+    def square(size=235.0):
+        return box(0.0, 0.0, size, size)
+
+    def test_no_two_pieces_on_a_plate_are_neighbours(self):
+        for pieces in (4, 25, 63, 100):
+            layout = choose_layout(self.square(), 235.0, 235.0, pieces, 1.6, 0.35)
+            plates = plate_colouring(layout)
+            self.assertEqual(len(plates), layout.pieces)
+            owner = layout.owner()
+            for (row, col), piece in owner.items():
+                for cell in ((row, col + 1), (row + 1, col)):
+                    other = owner.get(cell)
+                    if other is not None and other != piece:
+                        self.assertNotEqual(
+                            plates[piece], plates[other],
+                            f"{pieces} pieces: {piece} and {other} interlock but share a plate")
+
+    def test_a_grid_takes_two_plates(self):
+        """A grid is bipartite, so a rectangle never needs a third plate."""
+        for pieces in (4, 16, 25, 100):
+            layout = choose_layout(self.square(), 235.0, 235.0, pieces, 1.6, 0.35)
+            self.assertLessEqual(len(set(plate_colouring(layout))), 2, pieces)
+
+    def test_an_absorbed_crumb_still_gets_a_workable_colouring(self):
+        """A piece that swallowed a clipped neighbour spans cells of both
+        colours, so cell parity is not a colouring and the real adjacency graph
+        has to be coloured instead. It may need a third plate; it must never
+        leave two interlocking pieces together."""
+        notched = box(0.0, 0.0, 200.0, 200.0).difference(box(125.0, 125.0, 200.0, 200.0))
+        layout, _ = layout_for(Grid(5, 5, 200.0, 200.0), notched, 0.35)
+        plates = plate_colouring(layout)
+        owner = layout.owner()
+        for (row, col), piece in owner.items():
+            for cell in ((row, col + 1), (row + 1, col)):
+                other = owner.get(cell)
+                if other is not None and other != piece:
+                    self.assertNotEqual(plates[piece], plates[other])
+
+    def test_the_step_parts_two_diagonal_corners_by_the_clearance(self):
+        """Neighbours are on other plates, so the closest pair left on a plate
+        is two pieces meeting at a corner. Stepping every piece out by one
+        `spacing` per cell parts that corner along the diagonal, so the step
+        only has to be the clearance over root two."""
+        layout = choose_layout(self.square(), 235.0, 235.0, 100, 1.6, 0.35)
+        clearance = P2S.clearance_mm
+        spacing = clearance / math.sqrt(2)
+        offsets = plate_offsets(layout, spacing)
+        owner = layout.owner()
+        a, b = owner[(4, 4)], owner[(5, 5)]
+        (ax, ay), (bx, by) = offsets[a], offsets[b]
+        self.assertAlmostEqual(math.hypot(bx - ax, by - ay), clearance, places=9)
+
+    def test_the_plate_grows_by_one_step_a_seam_and_the_map_does_not(self):
+        layout = choose_layout(self.square(), 235.0, 235.0, 100, 1.6, 0.35)
+        spacing = P2S.clearance_mm / math.sqrt(2)
+        width, height = plate_extent(layout, 235.0, 235.0, spacing)
+        self.assertAlmostEqual(width, 235.0 + 9 * spacing)
+        self.assertAlmostEqual(height, 235.0 + 9 * spacing)
+        # The seats are what the map surface is cut to. At zero kerf they are
+        # the whole of the grid, so nothing of the map is thrown away.
+        seats = seat_polygons(layout, (0.0, 0.0), 0.0)
+        self.assertAlmostEqual(shapely.union_all(seats).area, 235.0 * 235.0, places=6)
+        # And at a kerf they are not: that is the map the old cut deleted.
+        eaten = seat_polygons(layout, (0.0, 0.0), P2S.clearance_mm)
+        self.assertLess(shapely.union_all(eaten).area, 235.0 * 235.0 - 3000.0)
+
+    def test_placing_a_piece_moves_it_and_nothing_else(self):
+        moved = offset_transform("1 0 0 0 1 0 0 0 1 10.5 10.5 0.0", 2.5, -1.25)
+        self.assertEqual(moved.split()[:9], "1 0 0 0 1 0 0 0 1".split())
+        self.assertAlmostEqual(float(moved.split()[9]), 13.0)
+        self.assertAlmostEqual(float(moved.split()[10]), 9.25)
+        self.assertAlmostEqual(float(moved.split()[11]), 0.0)
+        with self.assertRaises(PuzzleError):
+            offset_transform("1 0 0", 1.0, 1.0)
 
 
 class CutTests(unittest.TestCase):

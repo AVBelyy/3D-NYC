@@ -2,10 +2,10 @@
 
 `scripts/generate_puzzle.py` takes one finished 3MF from
 [`generate_3mf.py`](generate_3mf.md) and produces a printable jigsaw of exactly
-N interlocking pieces: a single 3MF in which every piece is its own object, cut
-so that the plate comes off the printer in pieces you assemble by hand. The
-pieces keep their positions, so the plate you slice is the map you generated,
-only divided.
+N interlocking pieces, split across two plates so that **no piece is printed
+beside one it interlocks with**. That is what lets the cut take nothing at all
+out of the map: the surface is divided on a plane of no width, and the two
+plates reassemble into the original chunk to the micron.
 
 It is a 3MF-to-3MF transform. It reads no source caches, needs no Bambu Studio
 profiles and creates no job directory: the input project already carries the
@@ -37,11 +37,14 @@ That writes `output/puzzles/34_w_76_235_25/`:
 
 | File | Contents |
 | --- | --- |
-| `34_w_76_235_25.3mf` | one object per piece, each still carrying its four filaments |
+| `34_w_76_235_25_plate1.3mf` | one object per piece, each still carrying its four filaments |
+| `34_w_76_235_25_plate2.3mf` | the other half of the pieces — none of them neighbours of each other |
 | `preview.svg` | the cut drawn over a top-down render of the map it was cut from |
-| | *(the same render, with the cut drawn in, becomes the 3MF's plate thumbnail)* |
-| `puzzle.json` | the grid, the seed, and every derived bound |
-| `validation.json` | the audit of the written 3MF, piece by piece |
+| | *(the same render, with the cut drawn in, becomes each 3MF's plate thumbnail)* |
+| `puzzle.json` | the grid, the seed, the plates, and every derived bound |
+| `validation_plate1.json`, `…2.json` | the audit of each written 3MF, piece by piece |
+
+Print both plates; together they are the whole map.
 
 `--puzzle-id` names the directory and `--output-dir` moves the root. Add
 `--dry-run` to plan the cut, write the preview and manifest, and cut no meshes —
@@ -86,6 +89,8 @@ profile, and the cut reads its bounds back out of it:
 | Bound | Derived from | Why that quantity |
 | --- | --- | --- |
 | Gap between pieces | two outer-wall line widths | Not the width the slicer can resolve — that is one nozzle — but the width the *toolpaths* need. See below. |
+| Plate step | `clearance / √2` | Neighbours are on other plates, so the closest same-plate pair meets at a diagonal corner; a step of this size parts that corner by exactly the clearance. |
+| Surface kerf | zero | Nothing of the map is thrown away; the gap is found on the plate instead. |
 | Knob undercut | the gap plus half a nozzle | The gap is subtracted from the joint before any of it is left to lock with, so the undercut has to cover it first and then add the lock. See below. |
 | Narrowest printable section | `2 x min_bead_width` | Below it the slicer lays no extrusion at all, and the layer becomes an empty layer *of that piece*. See below. |
 | Knob recess | two layer heights | A knob lies *under* its neighbour's surface tier. Without a gap in Z the printer lays that surface straight onto the knob. Two layers: one of air, one for the sag of the layer bridged across it. |
@@ -111,44 +116,80 @@ cartographic-style design choices, in the same class as
 `_material_layers.PAVEMENT_PAD_RELIEF_MM`: they are the proportions of a
 cardboard puzzle, held as module constants and scaled with the edge they sit on.
 
-## The gap: why two line widths, not one nozzle
+## The gap: where it comes from, and why not out of the map
 
-One nozzle diameter is the width below which a slicer cannot resolve a void at
-all, and it is the obvious gap to leave between two pieces. On this map it does
-not slice. Bambu Studio refuses a 100-piece plate with
+Two pieces printed side by side need a gap between them. One nozzle diameter is
+the obvious width, and on this map it does not slice — Bambu refuses a
+100-piece plate with
 
 ```text
 Object 34_w_76_235_100_E5 and 34_w_76_235_100_F5 have overlapping gcode paths
 ```
 
-and the refusal has nothing to do with the joint: the conflicting layer is
-z 8.60-8.84 mm, five times above the floor plane, up among the buildings.
+and the conflicting layer is z 8.60–8.84 mm, five times above the floor plane,
+up among the buildings. The cause is the map's own detail: at 1:5670 a city
+carries thousands of features narrower than a single bead, Arachne centres one
+bead on each and widens a lone bead up to about twice the nominal line width, so
+an extrusion spills as much as a full line width past what it is tracing. Two
+such features facing across a seam meet in the middle. Measured end to end at
+100 pieces: 0.40 mm refused, 0.50 mm refused at a different pair, **0.84 mm —
+two outer-wall line widths — slices clean**.
 
-The cause is the map's own detail. At 1:5670 a city carries thousands of
-features narrower than a single bead -- a parapet, a setback, a fire escape.
-Arachne centres one bead on each, and widens a lone bead up to about twice the
-nominal line width, so an extrusion spills as much as a full line width past the
-feature it is tracing. Two such features facing each other across a seam each
-spill a line width into it, and the toolpaths meet in the middle.
+That is invisible on the uncut map because the whole map is **one object**, and
+Bambu only reports path conflicts *between* objects. Cutting the map into pieces
+does not create the near-touching extrusions; it makes the slicer able to see
+them.
 
-That is invisible on the uncut map for a reason worth knowing: the whole map is
-**one object**, and Bambu only reports path conflicts *between* objects. Cutting
-the map into pieces does not create the near-touching extrusions, it just makes
-the slicer able to see them. Measured at the failing layer, the uncut model
-holds 133 sub-bead islands against 6 across the two pieces it blamed.
+So 0.84 mm has to exist between any two pieces on a plate. The question is
+where it comes from, and there are only three places:
 
-Measured end to end at 100 pieces:
-
-| gap | result |
+| taken out of | what it costs |
 | --- | --- |
-| 0.40 mm (one nozzle) | refused |
-| 0.50 mm | refused, at a different pair |
-| 0.84 mm (two 0.42 mm outer walls) | slices clean |
+| the map surface | a 4.8 m strip of deleted street per seam; **6.33%** of the map at 100 pieces, and every feature crossing a seam steps sideways |
+| the joint clearance | the pieces are placed further apart, which pulls the knob back into its notch: measured, the floor closes from 0.840 mm to **0.270 mm**. Reopening it needs clearance 1.6 mm, a head 1.89 × its neck and ~1.6 mm of slop the assembled map would show |
+| the lock | sweeping the notch along the pull-out axis buys the gap back and costs the interference that holds the puzzle together |
 
-So the gap is `2 x outer_wall_line_width`. It is derived from the profile rather
-than fixed, because the quantity it has to clear is a bead of that profile's own
-outer wall. `--clearance-mm` overrides it for a sparser map that does not need
-it.
+All three were measured and all three are bad. But the constraint only binds
+between **neighbours** — and neighbours do not have to be printed together.
+
+## Two plates, and a map that keeps all of itself
+
+Colour the pieces so that no two that interlock share a plate. A grid is
+bipartite, so two plates suffice, and then there is nothing to hold apart:
+
+```text
+Plates: 2 x 240.3 x 240.3 mm holding 50, 50 pieces. No two pieces on a plate
+interlock, so the map surface is cut on a plane of no width and keeps all
+55,225 mm2 of itself; the pieces are set down 0.59 mm further apart per cell to
+part their diagonal corners.
+```
+
+The colouring runs on the real adjacency graph rather than on cell parity,
+because a piece that absorbed a clipped neighbour spans cells of both colours
+and can force a third plate.
+
+The only same-plate contact left is the corner where two diagonal pieces meet,
+which a step of `clearance / √2` parts along the diagonal by exactly the
+clearance. The step also grows the plate — one step per seam — which is checked
+against the printable area and flagged past `--warn-plate-mm` (default 250):
+
+```text
+warning: the pieces spread to 251.4 x 251.4 mm on the plate, over 250 mm. That
+still fits 256 x 256 mm, but it leaves little room to nudge the plate; fewer
+pieces or a smaller chunk would give it back.
+```
+
+Measured on the tracked example at 100 pieces, against the map it was cut from:
+
+| | source | both plates |
+| --- | --- | --- |
+| surface at z = 2.64 mm | 55,220.8 mm² | 55,220.8 mm² |
+| removed | | **0.0 mm² (0.0000%)** |
+| assembled extent | 235.000 × 235.000 × 34.760 mm | 235.000 × 235.000 × 34.760 mm |
+
+The meshes stay in map coordinates and only the build item's transform moves,
+so the archive still holds the chunk exactly as it was cut. `--surface-kerf-mm`
+trades back the other way if you would rather have one plate than a whole map.
 
 ## The joint: the lock wins, the knob's proportion gives
 
@@ -388,19 +429,23 @@ The per-piece rules are `validate_3mf`'s own, applied one piece at a time:
   by piece would drive the toolhead through pieces already standing;
 - no brim wide enough to reach across a seam.
 
-It adds the two rules only a puzzle has: **neighbouring pieces must not
-overlap**, and nowhere may they come closer than the joint is built to — the
-tighter of the seam clearance and the knob recess — so the plate really does
-come off in pieces. The closest pair is reported:
+It adds the two rules only a puzzle has, applied to each plate in turn:
+**no two pieces on a plate may overlap**, and none may come closer than the
+seam clearance. Every pair is measured, not just the ones adjacent in the map —
+on a coloured plate the closest pair is usually two pieces meeting at a diagonal
+corner, which is not an adjacency at all. A bounding-box bound skips the pairs
+that are obviously far apart, so only the close ones cost a Boolean.
+
+A knob lying under a neighbour's surface is the one place two pieces come
+closer than the seam clearance, and on a coloured plate that never happens —
+the neighbour it reaches under is on the other plate. So what every pair on a
+plate has to keep is the full seam clearance, and the closest pair measured is
+the diagonal corner the plate step was sized for:
 
 ```text
-Validation passed: 25 pieces, closest neighbours 0.480 mm apart
+Plate 1 validation passed: 50 pieces, closest 0.840 mm apart
+Plate 2 validation passed: 50 pieces, closest 0.840 mm apart
 ```
-
-Which of the two shows up depends on the profile. On this one the seam
-(0.84 mm, two 0.42 mm outer walls) is wider than the recess (0.48 mm, two
-0.24 mm layers), so the recess is the tighter. On the Manhattan plates, printed
-at 0.16 mm layers, the recess is 0.32 mm and it governs by more still.
 
 A straight cut can sever a bridge abutment and leave its deck floating; that is
 what the one-printable-component rule catches, and it names the piece and the

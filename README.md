@@ -90,7 +90,8 @@ python scripts/generate_puzzle.py output/models/lower_manhattan.3mf --pieces 25
 ```
 
 The surface is cut on a straight grid and the knobs are hidden in the floor
-below it, so no seam wanders across a building. See the
+below it, so no seam wanders across a building. It writes two plates, which is
+what lets the cut take nothing out of the map. See the
 [puzzle guide](docs/generate_puzzle.md).
 
 ## License and data
