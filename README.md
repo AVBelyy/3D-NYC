@@ -81,6 +81,18 @@ This writes a preview and the exact per-plate generation commands. Seams are
 routed over streets, water, and open ground, never cutting along a building,
 bridge, or tunnel. See the [planner guide](docs/plan_map_chunks.md).
 
+## Generate a puzzle
+
+Cut one finished plate into an interlocking jigsaw:
+
+```bash
+python scripts/generate_puzzle.py output/models/lower_manhattan.3mf --pieces 25
+```
+
+The surface is cut on a straight grid and the knobs are hidden in the floor
+below it, so no seam wanders across a building. See the
+[puzzle guide](docs/generate_puzzle.md).
+
 ## License and data
 
 The code is [MIT licensed](LICENSE). See [data sources and attribution](ATTRIBUTION.md)

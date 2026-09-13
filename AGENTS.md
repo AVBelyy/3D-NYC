@@ -4,8 +4,9 @@
 
 3D NYC converts public NYC geospatial datasets into four-material,
 Bambu-compatible 3MF maps. `scripts/generate_3mf.py` is the supported
-single-model entry point, and `scripts/plan_map_chunks.py` splits a larger
-polygon into gap-free neighboring plates.
+single-model entry point, `scripts/plan_map_chunks.py` splits a larger
+polygon into gap-free neighboring plates, and `scripts/generate_puzzle.py`
+cuts one finished 3MF into a printable interlocking puzzle.
 
 Run commands from the repository root. Use Python 3.12 and install
 `scripts/requirements.txt` in `.venv`. That virtualenv is uv-managed and has no
@@ -19,8 +20,8 @@ there is not evidence that `.venv` accepts it.
   representative commands, and links—not an exhaustive prerequisite, option,
   architecture, troubleshooting, or implementation reference.
 - Put generation details in `docs/generate_3mf.md`, multi-plate planning in
-  `docs/plan_map_chunks.md`, and cache procedures in
-  `docs/cache_source_datasets.md`, with the per-collection LiDAR procedures in
+  `docs/plan_map_chunks.md`, puzzle generation in `docs/generate_puzzle.md`,
+  and cache procedures in `docs/cache_source_datasets.md`, with the per-collection LiDAR procedures in
   `docs/cache_nyc_lidar_2021.md` and `docs/cache_nyc_lidar_2017.md`.
 - Update the relevant guide whenever behavior, defaults, paths, required data,
   output contracts, or CLI options change.
@@ -37,7 +38,8 @@ there is not evidence that `.venv` accepts it.
 
 ## Code and data boundaries
 
-- Keep user-facing orchestration in `generate_3mf.py` and `plan_map_chunks.py`;
+- Keep user-facing orchestration in `generate_3mf.py`, `plan_map_chunks.py`
+  and `generate_puzzle.py`;
   individual extraction, field, mesh, render, package, and validation scripts
   are pipeline stages. Give a new module that is not a command-line entry point
   a `_` prefix. Six shared modules predate that rule and keep unprefixed names:
@@ -58,7 +60,8 @@ there is not evidence that `.venv` accepts it.
 - `output/` holds artifacts a script produces for a named job, plan, or model,
   each under the directory that owns it: `output/jobs/<job-id>/` for a
   generation and everything derived from its model, `output/plans/<plan-id>/`
-  for a chunk plan, `output/models/` for finished 3MFs. Nothing else belongs
+  for a chunk plan, `output/puzzles/<puzzle-id>/` for a puzzle cut and the 3MF
+  it produces, `output/models/` for finished 3MFs. Nothing else belongs
   there. A model's sliced project, `<model>.gcode.3mf`, is the exception that
   proves the rule: it is a deliverable of the model rather than of a job, so it
   sits beside the model it was sliced from and doubles as that model's estimate

@@ -297,3 +297,49 @@ def seam_nudge_distance(direction, axis):
     direction = np.asarray(direction, dtype=float)
     perpendicular = np.linalg.norm(np.delete(direction, axis))
     return max(1e-9, min(1e-4, 4e-12 / max(perpendicular, 1e-12)))
+
+
+def classify_positive_shells(volumes, nozzle_mm, layer_height_mm):
+    """Separate printable components from sub-extrusion Boolean crumbs."""
+    threshold = minimum_printable_shell_volume_mm3(nozzle_mm, layer_height_mm)
+    return ([v for v in volumes if v > threshold],
+            sum(0 < v <= threshold for v in volumes), threshold)
+
+
+def classify_cavity_shells(pieces, nozzle_mm, layer_height_mm):
+    """Separate slicer-resolvable cavities from sub-extrusion seam wedges.
+
+    ``pieces`` are signed shells: a negative volume encloses a cavity rather
+    than a solid.  A cavity thinner than one extrusion in either direction is a
+    film along a seam between independently serialized materials, not a sealed
+    chamber the slicer would have to print around.
+    """
+    thickness_limit = min(float(nozzle_mm), float(layer_height_mm))
+    printable, negligible = [], []
+    for piece in pieces:
+        volume = float(piece.volume())
+        if volume >= 0:
+            continue
+        area = float(piece.surface_area())
+        effective_thickness = 2 * abs(volume) / area if area > 0 else float("inf")
+        (printable if effective_thickness >= thickness_limit else negligible).append(
+            (abs(volume), effective_thickness))
+    return printable, negligible, thickness_limit
+
+
+def minimum_printable_shell_volume_mm3(nozzle_mm, layer_height_mm):
+    """Volume below which a closed shell cannot form a single extrusion.
+
+    Exact surface contacts between independently serialized solids, and plane
+    cuts that graze existing geometry, both shed tiny closed shells during
+    Boolean work.  One nozzle-width square at one layer height is the smallest
+    thing a printer can lay down, so a shell under that is CSG debris rather
+    than a disconnected printable component, wherever it is measured.
+
+    It is defined here, beside the export cleanup, because more than one stage
+    judges it: `validate_3mf` classifies the finished assembly's shells against
+    it, and `generate_puzzle` classifies each puzzle piece's against the same bound.
+    Two stages disagreeing about what counts as a loose piece of print is how a
+    cut comes to pass one and fail the other.
+    """
+    return float(nozzle_mm) ** 2 * float(layer_height_mm)

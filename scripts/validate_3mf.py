@@ -5,25 +5,9 @@ import numpy as np,trimesh,manifold3d as md
 from lxml import etree
 from map_common import *
 from build_map_meshes import solid
+from mesh_precision import (classify_cavity_shells,classify_positive_shells,
+    minimum_printable_shell_volume_mm3)
 from package_3mf import validate_generation_metadata
-
-def classify_positive_shells(volumes,nozzle_mm,layer_height_mm):
-    """Separate printable components from sub-extrusion Boolean crumbs."""
-    threshold=float(nozzle_mm)**2*float(layer_height_mm)
-    return [v for v in volumes if v>threshold],sum(0<v<=threshold for v in volumes),threshold
-
-def classify_cavity_shells(pieces,nozzle_mm,layer_height_mm):
-    """Separate slicer-resolvable cavities from sub-extrusion seam wedges."""
-    thickness_limit=min(float(nozzle_mm),float(layer_height_mm))
-    printable=[];negligible=[]
-    for piece in pieces:
-        volume=float(piece.volume())
-        if volume>=0:continue
-        area=float(piece.surface_area())
-        effective_thickness=2*abs(volume)/area if area>0 else float('inf')
-        (printable if effective_thickness>=thickness_limit else negligible).append(
-            (abs(volume),effective_thickness))
-    return printable,negligible,thickness_limit
 
 def validate_material_support_settings(project):
     """Require solid skins where one material starts on another material."""

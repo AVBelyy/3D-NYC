@@ -1,0 +1,1850 @@
+#!/usr/bin/env python3
+"""Generate a printable interlocking jigsaw of exactly N pieces from a map 3MF.
+
+The map surface is the thing being protected.  New York is dense enough that a
+jigsaw outline dragged across it lands on a building in almost every segment,
+which is why ``plan_map_chunks`` treats footprints as hard keep-outs.  So the
+puzzle is cut on two levels instead of one:
+
+* **Above the floor plane** every piece is a plain rectangle of a regular
+  ``rows x cols`` grid.  Seen from above the map is crossed by straight,
+  hairline-thin lines and nothing else -- a building is clipped by a straight
+  edge or not at all, and no seam wanders.
+* **Below the floor plane** the same joint becomes a classic jigsaw curve with
+  a knob on every edge.  None of it is visible once the puzzle is assembled and
+  none of it is visible while it is being assembled either; it is what makes
+  the pieces hold on to each other.
+
+That split is free because the generator already guarantees the lower level is
+a solid slab.  ``crossings.minimum_crossing_floor_mm`` keeps every tunnel floor
+and colour skin at least one layer *above* ``base_mm``, and only the foundation
+material reaches below it, so ``z < base_mm`` is a flat prism of one filament
+across the whole footprint.  The knobs are carved out of that prism, and the
+map above it is never consulted.
+
+The two levels are cut by different means for the same reason they look
+different.  The rectangular level is separated with plane splits, which are
+cheap on a mesh of several million triangles; the jigsaw level is a Boolean
+against a prism, which is cheap only because the slab it cuts is a box.
+
+There is a second clearance a flat jigsaw does not need.  A knob reaches *under*
+the neighbour it locks into, and that neighbour's surface tier starts at the
+floor plane, so a knob extruded to full height would present its top face flat
+against the underside of the neighbour's surface and be printed onto.  Every
+knob is therefore recessed, and the neighbour bridges the gap.
+
+This script reads and writes 3MF.  It needs no source caches, no Bambu Studio
+profiles and no job directory: the input project already carries the print
+profile it was resolved against, and every clearance defended here is derived
+from that rather than assumed.  What it writes it then reads back and audits the
+way ``validate_3mf`` audits a map, piece by piece, plus the two rules only a
+puzzle has: neighbouring pieces must not touch, and none may come closer than
+the joint is built to.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import io
+import json
+import math
+import re
+import shlex
+import sys
+import time
+import uuid
+import zipfile
+from dataclasses import dataclass
+from pathlib import Path
+from xml.sax.saxutils import escape
+
+import numpy as np
+import shapely
+import trimesh
+from lxml import etree
+from PIL import Image, ImageDraw
+from shapely.geometry import LineString, MultiLineString, Polygon, box
+from shapely.ops import polygonize, unary_union
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mesh_precision import (classify_cavity_shells,  # noqa: E402
+                            classify_positive_shells,
+                            minimum_printable_shell_volume_mm3, prepare_export_mesh)
+
+CORE = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+PROD = "http://schemas.microsoft.com/3dmanufacturing/production/2015/06"
+MAT = "http://schemas.microsoft.com/3dmanufacturing/material/2015/02"
+IDENTITY = "1 0 0 0 1 0 0 0 1 0 0 0"
+
+# Object ids for the assembled pieces live above the per-material mesh ids so
+# the two numbering spaces in one 3MF cannot collide.
+PIECE_ID_BASE = 1000
+MAX_PIECES = PIECE_ID_BASE // 4 - 1
+
+# Shape of one jigsaw knob, as fractions of the edge it sits on.  These are the
+# proportions of a cardboard puzzle: a neck about a quarter of the edge, a head
+# reaching a fifth of the edge away from it.  They are deliberately not tunable
+# per edge -- what varies from edge to edge is jitter, below.
+DEFAULT_TAB_SIZE = 0.20
+DEFAULT_TAB_NECK = 0.24
+# The knob's root is wider than its neck, which is what makes the neck the
+# throat of the joint rather than one pinch among several, and is capped so a
+# knob cannot swallow the edge it sits on.
+TAB_ROOT_RATIO = 2.0
+TAB_MAX_ROOT = 0.62
+# Where the neck sits between the straight edge and the head's peak.
+TAB_NECK_HEIGHT = 0.42
+# Jitter is what stops a regular grid from producing interchangeable pieces.
+TAB_SIZE_JITTER = 0.12
+TAB_POSITION_JITTER = 0.06
+# Sampling floor and ceiling for the knob's cubics.  How many are actually used
+# is derived from the nozzle, below; these only keep a very coarse or very fine
+# profile from becoming unusable or enormous.
+# The export cleanup's own degenerate-face threshold, restated so the audit of
+# the written file judges a triangle exactly as the writer did.
+MINIMUM_FACE_AREA_MM2 = 1e-12
+# Serialization rounds coordinates; nothing is allowed to move further than this
+# from where it was built, and nothing may sit outside the map by more than it.
+PLACEMENT_TOLERANCE_MM = 0.002
+# How much the floor slab's cross section may vary with depth before it stops
+# being the prism the knobs are carved from.
+FOOTPRINT_AREA_TOLERANCE = 0.002
+# Coverage below which a cell is treated as untouched by the model rather than
+# as catching a sliver of it; a numerical threshold, not a design one.
+SLIVER_COVERAGE = 1e-6
+MINIMUM_BEZIER_SAMPLES = 8
+MAXIMUM_BEZIER_SAMPLES = 96
+
+
+class PuzzleError(ValueError):
+    """The requested puzzle cannot be cut from the supplied model."""
+
+
+# --------------------------------------------------------------------------
+# Grid
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Grid:
+    """A rows x cols division of a ``width`` x ``height`` rectangle."""
+
+    rows: int
+    cols: int
+    width: float
+    height: float
+
+    @property
+    def cell_width(self) -> float:
+        return self.width / self.cols
+
+    @property
+    def cell_height(self) -> float:
+        return self.height / self.rows
+
+    @property
+    def pieces(self) -> int:
+        return self.rows * self.cols
+
+    @property
+    def aspect(self) -> float:
+        """Piece aspect ratio, always >= 1."""
+        long_side = max(self.cell_width, self.cell_height)
+        short_side = min(self.cell_width, self.cell_height)
+        return long_side / short_side
+
+
+@dataclass(frozen=True)
+class Layout:
+    """Which cells of a grid are actually pieces.
+
+    A generated map is whatever polygon it was cropped to -- a rectangle, or the
+    street-following outline a multi-plate plan cut -- so a grid laid over its
+    bounding box will have cells the model does not reach.  Those are not
+    pieces, and the piece count the user asked for is a count of the cells that
+    are.
+    """
+
+    grid: "Grid"
+    cells: tuple
+
+    @property
+    def pieces(self) -> int:
+        return len(self.cells)
+
+    def index_of(self) -> dict:
+        return {cell: index for index, cell in enumerate(self.cells)}
+
+
+def cell_coverage(grid: "Grid", footprint) -> np.ndarray:
+    """The fraction of each cell the model covers, row-major."""
+    boxes = np.array([
+        box(col * grid.cell_width, row * grid.cell_height,
+            (col + 1) * grid.cell_width, (row + 1) * grid.cell_height)
+        for row in range(grid.rows) for col in range(grid.cols)], dtype=object)
+    covered = shapely.area(shapely.intersection(boxes, footprint))
+    return covered / (grid.cell_width * grid.cell_height)
+
+
+def layout_for(grid: "Grid", footprint, min_fill: float):
+    """Split a grid's cells into pieces, slivers and cells the model never reaches."""
+    coverage = cell_coverage(grid, footprint)
+    kept = coverage >= min_fill
+    slivers = (coverage > SLIVER_COVERAGE) & ~kept
+    cells = tuple((index // grid.cols, index % grid.cols)
+                  for index in np.flatnonzero(kept))
+    return Layout(grid, cells), int(slivers.sum())
+
+
+def candidate_grids(width: float, height: float, pieces: int, max_aspect: float,
+                    fill: float):
+    """Every grid worth testing for a footprint of this shape and coverage.
+
+    The aspect limit is what makes this cheap: it pins the column count to a
+    narrow band around the row count, so the search is linear in the number of
+    rows rather than quadratic in the pair.
+    """
+    reach = max(4, int(math.ceil(pieces / max(fill, 0.05))) * 2)
+    for rows in range(1, reach + 1):
+        low = max(1, int(math.floor(width * rows / (height * max_aspect))))
+        high = int(math.ceil(width * rows * max_aspect / height))
+        for cols in range(low, high + 1):
+            if rows * cols < pieces or rows * cols > reach:
+                continue
+            grid = Grid(rows, cols, width, height)
+            if grid.aspect <= max_aspect + 1e-9:
+                yield grid
+
+
+def factor_pairs(pieces: int):
+    """Every ``(rows, cols)`` whose product is exactly ``pieces``."""
+    if pieces < 1:
+        raise PuzzleError("A puzzle needs at least one piece")
+    return [(rows, pieces // rows) for rows in range(1, pieces + 1) if pieces % rows == 0]
+
+
+def choose_layout(footprint, width: float, height: float, pieces: int,
+                  max_aspect: float, min_fill: float) -> Layout:
+    """Pick the grid whose cells over this footprint are exactly ``pieces``, squarest.
+
+    The piece count is exact by contract.  Over a rectangle that means a
+    factorisation of the count, and a prime count has only the 1 x N one --
+    rather than quietly cutting twenty-three ribbons the run fails and names
+    counts nearby that work.  Over an irregular outline the grid is no longer
+    tied to the count at all: a 12 x 11 grid on a chunk the model half fills may
+    be the one that yields exactly sixty pieces.
+
+    A grid is rejected outright if any cell catches a sliver of the model --
+    coverage above nothing but below ``min_fill``.  Those become pieces too
+    small to print a knob on or to pick up, and there is always another grid.
+    """
+    if not math.isfinite(width) or not math.isfinite(height) or width <= 0 or height <= 0:
+        raise PuzzleError("Model footprint must be finite and positive")
+    if max_aspect < 1:
+        raise PuzzleError("Maximum piece aspect ratio must be at least 1")
+    fill = footprint.area / (width * height)
+    best = None
+    for grid in candidate_grids(width, height, pieces, max_aspect, fill):
+        layout, slivers = layout_for(grid, footprint, min_fill)
+        if slivers or layout.pieces != pieces:
+            continue
+        key = (grid.aspect, grid.rows * grid.cols, grid.rows)
+        if best is None or key < best[0]:
+            best = (key, layout)
+    if best is None:
+        raise PuzzleError(
+            f"No grid cuts exactly {pieces} pieces from this {width:g} x {height:g} mm outline "
+            f"({fill:.0%} of its bounding box) at {max_aspect:g}:1 pieces and a {min_fill:.0%} "
+            f"minimum fill. Try {', '.join(str(n) for n in nearby_counts(footprint, width, height, pieces, max_aspect, min_fill))} "
+            "pieces, or relax --max-piece-aspect or --min-piece-fill.")
+    return best[1]
+
+
+def nearby_counts(footprint, width: float, height: float, pieces: int,
+                  max_aspect: float, min_fill: float, span: int = 15):
+    """Piece counts near ``pieces`` that this footprint can actually be cut into."""
+    found = []
+    for delta in range(1, span + 1):
+        for candidate in (pieces - delta, pieces + delta):
+            if candidate < 1:
+                continue
+            try:
+                choose_layout(footprint, width, height, candidate, max_aspect, min_fill)
+            except PuzzleError:
+                continue
+            found.append(candidate)
+        if len(found) >= 3:
+            break
+    return sorted(found)[:3] or ["some other count"]
+
+
+# --------------------------------------------------------------------------
+# Knob profile
+# --------------------------------------------------------------------------
+
+def _cubic(p0, c0, c1, p1, samples: int, include_start: bool):
+    """Sample one cubic Bezier as ``samples`` points along it."""
+    t = np.linspace(0.0, 1.0, samples + 1)[(0 if include_start else 1):]
+    t = t.reshape(-1, 1)
+    u = 1.0 - t
+    points = (u ** 3) * np.asarray(p0) + 3 * (u ** 2) * t * np.asarray(c0) \
+        + 3 * u * (t ** 2) * np.asarray(c1) + (t ** 3) * np.asarray(p1)
+    return points
+
+
+def knob_profile(length: float, neck: float, height: float, undercut: float,
+                 centre: float | None = None, samples: int = MINIMUM_BEZIER_SAMPLES) -> np.ndarray:
+    """Return one edge's cut profile as ``(along, across)`` points in millimetres.
+
+    ``along`` runs from 0 to ``length``; ``across`` is the perpendicular
+    excursion, positive on one side of the straight edge.  ``height`` is the
+    peak of the head, ``neck`` its throat and ``undercut`` how far the head
+    reaches back past that throat.
+
+    The shape is built so the neck really is the throat.  Going up from the
+    straight edge the knob narrows monotonically from a root twice the neck's
+    width down to the neck, and only then balloons out again: every control
+    point of the shoulder is held inside the root-to-neck span, so the shoulder
+    cannot contribute a second, wider interference behind the designer's back.
+    That leaves exactly one undercut in the joint, which is the one solved for
+    here -- and it is solved rather than tabulated because a fit allowance has
+    to mean the same number of millimetres on a 20 mm edge as on a 60 mm one,
+    while every other proportion scales with the edge.
+    """
+    if not all(math.isfinite(value) for value in (length, neck, height, undercut)):
+        raise PuzzleError("Knob geometry must be finite")
+    if length <= 0 or neck <= 0 or height <= 0:
+        raise PuzzleError("Knob length, neck and height must be positive")
+    if undercut < 0:
+        raise PuzzleError("Knob undercut cannot be negative")
+    centre = length / 2 if centre is None else float(centre)
+    root = min(TAB_ROOT_RATIO * neck, TAB_MAX_ROOT * length)
+    if root >= neck + 2 * undercut + length or root <= neck:
+        raise PuzzleError(f"Knob root {root:g} mm is not wider than its {neck:g} mm neck")
+    if centre - root / 2 <= 0 or centre + root / 2 >= length:
+        raise PuzzleError(
+            f"A knob {root:g} mm wide does not fit centred at {centre:g} mm on a {length:g} mm edge")
+
+    root_left, root_right = centre - root / 2, centre + root / 2
+    neck_left, neck_right = centre - neck / 2, centre + neck / 2
+    neck_height = TAB_NECK_HEIGHT * height
+    # A cubic's midpoint is (2*ends + 6*controls)/8; solve for the control
+    # height that puts the head's peak exactly at `height`.
+    head_height = (8 * height - 2 * neck_height) / 6
+    spread = _solve_head_spread(neck_left, neck_right, neck_height, head_height,
+                                undercut, neck, samples)
+
+    parts = [
+        np.array([[0.0, 0.0], [root_left, 0.0]]),
+        _cubic((root_left, 0.0), (root_left + 0.55 * (neck_left - root_left), 0.0),
+               (neck_left, 0.35 * neck_height), (neck_left, neck_height),
+               samples, include_start=False),
+        _cubic((neck_left, neck_height), (neck_left - spread, head_height),
+               (neck_right + spread, head_height), (neck_right, neck_height),
+               samples, include_start=False),
+        _cubic((neck_right, neck_height), (neck_right, 0.35 * neck_height),
+               (root_right + 0.55 * (neck_right - root_right), 0.0), (root_right, 0.0),
+               samples, include_start=False),
+        np.array([[length, 0.0]]),
+    ]
+    profile = np.vstack(parts)
+    if not LineString(profile).is_simple:
+        raise PuzzleError(
+            f"Knob profile self-intersects on a {length:g} mm edge with neck {neck:g} mm, "
+            f"height {height:g} mm and undercut {undercut:g} mm; reduce --tab-undercut-mm "
+            "or --tab-size")
+    return profile
+
+
+def knob_interference(profile: np.ndarray) -> float:
+    """Measure a profile's real interference per side, in millimetres.
+
+    The number the joint is actually built to is not a control point but a
+    property of the finished curve: how far the widest part of the knob exceeds
+    the narrowest part it has to pass through on the way in.  Measuring it back
+    off the sampled polyline is what keeps ``--tab-undercut-mm`` honest if the
+    control points above are ever retuned.
+    """
+    profile = np.asarray(profile, dtype=float)
+    peak = int(np.argmax(profile[:, 1]))
+    left, right = profile[:peak + 1], profile[peak:][::-1]
+    if profile[peak, 1] <= 0:
+        return 0.0
+    levels = np.linspace(0.0, profile[peak, 1], 256)
+    left_x = np.interp(levels, left[:, 1], left[:, 0])
+    right_x = np.interp(levels, right[:, 1], right[:, 0])
+    width = right_x - left_x
+    throat = np.minimum.accumulate(width)
+    return float(np.max(width - throat) / 2)
+
+
+def _solve_head_spread(neck_left, neck_right, neck_height, head_height,
+                       undercut, neck, samples):
+    """Find the head control offset that produces exactly ``undercut`` per side."""
+    if undercut <= 0:
+        return 0.0
+    limit = 4.0 * neck
+
+    def overhang(spread):
+        curve = _cubic((neck_left, neck_height), (neck_left - spread, head_height),
+                       (neck_right + spread, head_height), (neck_right, neck_height),
+                       samples, include_start=True)
+        return neck_left - float(curve[:, 0].min())
+
+    if overhang(limit) < undercut:
+        raise PuzzleError(
+            f"An undercut of {undercut:g} mm does not fit on a knob with a {neck:g} mm neck; "
+            "reduce --tab-undercut-mm or raise --tab-neck")
+    low, high = 0.0, limit
+    for _ in range(60):
+        middle = (low + high) / 2
+        if overhang(middle) < undercut:
+            low = middle
+        else:
+            high = middle
+    return high
+
+
+# --------------------------------------------------------------------------
+# Cut curves
+# --------------------------------------------------------------------------
+
+def edge_curve(start, end, rng, *, size, neck, undercut,
+               samples=MINIMUM_BEZIER_SAMPLES) -> LineString:
+    """One interior grid edge, carrying one knob, placed in the model plane.
+
+    The two endpoints are written back exactly as supplied.  They are lattice
+    nodes shared with the three edges that meet there, and a node reproduced by
+    arithmetic instead of copied lands a bit away from its neighbours often
+    enough to matter: ``polygonize`` then fails to close that corner and the two
+    pieces either side of the edge come out merged into one.
+    """
+    start = np.asarray(start, dtype=float)
+    end = np.asarray(end, dtype=float)
+    delta = end - start
+    length = float(np.hypot(*delta))
+    if length <= 0:
+        raise PuzzleError("A grid edge has zero length")
+    direction = delta / length
+    normal = np.array([-direction[1], direction[0]])
+
+    flip = 1.0 if rng.random() < 0.5 else -1.0
+    scale = 1.0 + rng.uniform(-TAB_SIZE_JITTER, TAB_SIZE_JITTER)
+    shift = rng.uniform(-TAB_POSITION_JITTER, TAB_POSITION_JITTER) * length
+    profile = knob_profile(length, neck * length, size * length * scale, undercut,
+                           centre=length / 2 + shift, samples=samples)
+    points = start + profile[:, 0:1] * direction + (profile[:, 1:2] * flip) * normal
+    points[0], points[-1] = start, end
+    return LineString(points)
+
+
+def grid_nodes(grid: Grid):
+    """The lattice every cut endpoint is taken from, computed exactly once."""
+    xs = [col * grid.cell_width for col in range(grid.cols + 1)]
+    ys = [row * grid.cell_height for row in range(grid.rows + 1)]
+    xs[-1], ys[-1] = grid.width, grid.height
+    return xs, ys
+
+
+def cut_curves(grid: Grid, rng, *, size, neck, undercut,
+               samples=MINIMUM_BEZIER_SAMPLES) -> list[LineString]:
+    """Every interior cut of the puzzle, one LineString per edge segment.
+
+    One curve per shared edge, used by both pieces that meet on it, is what
+    makes the two halves of a joint the same shape by construction rather than
+    by a tolerance.
+    """
+    xs, ys = grid_nodes(grid)
+    curves = []
+    for col in range(1, grid.cols):
+        for row in range(grid.rows):
+            curves.append(edge_curve((xs[col], ys[row]), (xs[col], ys[row + 1]), rng,
+                                     size=size, neck=neck, undercut=undercut, samples=samples))
+    for row in range(1, grid.rows):
+        for col in range(grid.cols):
+            curves.append(edge_curve((xs[col], ys[row]), (xs[col + 1], ys[row]), rng,
+                                     size=size, neck=neck, undercut=undercut, samples=samples))
+    return curves
+
+
+def floor_polygons(layout: Layout, curves, clearance: float, footprint) -> list[Polygon]:
+    """Piece footprints for the floor slab, in the layout's order, gap included.
+
+    The gap is subtracted as one band centred on the interior cuts rather than
+    by shrinking each piece, so the outer edge of the map keeps its exact
+    dimensions and every joint gets the same clearance from both sides.  The
+    footprint is then what clips each piece, so a piece on an irregular outline
+    keeps the map's own edge on one side and a jigsaw edge on the others.
+    """
+    grid = layout.grid
+    outline = box(0.0, 0.0, grid.width, grid.height)
+    network = unary_union([outline.boundary, MultiLineString(curves)])
+    faces = [face for face in polygonize(network) if face.area > 1e-9]
+    if len(faces) != grid.rows * grid.cols:
+        raise PuzzleError(
+            f"Cut curves enclosed {len(faces)} regions, not the {grid.rows * grid.cols} "
+            "the grid has; this means two knobs overlapped -- reduce --tab-size or "
+            "--tab-undercut-mm")
+    gap = unary_union(curves).buffer(clearance / 2, cap_style="square", join_style="round",
+                                     quad_segs=8) if clearance > 0 else None
+    ordered = []
+    for row, col in layout.cells:
+        centre = shapely.Point((col + 0.5) * grid.cell_width, (row + 0.5) * grid.cell_height)
+        matches = [face for face in faces if face.contains(centre)]
+        if len(matches) != 1:
+            raise PuzzleError(
+                f"Piece at row {row}, column {col} matched {len(matches)} cut regions")
+        piece = matches[0] if gap is None else matches[0].difference(gap)
+        piece = piece.intersection(footprint)
+        if piece.geom_type != "Polygon" or piece.is_empty:
+            raise PuzzleError(
+                f"Piece {piece_label(row, col)} came out as {piece.geom_type} once the "
+                f"{clearance:g} mm clearance and the map's own outline were taken off it; "
+                "reduce --clearance-mm or raise --min-piece-fill")
+        ordered.append(piece)
+    return ordered
+
+
+# --------------------------------------------------------------------------
+# 3MF input
+# --------------------------------------------------------------------------
+
+@dataclass
+class SourceProject:
+    """Everything read out of the input 3MF."""
+
+    path: Path
+    meshes: list                      # (member object id, vertices, triangles)
+    object_member: str
+    colors: list
+    part_names: list
+    extruders: list
+    title: str
+    description: str
+    designer: str
+    copyright: str
+    plate_name: str
+    transform: str
+    profile: "PrintProfile"
+    project: bytes
+    thumbnail: bytes | None
+    passthrough: dict                 # archive members copied unchanged
+
+
+def read_project(path: Path) -> SourceProject:
+    """Load the four material meshes and the project settings of a map 3MF."""
+    with zipfile.ZipFile(path) as archive:
+        names = set(archive.namelist())
+        wrapper = etree.fromstring(archive.read("3D/3dmodel.model"))
+        core = f"{{{CORE}}}"
+        components = wrapper.findall(f".//{core}component")
+        if not components:
+            raise PuzzleError(f"{path} has no component objects; it is not a map project")
+        member = components[0].get(f"{{{PROD}}}path", "").lstrip("/")
+        if not member or member not in names:
+            raise PuzzleError(f"{path} references a mesh member {member!r} it does not contain")
+        if len({component.get(f"{{{PROD}}}path") for component in components}) != 1:
+            raise PuzzleError(f"{path} spreads its materials over several mesh members")
+        item = wrapper.find(f".//{core}item")
+        transform = item.get("transform", IDENTITY) if item is not None else IDENTITY
+
+        def metadata(name, default=""):
+            found = wrapper.find(f"{core}metadata[@name='{name}']")
+            return found.text if found is not None and found.text else default
+
+        settings = etree.fromstring(archive.read("Metadata/model_settings.config"))
+        parts = settings.findall(".//object/part")
+        part_names, extruders = [], []
+        for part in parts:
+            name = part.find("metadata[@key='name']")
+            extruder = part.find("metadata[@key='extruder']")
+            part_names.append(name.get("value") if name is not None else "")
+            extruders.append(extruder.get("value") if extruder is not None else "1")
+        plate = settings.find(".//plate/metadata[@key='plater_name']")
+
+        with archive.open(member) as handle:
+            meshes, colors = read_meshes(handle)
+        if len(meshes) != len(part_names):
+            raise PuzzleError(
+                f"{path} declares {len(part_names)} parts but carries {len(meshes)} meshes")
+
+        passthrough = {}
+        for name in ("Metadata/generation_command.json", "Metadata/slice_info.config"):
+            if name in names:
+                passthrough[name] = archive.read(name)
+        settings_member = "Metadata/project_settings.config"
+        project = archive.read(settings_member) if settings_member in names else b""
+        profile = print_profile(project)
+        thumbnail = archive.read("Metadata/plate_1.png") if "Metadata/plate_1.png" in names else None
+
+    return SourceProject(
+        path=path, meshes=meshes, object_member=member, colors=colors,
+        part_names=part_names, extruders=extruders,
+        title=metadata("Title", path.stem), description=metadata("Description"),
+        designer=metadata("Designer"), copyright=metadata("Copyright"),
+        plate_name=plate.get("value") if plate is not None else metadata("Title", path.stem),
+        transform=transform, profile=profile, project=project, thumbnail=thumbnail,
+        passthrough=passthrough,
+    )
+
+
+@dataclass(frozen=True)
+class PrintProfile:
+    """The machine measurements the cut has to obey, read off the input project.
+
+    None of these are the puzzle's to choose.  The project was resolved against
+    an installed Bambu profile for a particular nozzle, layer height, wall count
+    and plate, and every bound this script defends follows from those rather
+    than from a constant written here:
+
+    ``clearance``      two outer-wall line widths -- one extrusion of squish
+                       allowance on each side of the seam. Every piece prints at
+                       once, side by side, and the puzzle has to come off the
+                       plate in pieces rather than as one tile.
+    ``vertical``       two layers. A knob lies under its neighbour's surface
+                       tier, so the joint needs clearance in Z as well: one
+                       layer of air, and one for the sag of the layer the
+                       neighbour bridges across the gap.
+    ``crumb``          one nozzle-width square at one layer height -- the
+                       smallest thing the printer can put down, and so the line
+                       between Boolean debris and a real loose fragment. Shared
+                       with ``validate_3mf`` through ``mesh_precision``.
+    ``narrowest knob`` the walls alone must fit across a knob's throat, twice
+                       ``wall_loops`` of wall line width.
+    ``interference``   half a nozzle: a few times the machine's own dimensional
+                       error, so the lock is something the pieces feel rather
+                       than something lost in tolerance.
+    ``undercut``       the clearance plus that interference. The two halves of a
+                       joint are each eroded by half the gap, so a knob's head
+                       has to out-reach its neck by the whole gap before any of
+                       the overhang is left to lock with.
+    ``plate``          the printable area, less what the configured brim needs.
+    ``brim``           kept only where a brim loop cannot fit between two
+                       pieces; a brim that reaches across the seam welds the
+                       first layer of the whole puzzle together.
+    ``knob facets``    chords no coarser than half a nozzle, so the only curved
+                       surface in the model is not the thing that shows.
+    """
+
+    nozzle_mm: float
+    layer_height_mm: float
+    wall_loops: int
+    wall_line_width_mm: float
+    outer_wall_line_width_mm: float
+    plate_mm: tuple
+    brim_width_mm: float
+    brim_object_gap_mm: float
+    print_sequence: str
+
+    @property
+    def clearance_mm(self) -> float:
+        return 2 * self.outer_wall_line_width_mm
+
+    @property
+    def interference_mm(self) -> float:
+        return self.nozzle_mm / 2
+
+    @property
+    def vertical_clearance_mm(self) -> float:
+        return 2 * self.layer_height_mm
+
+    @property
+    def brim_margin_mm(self) -> float:
+        return self.brim_width_mm + self.brim_object_gap_mm if self.brim_width_mm else 0.0
+
+    def brim_bridges_gap(self, clearance_mm: float) -> bool:
+        """Whether a brim loop fits in the gap between two neighbouring pieces.
+
+        A brim is laid outward from each object's first layer and clipped back
+        from every other object by ``brim_object_gap``.  Where what is left
+        between two pieces is still an extrusion wide, the slicer fills it, and
+        the first layer of the print welds the puzzle into a tile.
+        """
+        if not self.brim_width_mm:
+            return False
+        return (clearance_mm - 2 * self.brim_object_gap_mm) >= self.outer_wall_line_width_mm
+
+    @property
+    def undercut_mm(self) -> float:
+        return self.clearance_mm + self.interference_mm
+
+    @property
+    def crumb_mm3(self) -> float:
+        return minimum_printable_shell_volume_mm3(self.nozzle_mm, self.layer_height_mm)
+
+    @property
+    def narrowest_knob_neck_mm(self) -> float:
+        return 2 * self.wall_loops * self.wall_line_width_mm
+
+    def knob_samples(self, span_mm: float) -> int:
+        chord = self.nozzle_mm / 2
+        return int(min(MAXIMUM_BEZIER_SAMPLES,
+                       max(MINIMUM_BEZIER_SAMPLES, math.ceil(span_mm / chord))))
+
+    def complete(self) -> bool:
+        return all(value > 0 for value in (self.nozzle_mm, self.layer_height_mm,
+                                           self.wall_line_width_mm,
+                                           self.outer_wall_line_width_mm, *self.plate_mm)) \
+            and self.wall_loops > 0
+
+
+def print_profile(settings: bytes | None) -> PrintProfile:
+    """Read the resolved print profile out of a project's settings."""
+    empty = PrintProfile(0.0, 0.0, 0, 0.0, 0.0, (0.0, 0.0), 0.0, 0.0, "")
+    if not settings:
+        return empty
+    try:
+        resolved = json.loads(settings)
+    except ValueError:
+        return empty
+
+    def measure(key, limit=100.0, default=0.0):
+        value = resolved.get(key)
+        if isinstance(value, list):
+            value = value[0] if value else None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return number if math.isfinite(number) and 0 <= number < limit else default
+
+    nozzle = measure("nozzle_diameter", 2.0)
+    # The walls across a knob's throat are inner walls once there is more than
+    # one loop; fall back through the profile's other widths to the nozzle.
+    width = (measure("inner_wall_line_width", 4.0) or measure("line_width", 4.0)
+             or measure("outer_wall_line_width", 4.0) or nozzle)
+    # The wall that faces the gap between two pieces is the outer one.
+    outer = (measure("outer_wall_line_width", 4.0) or measure("line_width", 4.0)
+             or width)
+    corners = []
+    for corner in resolved.get("printable_area") or []:
+        try:
+            x, y = str(corner).lower().split("x")
+            corners.append((float(x), float(y)))
+        except ValueError:
+            corners = []
+            break
+    plate = ((max(x for x, _ in corners) - min(x for x, _ in corners),
+              max(y for _, y in corners) - min(y for _, y in corners))
+             if len(corners) >= 3 else (0.0, 0.0))
+    brimming = str(resolved.get("brim_type", "no_brim")) != "no_brim"
+    return PrintProfile(nozzle, measure("layer_height", 2.0),
+                        int(measure("wall_loops", 100.0, 0.0)), width, outer, plate,
+                        measure("brim_width") if brimming else 0.0,
+                        measure("brim_object_gap"),
+                        str(resolved.get("print_sequence", "")))
+
+
+def read_meshes(handle):
+    """Stream one 3MF mesh member into numpy arrays, one entry per object."""
+    core = f"{{{CORE}}}"
+    material = f"{{{MAT}}}"
+    meshes, colors = [], []
+    vertices, triangles, current = [], [], None
+    events = ("start", "end")
+    tags = (f"{core}object", f"{core}vertex", f"{core}triangle", f"{material}color")
+    for event, element in etree.iterparse(handle, events=events, tag=tags):
+        tag = element.tag.rsplit("}", 1)[1]
+        if event == "start":
+            if tag == "object":
+                current = element.get("id")
+                vertices, triangles = [], []
+            continue
+        if tag == "vertex":
+            vertices.append((element.get("x"), element.get("y"), element.get("z")))
+        elif tag == "triangle":
+            triangles.append((element.get("v1"), element.get("v2"), element.get("v3")))
+        elif tag == "color":
+            colors.append((element.get("color") or "")[:7])
+        elif tag == "object":
+            meshes.append((current, np.array(vertices, dtype=np.float64),
+                           np.array(triangles, dtype=np.int64)))
+            vertices, triangles = [], []
+        element.clear()
+        while element.getprevious() is not None:
+            del element.getparent()[0]
+    return meshes, colors
+
+
+# --------------------------------------------------------------------------
+# Cutting
+# --------------------------------------------------------------------------
+
+def to_manifold(vertices, triangles):
+    """Load one material mesh at full precision.
+
+    ``Mesh64`` rather than ``Mesh``: the generator's Boolean seam repairs are
+    deliberately sub-micron, and truncating those vertices to float32 merges
+    distinct ones back together and recreates the zero-area triangles the
+    export cleanup removed.  ``build_map_meshes.solid`` takes the same care for
+    the same reason.
+    """
+    import manifold3d as md
+    mesh = md.Mesh64(np.ascontiguousarray(vertices, dtype=np.float64),
+                     np.ascontiguousarray(triangles, dtype=np.uint64))
+    solid = md.Manifold(mesh)
+    if solid.status() != md.Error.NoError:
+        raise PuzzleError(f"A material mesh did not load as a solid: {solid.status()}")
+    return solid
+
+
+def derive_foundation(solids) -> int:
+    """The filament carrying the substrate is the one that reaches the plate.
+
+    Which index that is depends on ``--foundation-color`` at generation time, so
+    reading it off the geometry is more robust than assuming the default, and it
+    is unambiguous: every other material is a surface standing on this one.
+    """
+    reaching = [index for index, solid in enumerate(solids)
+                if solid.bounding_box()[2] <= 1e-6]
+    if len(reaching) != 1:
+        raise PuzzleError(
+            f"{len(reaching)} of this project's {len(solids)} filaments reach the plate, so the "
+            "substrate cannot be identified; pass --foundation-material")
+    return reaching[0]
+
+
+def derive_floor(solids, foundation: int, layer_height_mm: float) -> float:
+    """The highest plane the jigsaw joint can hide below, in millimetres.
+
+    A finished project records no ``base_mm``, and it does not need to. What the
+    cut actually requires is a plane with only substrate below it, and the mesh
+    states that directly: the lowest point of any other filament is where the
+    map's colour begins. One layer below that is the same shape of bound the
+    generator sets for itself in ``crossings.minimum_crossing_floor_mm``, and it
+    keeps the cut plane off a colour skin's underside rather than grazing it --
+    which is what sheds Boolean debris.
+
+    The result is a derived floor, not the generator's own: it lands wherever
+    the map's lowest colour happens to be, and is usually close to ``base_mm``.
+    ``--floor-mm`` overrides it for a map whose base is known.
+    """
+    others = [solid.bounding_box()[2] for index, solid in enumerate(solids)
+              if index != foundation and not solid.is_empty()]
+    if not others:
+        raise PuzzleError(
+            "This project has only one filament, so there is no colour skin to place the "
+            "floor plane below; pass --floor-mm")
+    floor = min(others) - float(layer_height_mm)
+    if floor <= float(layer_height_mm):
+        raise PuzzleError(
+            f"The lowest colour skin sits at z={min(others):g} mm, leaving no room for a joint "
+            f"below it at {layer_height_mm:g} mm layers")
+    return floor
+
+
+def section_polygon(section) -> Polygon:
+    """One Manifold cross section as a shapely geometry, holes included.
+
+    Manifold states a hole by winding it the other way round, so the rings are
+    sorted by signed area rather than assumed to be a simple outline: a chunk
+    cut around a park or a basin is an ordinary polygon for this purpose and
+    must not come back as a solid blob.
+    """
+    shells, holes = [], []
+    for ring in section.to_polygons():
+        ring = np.asarray(ring, dtype=float)
+        if len(ring) < 3:
+            continue
+        x, y = ring[:, 0], ring[:, 1]
+        area = 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+        (shells if area > 0 else holes).append(Polygon(ring))
+    if not shells:
+        raise PuzzleError("A cross section of the model enclosed no area")
+    outline = unary_union(shells)
+    return outline.difference(unary_union(holes)) if holes else outline
+
+
+def measure_footprint(solid, floor_mm: float, samples: int = 5):
+    """The model's own outline below the floor, and proof it is a prism there.
+
+    The outline is whatever the generator produced -- a rectangular crop, or the
+    street-following polygon a multi-plate plan cut -- so it is measured rather
+    than assumed.  What the puzzle actually needs is not that the outline be
+    any particular shape but that it not *change* with depth: the knobs are
+    carved out of this slab, and a slab that narrows or grows partway down would
+    put them in geometry that is carrying map detail.  Slicing at several depths
+    and requiring one constant area is that check, and it makes no assumption
+    about the shape at all.
+    """
+    heights = np.linspace(0.15 * floor_mm, 0.85 * floor_mm, samples)
+    sections = [solid.slice(float(height)) for height in heights]
+    areas = [float(section.area()) for section in sections]
+    if min(areas) <= 0:
+        raise PuzzleError(f"The model encloses no area below its {floor_mm:g} mm floor")
+    if max(areas) - min(areas) > FOOTPRINT_AREA_TOLERANCE * max(areas):
+        raise PuzzleError(
+            f"The floor slab measures between {min(areas):g} and {max(areas):g} mm2 over the "
+            f"depths sampled below {floor_mm:g} mm, so it is not the constant prism this cut "
+            "assumes. Lower --floor-mm.")
+    return section_polygon(sections[len(sections) // 2])
+
+
+def validate_floor(solids, floor_mm: float, foundation: int):
+    """Confirm ``z < floor_mm`` really is a solid slab of one filament.
+
+    The whole two-level cut rests on this.  If a later generator change lets a
+    tunnel floor or a colour skin dip below the base, the knobs would be carved
+    out of geometry that is also carrying map detail, and the run must stop
+    rather than quietly cut a hole in a road.
+    """
+    for index, solid in enumerate(solids):
+        low = solid.bounding_box()[2]
+        if index == foundation:
+            if low > 1e-6:
+                raise PuzzleError(
+                    f"The foundation material starts at z={low:g} mm, so there is no floor slab "
+                    "to cut a puzzle out of")
+            continue
+        if low < floor_mm - 1e-6:
+            raise PuzzleError(
+                f"Material {index} reaches down to z={low:g} mm, below the {floor_mm:g} mm floor; "
+                f"pass --floor-mm {low:g} or smaller")
+    return measure_footprint(solids[foundation], floor_mm)
+
+
+def split_grid(solid, grid: Grid, origin, clearance: float):
+    """Split one solid on the rectangular grid, dropping the clearance slivers.
+
+    Plane splits rather than a Boolean per piece: the surface meshes here carry
+    millions of triangles, and a half-space split costs a fraction of a general
+    intersection against a prism of the same extent.  Splitting hierarchically
+    also means each later cut runs against a solid that is already a fraction
+    of the original.
+    """
+    half = clearance / 2
+    columns, rest = [], solid
+    for col in range(1, grid.cols):
+        x = origin[0] + col * grid.cell_width
+        left, rest = rest.split_by_plane([-1.0, 0.0, 0.0], -(x - half))
+        _, rest = rest.split_by_plane([-1.0, 0.0, 0.0], -(x + half))
+        columns.append(left)
+    columns.append(rest)
+
+    pieces = [[None] * grid.cols for _ in range(grid.rows)]
+    for col, column in enumerate(columns):
+        rest = column
+        for row in range(1, grid.rows):
+            y = origin[1] + row * grid.cell_height
+            lower, rest = rest.split_by_plane([0.0, -1.0, 0.0], -(y - half))
+            _, rest = rest.split_by_plane([0.0, -1.0, 0.0], -(y + half))
+            pieces[row - 1][col] = lower
+        pieces[grid.rows - 1][col] = rest
+    return pieces
+
+
+def drop_negligible_shells(solid, crumb_mm3: float):
+    """Remove the CSG debris a plane split leaves behind.
+
+    Cutting a mesh with a plane that grazes its existing geometry sheds
+    disconnected shells of six triangles and no volume.  They are judged by the
+    bound `validate_3mf` uses on the finished assembly, so the puzzle and the
+    map agree about what counts as a loose piece of print rather than each
+    keeping its own tolerance.
+    """
+    import manifold3d as md
+    parts = solid.decompose()
+    if len(parts) <= 1:
+        return solid, 0, len(parts)
+    kept = [part for part in parts if part.volume() > crumb_mm3]
+    if len(kept) == len(parts):
+        return solid, 0, len(parts)
+    if not kept:
+        return md.Manifold(), len(parts), 0
+    return md.Manifold.compose(kept), len(parts) - len(kept), len(kept)
+
+
+def piece_rectangles(layout: Layout, low, clearance: float) -> list[Polygon]:
+    """Each piece's own cell, inset by half the clearance on its interior sides.
+
+    This is the footprint of the piece above the floor plane, and the part of
+    its floor that has its own surface tier standing on it.  Everything of a
+    piece outside this rectangle is knob, and lies under a *neighbour's* surface.
+    """
+    grid = layout.grid
+    half = clearance / 2
+    rectangles = []
+    for row, col in layout.cells:
+        rectangles.append(box(
+            low[0] + col * grid.cell_width + (half if col else 0.0),
+            low[1] + row * grid.cell_height + (half if row else 0.0),
+            low[0] + (col + 1) * grid.cell_width - (half if col + 1 < grid.cols else 0.0),
+            low[1] + (row + 1) * grid.cell_height - (half if row + 1 < grid.rows else 0.0)))
+    return rectangles
+
+
+def floor_prisms(slab, polygons, rectangles, floor_mm: float, recess_mm: float):
+    """Carve the floor slab into knobbed pieces, recessing every knob.
+
+    A knob reaches under the neighbour it locks into, and that neighbour's
+    surface tier starts at the floor plane.  Extruded to full floor height the
+    knob's top face would therefore lie flat against the underside of the
+    neighbour's surface, and the printer would lay that surface straight onto
+    it: two pieces welded across a joint designed to come apart.  So the knob
+    stops ``recess_mm`` short of the plane and the neighbour bridges the gap,
+    which is a short bridge anchored on three sides and the only overhang the
+    cut creates.
+
+    Cheap despite being a general Boolean, because ``slab`` is a box: the
+    expensive surface geometry was left on the other side of the floor plane.
+    """
+    import manifold3d as md
+    prisms = []
+    for index, (polygon, rectangle) in enumerate(zip(polygons, rectangles)):
+        # Manifold reads winding, shapely does not guarantee it, and a
+        # clockwise ring under FillRule.Positive yields an empty cross section
+        # -- which then silently empties the union it was meant to complete
+        # rather than failing anywhere near the cause.
+        seated = polygon.intersection(rectangle)
+        knobs = polygon.difference(rectangle)
+        parts = []
+        for shape, height in ((seated, floor_mm), (knobs, floor_mm - recess_mm)):
+            if shape.is_empty or height <= 0:
+                continue
+            parts.append(cross_section(shape).extrude(height + 1.0).translate([0.0, 0.0, -1.0]))
+        if not parts:
+            raise PuzzleError(f"Floor piece {index} has no footprint to extrude")
+        prism = slab ^ md.Manifold.batch_boolean(parts, md.OpType.Add)
+        if prism.is_empty() or prism.volume() <= 0:
+            raise PuzzleError(
+                f"Floor piece {index} carved out empty against a {slab.volume():g} mm3 slab; "
+                f"its footprint measures {polygon.area:g} mm2")
+        prisms.append(prism)
+    return prisms
+
+
+def cross_section(shape):
+    """One shapely polygon or multipolygon as a Manifold cross section.
+
+    Manifold reads winding and shapely does not guarantee it; a clockwise ring
+    under ``FillRule.Positive`` yields an empty section, which then silently
+    empties whatever it was meant to build rather than failing near the cause.
+    """
+    import manifold3d as md
+    rings = []
+    for polygon in shapely.get_parts(shape):
+        if polygon.geom_type != "Polygon" or polygon.is_empty:
+            continue
+        oriented = shapely.geometry.polygon.orient(polygon, 1.0)
+        rings.append(np.asarray(oriented.exterior.coords)[:-1, :2].tolist())
+        rings += [np.asarray(ring.coords)[:-1, :2].tolist() for ring in oriented.interiors]
+    if not rings:
+        raise PuzzleError("A piece footprint holds no polygon to extrude")
+    return md.CrossSection(rings, md.FillRule.Positive)
+
+
+# --------------------------------------------------------------------------
+# 3MF output
+# --------------------------------------------------------------------------
+
+def piece_label(row: int, col: int) -> str:
+    """Spreadsheet-style label, so a piece can be found in the preview."""
+    letters = ""
+    index = col
+    while True:
+        letters = chr(ord("A") + index % 26) + letters
+        index = index // 26 - 1
+        if index < 0:
+            break
+    return f"{letters}{row + 1}"
+
+
+def write_project(output: Path, source: SourceProject, pieces, grid: Grid, plan: dict,
+                  project: bytes, thumbnail: bytes | None = None):
+    """Write one 3MF holding every piece as its own printable object."""
+    identity = f"{source.title}|{grid.rows}x{grid.cols}|{plan['seed']}"
+    uid = lambda name: str(uuid.uuid5(uuid.NAMESPACE_URL, "3d-nyc/puzzle/" + identity + "/" + name))
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", output.stem).strip("._") or "nyc_puzzle"
+    member = f"3D/Objects/{slug}.model"
+
+    mesh_ids = {}
+    next_id = 1
+    for piece in pieces:
+        for material, _ in piece["meshes"]:
+            mesh_ids[(piece["index"], material)] = next_id
+            next_id += 1
+
+    resources, build = [], []
+    for piece in pieces:
+        object_id = PIECE_ID_BASE + piece["index"]
+        components = "".join(
+            f'<component objectid="{mesh_ids[(piece["index"], material)]}" p:path="/{member}" '
+            f'transform="{IDENTITY}" p:UUID="{uid(f"component/{piece['index']}/{material}")}"/>\n'
+            for material, _ in piece["meshes"])
+        resources.append(
+            f'<object id="{object_id}" type="model" name="{escape(piece["name"])}" '
+            f'p:UUID="{uid(f"piece/{piece['index']}")}"><components>\n{components}</components></object>')
+        build.append(
+            f'<item objectid="{object_id}" transform="{source.transform}" printable="1" '
+            f'p:UUID="{uid(f"instance/{piece['index']}")}"/>')
+
+    wrapper = f'''<?xml version="1.0" encoding="UTF-8"?>
+<model xmlns="{CORE}" xmlns:p="{PROD}" unit="millimeter" requiredextensions="p" xml:lang="en-US">
+<metadata name="Application">BambuStudio-02.08.02.61</metadata><metadata name="BambuStudio:3mfVersion">1</metadata>
+<metadata name="Title">{escape(source.title)} - {grid.pieces} piece puzzle</metadata>
+<metadata name="Description">{escape(source.description)} Cut into {grid.rows} x {grid.cols} interlocking pieces; the jigsaw joint is below the {plan['floor_mm']:g} mm floor and the map above it is cut on straight lines.</metadata>
+<metadata name="Designer">{escape(source.designer)}</metadata>
+<metadata name="Copyright">{escape(source.copyright)}</metadata>
+<resources>
+''' + "\n".join(resources) + f'''
+</resources>
+<build p:UUID="{uid('build')}">
+''' + "\n".join(build) + '''
+</build></model>'''
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6,
+                         allowZip64=True) as archive:
+        archive.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="json" ContentType="application/json"/></Types>')
+        archive.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>')
+        archive.writestr("3D/3dmodel.model", wrapper)
+        archive.writestr("3D/_rels/3dmodel.model.rels", f'<?xml version="1.0" encoding="UTF-8"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Target="/{member}" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/></Relationships>')
+        with archive.open(member, "w", force_zip64=True) as raw:
+            stream = io.TextIOWrapper(raw, encoding="utf-8", newline="\n")
+            stream.write(f'<?xml version="1.0" encoding="UTF-8"?><model xmlns="{CORE}" xmlns:p="{PROD}" xmlns:m="{MAT}" unit="millimeter" requiredextensions="p m"><metadata name="BambuStudio:3mfVersion">1</metadata><resources><m:colorgroup id="1008">')
+            for color in source.colors:
+                stream.write(f'<m:color color="{color}FF"/>')
+            stream.write("</m:colorgroup>")
+            for piece in pieces:
+                for material, mesh in piece["meshes"]:
+                    write_mesh_object(stream, mesh_ids[(piece["index"], material)], material,
+                                      f'{piece["name"]} - {source.part_names[material]}',
+                                      mesh, uid)
+            stream.write("</resources><build/></model>")
+            stream.flush()
+            stream.detach()
+        archive.writestr("Metadata/model_settings.config",
+                         model_settings(source, pieces, mesh_ids, output.name))
+        for name, payload in source.passthrough.items():
+            archive.writestr(name, payload)
+        archive.writestr("Metadata/project_settings.config", project)
+        if thumbnail:
+            archive.writestr("Metadata/plate_1.png", thumbnail)
+        archive.writestr("Metadata/puzzle_plan.json", json.dumps(plan, indent=2))
+    return mesh_ids
+
+
+def write_mesh_object(stream, object_id, material, name, mesh, uid):
+    stream.write(f'<object id="{object_id}" name="{escape(name)}" type="model" pid="1008" '
+                 f'pindex="{material}" p:UUID="{uid(f"mesh/{object_id}")}"><mesh><vertices>\n')
+    for start in range(0, len(mesh.vertices), 10000):
+        stream.writelines(f'<vertex x="{x:.17g}" y="{y:.17g}" z="{z:.17g}"/>\n'
+                          for x, y, z in mesh.vertices[start:start + 10000])
+    stream.write("</vertices><triangles>\n")
+    for start in range(0, len(mesh.faces), 10000):
+        stream.writelines(f'<triangle v1="{int(a)}" v2="{int(b)}" v3="{int(c)}"/>\n'
+                          for a, b, c in mesh.faces[start:start + 10000])
+    stream.write("</triangles></mesh></object>\n")
+
+
+def model_settings(source: SourceProject, pieces, mesh_ids, source_file: str) -> bytes:
+    """One Bambu object per piece, each still carrying its own four filaments."""
+    root = etree.Element("config")
+    for piece in pieces:
+        object_id = PIECE_ID_BASE + piece["index"]
+        node = etree.SubElement(root, "object", id=str(object_id))
+        etree.SubElement(node, "metadata", key="name", value=piece["name"])
+        etree.SubElement(node, "metadata", key="extruder", value="1")
+        etree.SubElement(node, "metadata",
+                         face_count=str(sum(len(mesh.faces) for _, mesh in piece["meshes"])))
+        for material, mesh in piece["meshes"]:
+            part = etree.SubElement(node, "part", id=str(mesh_ids[(piece["index"], material)]),
+                                    subtype="normal_part")
+            for key, value in (("name", source.part_names[material]),
+                               ("matrix", "1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"),
+                               ("source_file", source_file),
+                               ("source_object_id", str(piece["index"])),
+                               ("source_volume_id", str(material)),
+                               ("extruder", source.extruders[material])):
+                etree.SubElement(part, "metadata", key=key, value=value)
+            etree.SubElement(part, "mesh_stat", face_count=str(len(mesh.faces)),
+                             edges_fixed="0", degenerate_facets="0", facets_removed="0",
+                             facets_reversed="0", backwards_edges="0")
+    plate = etree.SubElement(root, "plate")
+    for key, value in (("plater_id", "1"), ("plater_name", f"{source.plate_name} puzzle"),
+                       ("locked", "false"), ("filament_map_mode", "Auto For Flush"),
+                       ("filament_maps", "1 1 1 1"), ("filament_volume_maps", "0 0 0 0")):
+        etree.SubElement(plate, "metadata", key=key, value=value)
+    for piece in pieces:
+        instance = etree.SubElement(plate, "model_instance")
+        for key, value in (("object_id", str(PIECE_ID_BASE + piece["index"])),
+                           ("instance_id", "0"), ("identify_id", str(piece["index"] + 1))):
+            etree.SubElement(instance, "metadata", key=key, value=value)
+    assemble = etree.SubElement(root, "assemble")
+    for piece in pieces:
+        etree.SubElement(assemble, "assemble_item", object_id=str(PIECE_ID_BASE + piece["index"]),
+                         instance_id="0", transform=source.transform, offset="0 0 0")
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8", pretty_print=True)
+
+
+def write_manifest(path: Path, plan: dict):
+    """The cut's own record, beside the 3MF it describes."""
+    path.write_text(json.dumps(plan, indent=2) + "\n")
+
+
+def render_basemap(solids, colors, low, high, pixels_per_mm: float):
+    """A top-down render of the map itself, framed exactly on its footprint.
+
+    The cut is only worth checking against the thing it cuts: whether a seam
+    lands on a tower, whether a knob reaches into the park.  This is the same
+    rasteriser `render_map` uses for a job's preview, driven from the solids in
+    hand and from the model's measured bounds rather than from a job config, so
+    the image covers the footprint one-to-one and the cut can be drawn straight
+    over it in model millimetres.
+    """
+    import render_map
+
+    width, height = float(high[0] - low[0]), float(high[1] - low[1])
+    pixels_x = max(1, int(round(width * pixels_per_mm)))
+    pixels_y = max(1, int(round(height * pixels_per_mm)))
+    soup, tints = [], []
+    for solid, color in zip(solids, colors):
+        mesh = solid.to_mesh64()
+        vertices = np.asarray(mesh.vert_properties[:, :3], np.float32)
+        faces = np.asarray(mesh.tri_verts, np.int64)
+        if not len(faces):
+            continue
+        soup.append(vertices[faces])
+        rgb = np.array([int(color[index:index + 2], 16) / 255 for index in (1, 3, 5)], np.float32)
+        tints.append(np.broadcast_to(rgb, (len(faces), 3)))
+    if not soup:
+        raise PuzzleError("The model has no triangles to render a preview from")
+    # Straight down, less the hair of tilt the camera basis needs to stay
+    # non-degenerate; over the model's own height that is microns of parallax.
+    camera = render_map.camera(-90.0, 89.99,
+                               ((low[0] + high[0]) / 2, (low[1] + high[1]) / 2, 0.0),
+                               width, pixels_x, pixels_y)
+    image = render_map.render(np.ascontiguousarray(np.concatenate(soup)),
+                              np.ascontiguousarray(np.concatenate(tints)), camera)
+    return image
+
+
+def plate_thumbnail(basemap, grid: Grid, polygons, low, longest_edge: int = 2400) -> bytes:
+    """The slicer's plate image, showing the cut rather than the uncut map.
+
+    Bambu Studio shows this next to the plate, and on a puzzle the one thing
+    worth seeing there is where the pieces fall -- so the outlines are drawn
+    into the render rather than the source model's own thumbnail being carried
+    through, which would show an undivided map the project no longer contains.
+    """
+    image = Image.fromarray(basemap).convert("RGB")
+    scale = image.width / grid.width
+    draw = ImageDraw.Draw(image)
+    for polygon in polygons:
+        points = [(round((x - low[0]) * scale, 2), round(image.height - (y - low[1]) * scale, 2))
+                  for x, y in polygon.exterior.coords]
+        draw.line(points, fill=(20, 24, 26), width=max(1, round(scale * 0.5)), joint="curve")
+    if max(image.size) > longest_edge:
+        factor = longest_edge / max(image.size)
+        image = image.resize((round(image.width * factor), round(image.height * factor)),
+                             Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    image.save(buffer, "PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def write_preview(path: Path, grid: Grid, polygons, low, basemap=None):
+    """An SVG of the cut over the map it was cut from, at model scale.
+
+    Nothing is drawn inside a piece.  The preview exists to be checked against
+    the map before a long print -- whether the knobs read as a normal jigsaw,
+    whether a seam crosses something it should not -- and a label in every cell
+    is noise over the only thing worth looking at.
+    """
+    pad = 6.0
+    width, height = grid.width + 2 * pad, grid.height + 2 * pad
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{width:.2f}mm" '
+             f'height="{height:.2f}mm" viewBox="0 0 {width:.2f} {height:.2f}">',
+             f'<rect width="{width:.2f}" height="{height:.2f}" fill="#f4f2ec"/>',
+             f'<g transform="translate({pad:.2f},{height - pad:.2f}) scale(1,-1)">']
+    if basemap is not None:
+        buffer = io.BytesIO()
+        Image.fromarray(basemap).save(buffer, "PNG", optimize=True)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        # Placed flipped back upright inside the y-up group, covering exactly
+        # the footprint the render was framed on.
+        parts.append(f'<g transform="translate(0,{grid.height:.4f}) scale(1,-1)">'
+                     f'<image x="0" y="0" width="{grid.width:.4f}" height="{grid.height:.4f}" '
+                     f'preserveAspectRatio="none" href="data:image/png;base64,{encoded}"/></g>')
+    parts.append('<g fill="none" stroke="#14181a" stroke-width="0.6" stroke-linejoin="round" '
+                 'stroke-opacity="0.85">')
+    for polygon in polygons:
+        coords = " ".join(f"{x - low[0]:.3f},{y - low[1]:.3f}" for x, y in polygon.exterior.coords)
+        parts.append(f'<polygon points="{coords}"/>')
+    parts.append("</g></g></svg>")
+    path.write_text("\n".join(parts) + "\n")
+
+
+# --------------------------------------------------------------------------
+# Validation
+# --------------------------------------------------------------------------
+
+def validate_puzzle(output: Path, source: SourceProject, expected, footprint, *,
+                    clearance_mm: float, vertical_clearance_mm: float, grid: Grid, labels):
+    """Re-read the written 3MF and audit it the way `validate_3mf` audits a map.
+
+    Independent of everything above it: the archive is reopened, the meshes are
+    parsed back out of the serialized XML rather than reused from memory, and
+    the geometry is judged on what a slicer will actually receive.  That is the
+    point of the exercise -- an in-memory solid that never survived
+    serialization intact has not been checked at all.
+
+    The per-piece rules are `validate_3mf`'s own, applied one piece at a time:
+    every material mesh closed, wound consistently, positive in volume and free
+    of degenerate triangles; the piece's four filaments unioning to exactly one
+    printable component with no sealed printable chamber; nothing outside the
+    map's own footprint or below the plate.  The rule it adds is the one that
+    only a puzzle has -- that neighbouring pieces are genuinely separate, held
+    apart by the full clearance, so the plate comes off in pieces.
+    """
+    import manifold3d as md
+
+    separation_mm = min(clearance_mm, vertical_clearance_mm)
+    report = {"model": str(output), "pieces": {}, "clearance_mm": clearance_mm,
+              "knob_recess_mm": vertical_clearance_mm, "required_separation_mm": separation_mm}
+    crumb = expected["crumb_mm3"]
+    with zipfile.ZipFile(output) as archive:
+        corrupt = archive.testzip()
+        if corrupt is not None:
+            raise PuzzleError(f"3MF ZIP integrity check failed for member {corrupt!r}")
+        names = set(archive.namelist())
+        for member, payload in source.passthrough.items():
+            if archive.read(member) != payload:
+                raise PuzzleError(
+                    f"{member} was not carried through from {source.path} unchanged")
+        wrapper = etree.fromstring(archive.read("3D/3dmodel.model"))
+        if wrapper.get("unit") != "millimeter":
+            raise PuzzleError(
+                f"3MF wrapper must use millimeter units; found {wrapper.get('unit')!r}")
+        core = f"{{{CORE}}}"
+        production = f"{{{PROD}}}path"
+        objects = wrapper.findall(f".//{core}object")
+        items = wrapper.findall(f".//{core}item")
+        if len(objects) != grid.pieces or len(items) != grid.pieces:
+            raise PuzzleError(
+                f"3MF declares {len(objects)} objects and {len(items)} build items for a "
+                f"{grid.pieces} piece puzzle")
+        if {item.get("objectid") for item in items} != {obj.get("id") for obj in objects}:
+            raise PuzzleError("3MF build items do not name the objects the wrapper declares")
+        components = wrapper.findall(f".//{core}component")
+        paths = {component.get(production) for component in components}
+        if len(paths) != 1 or None in paths:
+            raise PuzzleError(
+                f"3MF components must reference one shared production object path; found {paths}")
+        member = next(iter(paths)).lstrip("/")
+        if member not in names:
+            raise PuzzleError(f"3MF references a missing object member {member!r}")
+        declared = sorted(int(component.get("objectid")) for component in components)
+        if declared != sorted(expected["mesh_ids"]):
+            raise PuzzleError(
+                f"3MF component ids {declared[:8]}... do not match the {len(expected['mesh_ids'])} "
+                "meshes that were written")
+
+        settings = etree.fromstring(archive.read("Metadata/model_settings.config"))
+        if len(settings.findall(".//object")) != grid.pieces:
+            raise PuzzleError("Bambu object settings do not declare one object per piece")
+        if len(settings.findall(".//plate/model_instance")) != grid.pieces:
+            raise PuzzleError("The plate does not carry one instance per piece")
+        if sorted(int(part.get("id")) for part in settings.findall(".//part")) != declared:
+            raise PuzzleError("Bambu part ids do not match the serialized mesh objects")
+
+        project = json.loads(archive.read("Metadata/project_settings.config"))
+        if [str(color).upper() for color in project.get("filament_colour", [])] \
+                != [color.upper() for color in source.colors]:
+            raise PuzzleError(
+                f"3MF filament colors {project.get('filament_colour')!r} do not match the "
+                f"palette the meshes are indexed against {source.colors!r}")
+        sequence = str(project.get("print_sequence", ""))
+        if sequence != "by layer":
+            raise PuzzleError(
+                f"A {grid.pieces} object plate must print by layer, not {sequence!r}: printing "
+                "piece by piece would drive the toolhead through pieces already standing")
+        written = print_profile(archive.read("Metadata/project_settings.config"))
+        if written.brim_bridges_gap(clearance_mm):
+            raise PuzzleError(
+                f"The project keeps a {written.brim_width_mm:g} mm brim, which fits the gap "
+                f"between two pieces and would weld the puzzle's first layer into one tile")
+
+        with archive.open(member) as handle:
+            meshes, colors = read_meshes(handle)
+    if [color.upper() for color in colors] != [color.upper() for color in source.colors]:
+        raise PuzzleError("The serialized color group does not match the source palette")
+
+    solids, seen = {}, {}
+    for object_id, vertices, triangles in meshes:
+        identifier = int(object_id)
+        piece, material = expected["owner"][identifier]
+        counts = expected["counts"][identifier]
+        if (len(vertices), len(triangles)) != counts:
+            raise PuzzleError(
+                f"Piece {labels[piece]} material {material} serialized "
+                f"{len(vertices)} vertices and {len(triangles)} triangles, not {counts}")
+        if not np.isfinite(vertices).all():
+            raise PuzzleError(
+                f"Piece {labels[piece]} material {material} has non-finite vertex coordinates")
+        if not len(triangles) or triangles.min() < 0 or triangles.max() >= len(vertices):
+            raise PuzzleError(
+                f"Piece {labels[piece]} material {material} has out-of-range triangle indices")
+        mesh = trimesh.Trimesh(vertices, triangles, process=False)
+        zero = int((mesh.area_faces < MINIMUM_FACE_AREA_MM2).sum())
+        if not mesh.is_watertight or not mesh.is_winding_consistent or mesh.volume <= 0 or zero:
+            raise PuzzleError(
+                f"Piece {labels[piece]} material {material} failed geometry validation: "
+                f"watertight={mesh.is_watertight}, winding_consistent={mesh.is_winding_consistent}, "
+                f"volume_mm3={mesh.volume:g}, zero_area_triangles={zero}")
+        low, high = mesh.bounds
+        if low[2] < -PLACEMENT_TOLERANCE_MM or not footprint.buffer(PLACEMENT_TOLERANCE_MM).contains(
+                box(low[0], low[1], high[0], high[1])):
+            raise PuzzleError(
+                f"Piece {labels[piece]} material {material} lies outside the map footprint or "
+                f"below the plate: bounds={mesh.bounds.tolist()}")
+        solids.setdefault(piece, []).append(to_manifold(vertices, triangles))
+        seen.setdefault(piece, []).append(material)
+
+    if sorted(solids) != list(range(grid.pieces)):
+        raise PuzzleError(f"The archive carries meshes for {len(solids)} of {grid.pieces} pieces")
+
+    print(f"Validating {len(solids)} pieces read back from {output.name}", flush=True)
+    assemblies = {}
+    for piece, parts in sorted(solids.items()):
+        assembly = md.Manifold.batch_boolean(parts, md.OpType.Add)
+        shells = assembly.decompose()
+        volumes = sorted((float(shell.volume()) for shell in shells), reverse=True)
+        printable, crumbs, _ = classify_positive_shells(
+            volumes, expected["nozzle_mm"], expected["layer_height_mm"])
+        cavities, _, _ = classify_cavity_shells(
+            shells, expected["nozzle_mm"], expected["layer_height_mm"])
+        if len(printable) != 1:
+            raise PuzzleError(
+                f"Piece {labels[piece]} is {len(printable)} disconnected printable components of "
+                f"{printable[:6]} mm3. A straight cut through an elevated road or a bridge can "
+                "leave its deck floating; try a different --seed, --pieces or --grid.")
+        if cavities:
+            raise PuzzleError(
+                f"Piece {labels[piece]} encloses {len(cavities)} sealed printable chambers: "
+                f"{cavities[:6]}")
+        assemblies[piece] = assembly
+        print(f"  {labels[piece]}: one component, {float(assembly.volume()):,.0f} mm3",
+              flush=True)
+        report["pieces"][labels[piece]] = {
+            "materials": sorted(seen[piece]), "volume_mm3": float(assembly.volume()),
+            "printable_components": len(printable), "negligible_shells": crumbs,
+            "triangles": sum(counts for counts in
+                             (expected["counts"][i][1] for i in expected["by_piece"][piece])),
+        }
+
+    gaps = []
+    for row in range(grid.rows):
+        for col in range(grid.cols):
+            here = assemblies[row * grid.cols + col]
+            for neighbour_row, neighbour_col in ((row, col + 1), (row + 1, col)):
+                if neighbour_row >= grid.rows or neighbour_col >= grid.cols:
+                    continue
+                other = assemblies[neighbour_row * grid.cols + neighbour_col]
+                overlap = float((here ^ other).volume())
+                if overlap > crumb:
+                    raise PuzzleError(
+                        f"Pieces {labels[row * grid.cols + col]} and "
+                        f"{labels[neighbour_row * grid.cols + neighbour_col]} overlap by "
+                        f"{overlap:g} mm3; they would print fused")
+                # Neighbours meet in two places with two different clearances:
+                # side by side across the seam, and a knob lying under the
+                # other's surface. The tighter of the two is what has to hold.
+                gap = float(here.min_gap(other, 4 * separation_mm))
+                gaps.append(gap)
+                if gap < separation_mm - PLACEMENT_TOLERANCE_MM:
+                    raise PuzzleError(
+                        f"Pieces {labels[row * grid.cols + col]} and "
+                        f"{labels[neighbour_row * grid.cols + neighbour_col]} come within "
+                        f"{gap:g} mm of each other, inside the {separation_mm:g} mm the joint "
+                        f"is built to ({clearance_mm:g} mm across the seam, "
+                        f"{vertical_clearance_mm:g} mm under the surface); they would print "
+                        "welded together")
+    report["minimum_neighbour_gap_mm"] = min(gaps) if gaps else None
+    report["result"] = "passed"
+    return report
+
+
+# --------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------
+
+def parse_size(text: str):
+    match = re.fullmatch(r"\s*([0-9.]+)\s*[xX]\s*([0-9.]+)\s*", text)
+    if not match:
+        raise argparse.ArgumentTypeError(f"Expected WIDTHxHEIGHT, got {text!r}")
+    return float(match.group(1)), float(match.group(2))
+
+
+def parse_grid(text: str):
+    rows, cols = parse_size(text)
+    if rows != int(rows) or cols != int(cols) or rows < 1 or cols < 1:
+        raise argparse.ArgumentTypeError(f"Expected ROWSxCOLS whole numbers, got {text!r}")
+    return int(rows), int(cols)
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Generate a printable interlocking jigsaw puzzle from a finished NYC map 3MF.")
+    parser.add_argument("input", type=Path, help="Finished map 3MF from generate_3mf.py")
+    parser.add_argument("--pieces", type=int, default=25,
+                        help="Exact number of puzzle pieces to produce (default 25)")
+    parser.add_argument("--grid", type=parse_grid, metavar="ROWSxCOLS",
+                        help="Force a division instead of deriving the squarest one from --pieces")
+    parser.add_argument("--max-piece-aspect", type=float, default=1.6,
+                        help="Longest acceptable piece aspect ratio (default 1.6)")
+    parser.add_argument("--plate-mm", type=parse_size, metavar="WIDTHxHEIGHT",
+                        help="Printable plate area the assembled cut must fit; the project's "
+                             "own printable_area when omitted")
+    parser.add_argument("--brim", action=argparse.BooleanOptionalAction, default=None,
+                        help="Keep the project's brim; by default it is kept only when a brim "
+                             "loop cannot fit in the gap between two pieces")
+    parser.add_argument("--plate-margin-mm", type=float,
+                        help="Margin kept clear inside the plate; the project's brim width plus "
+                             "its object gap when omitted")
+    parser.add_argument("--floor-mm", type=float,
+                        help="Plane the puzzle joint hides below; one layer beneath the lowest "
+                             "colour skin in the model when omitted")
+    parser.add_argument("--knob-recess-mm", type=float,
+                        help="Vertical gap between a knob and the neighbour's surface above it; "
+                             "two layer heights when omitted")
+    parser.add_argument("--clearance-mm", type=float,
+                        help="Total gap between neighbouring pieces; one nozzle diameter when "
+                             "omitted, which is the width below which two pieces printed side "
+                             "by side fuse into one")
+    parser.add_argument("--tab-size", type=float, default=DEFAULT_TAB_SIZE,
+                        help="Knob reach, as a fraction of the edge it sits on "
+                             f"(default {DEFAULT_TAB_SIZE:g})")
+    parser.add_argument("--tab-neck", type=float, default=DEFAULT_TAB_NECK,
+                        help="Knob neck width, as a fraction of its edge "
+                             f"(default {DEFAULT_TAB_NECK:g})")
+    parser.add_argument("--tab-undercut-mm", type=float,
+                        help="How far a knob's head out-reaches its own neck; the clearance plus "
+                             "half a nozzle when omitted, since the gap is subtracted from the "
+                             "joint before any of it is left to lock with")
+    parser.add_argument("--foundation-material", type=int,
+                        help="Index of the filament carrying the substrate; the one reaching the "
+                             "plate when omitted")
+    parser.add_argument("--seed", type=int, default=0, help="Knob randomisation seed (default 0)")
+    parser.add_argument("--puzzle-id",
+                        help="Directory name under the output root; derived from the input "
+                             "model and the piece count when omitted")
+    parser.add_argument("--output-dir", type=Path, default=Path("output/puzzles"),
+                        help="Root the puzzle directory is created under (default output/puzzles)")
+    parser.add_argument("--preview", action=argparse.BooleanOptionalAction, default=True,
+                        help="Write preview.svg into the puzzle directory: the cut drawn over a "
+                             "top-down render of the map it was cut from")
+    parser.add_argument("--preview-px-per-mm", type=float, default=8.0,
+                        help="Resolution of the preview's rendered basemap (default 8)")
+    parser.add_argument("--validate", action=argparse.BooleanOptionalAction, default=True,
+                        help="Re-read the written 3MF and audit it the way validate_3mf audits "
+                             "a map, piece by piece")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Plan the cut, write the preview and manifest, and cut no meshes")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    started = time.time()
+    print(f"Reading {args.input}", flush=True)
+    source = read_project(args.input)
+    profile = source.profile
+    if not profile.complete():
+        raise PuzzleError(
+            f"{args.input} does not carry a complete print profile ({profile}), so the cut's "
+            "clearances cannot be derived from the machine it was resolved for. Pass "
+            "--clearance-mm, --floor-mm, --tab-undercut-mm and --plate-mm explicitly.")
+    print(f"Profile: {profile.nozzle_mm:g} mm nozzle, {profile.layer_height_mm:g} mm layers, "
+          f"{profile.wall_loops} walls of {profile.wall_line_width_mm:g} mm, "
+          f"{profile.plate_mm[0]:g} x {profile.plate_mm[1]:g} mm plate", flush=True)
+
+    clearance = profile.clearance_mm if args.clearance_mm is None else args.clearance_mm
+    # The undercut follows whatever gap is actually in force, not the profile's
+    # own: both halves of a joint are eroded by half the gap, so an undercut of
+    # less than the gap leaves nothing behind to lock with.
+    undercut = (clearance + profile.interference_mm if args.tab_undercut_mm is None
+                else args.tab_undercut_mm)
+    interference = undercut - clearance
+    plate_w, plate_h = args.plate_mm or profile.plate_mm
+    project = source.project
+    brim = profile.brim_width_mm
+    if args.brim and profile.brim_bridges_gap(clearance):
+        raise PuzzleError(
+            f"A {profile.brim_width_mm:g} mm brim cannot be kept at a {clearance:g} mm gap: "
+            f"{clearance - 2 * profile.brim_object_gap_mm:.2f} mm is left between two pieces "
+            f"after the {profile.brim_object_gap_mm:g} mm object gap, which fits a "
+            f"{profile.outer_wall_line_width_mm:g} mm extrusion, and the first layer would weld "
+            "the puzzle into one tile. Drop --brim, or narrow the gap with --clearance-mm.")
+    if args.brim is False or (args.brim is None and profile.brim_bridges_gap(clearance)):
+        if profile.brim_width_mm:
+            reason = ("a brim loop fits the "
+                      f"{clearance - 2 * profile.brim_object_gap_mm:.2f} mm left between two "
+                      f"pieces after the {profile.brim_object_gap_mm:g} mm object gap, so it "
+                      "would weld the first layer of the puzzle together"
+                      if args.brim is None else "it was turned off")
+            print(f"Brim: disabled because {reason}.", flush=True)
+        brim = 0.0
+        settings = json.loads(project or b"{}")
+        settings["brim_type"] = "no_brim"
+        project = json.dumps(settings, indent=2).encode()
+    margin = (brim + profile.brim_object_gap_mm if brim else 0.0) \
+        if args.plate_margin_mm is None else args.plate_margin_mm
+    if not 0 < clearance < 2:
+        raise PuzzleError("Clearance must be between 0 and 2 mm")
+    if clearance < profile.nozzle_mm - 1e-9:
+        print(f"warning: a {clearance:g} mm gap is narrower than the {profile.nozzle_mm:g} mm "
+              "nozzle, so the slicer cannot leave a void between two pieces. They will print "
+              "fused and the puzzle will come off the plate as one tile.", flush=True)
+    if interference <= 0:
+        print(f"warning: a {undercut:g} mm undercut across a {clearance:g} mm gap leaves "
+              f"{interference:g} mm of interference, so the pieces will locate each other but "
+              "not hold together.", flush=True)
+
+    solids = [to_manifold(vertices, triangles) for _, vertices, triangles in source.meshes]
+    foundation = (derive_foundation(solids) if args.foundation_material is None
+                  else args.foundation_material)
+    if not 0 <= foundation < len(solids):
+        raise PuzzleError(f"Material {foundation} is not one of this project's "
+                          f"{len(solids)} filaments")
+    floor = (derive_floor(solids, foundation, profile.layer_height_mm)
+             if args.floor_mm is None else args.floor_mm)
+    if floor <= 0:
+        raise PuzzleError("The floor height must be positive")
+
+    bounds = np.array([solid.bounding_box() for solid in solids])
+    low = bounds[:, :3].min(axis=0)
+    high = bounds[:, 3:].max(axis=0)
+    width, height = float(high[0] - low[0]), float(high[1] - low[1])
+    print(f"Model {width:.3f} x {height:.3f} mm, {len(solids)} filaments, "
+          f"{sum(solid.num_tri() for solid in solids):,} triangles", flush=True)
+
+    usable_w, usable_h = plate_w - 2 * margin, plate_h - 2 * margin
+    if width > usable_w + 1e-6 or height > usable_h + 1e-6:
+        raise PuzzleError(
+            f"A {width:.1f} x {height:.1f} mm map does not fit {plate_w:g} x {plate_h:g} mm with "
+            f"{margin:g} mm of margin ({usable_w:g} x {usable_h:g} mm usable). "
+            "Regenerate the chunk smaller, or raise --plate-mm to your printer's real area.")
+
+    footprint = validate_floor(solids, floor, foundation)
+    local = shapely.affinity.translate(footprint, -low[0], -low[1])
+    fill = footprint.area / (width * height)
+    print(f"Outline: {footprint.area:,.0f} mm2, {fill:.1%} of its bounding box, "
+          f"{len(shapely.get_parts(footprint))} part(s)", flush=True)
+
+    if args.grid:
+        rows, cols = args.grid
+        layout, slivers = layout_for(Grid(rows, cols, width, height), local, args.min_piece_fill)
+        if slivers:
+            raise PuzzleError(
+                f"--grid {rows}x{cols} catches {slivers} slivers of the map too small to be "
+                f"pieces; raise --min-piece-fill to keep them or pick another grid")
+        if layout.pieces != args.pieces:
+            print(f"--grid {rows}x{cols} overrides --pieces {args.pieces}; "
+                  f"cutting {layout.pieces} pieces", flush=True)
+    else:
+        layout = choose_layout(local, width, height, args.pieces, args.max_piece_aspect,
+                               args.min_piece_fill)
+    grid = layout.grid
+    if layout.pieces > MAX_PIECES:
+        raise PuzzleError(f"At most {MAX_PIECES} pieces fit this 3MF's object numbering")
+    shortest = min(grid.cell_width, grid.cell_height)
+    neck_mm = args.tab_neck * shortest
+    if neck_mm < profile.narrowest_knob_neck_mm:
+        raise PuzzleError(
+            f"{grid.rows} x {grid.cols} gives {grid.cell_width:.1f} x {grid.cell_height:.1f} mm "
+            f"pieces, whose knobs are only {neck_mm:.2f} mm across the neck. This profile's "
+            f"{profile.wall_loops} walls of {profile.wall_line_width_mm:g} mm need "
+            f"{profile.narrowest_knob_neck_mm:.2f} mm before a knob is solid rather than two "
+            "walls touching. Ask for fewer pieces, or raise --tab-neck.")
+
+    footprint = box(low[0], low[1], high[0], high[1])
+    validate_floor(solids, floor, foundation, footprint)
+
+    crumb_mm3 = profile.crumb_mm3
+    samples = profile.knob_samples(neck_mm)
+    recess = (profile.vertical_clearance_mm if args.knob_recess_mm is None
+              else args.knob_recess_mm)
+    knob_thickness = floor - recess
+    if knob_thickness < 2 * profile.layer_height_mm:
+        raise PuzzleError(
+            f"A {floor:.3g} mm floor less {recess:g} mm of vertical clearance leaves a "
+            f"{knob_thickness:.3g} mm knob, under two {profile.layer_height_mm:g} mm layers. "
+            "Lower --knob-recess-mm, or raise --floor-mm if you know this map's base.")
+
+    rng = np.random.default_rng(args.seed)
+    curves = cut_curves(grid, rng, size=args.tab_size, neck=args.tab_neck,
+                        undercut=undercut, samples=samples)
+    polygons = floor_polygons(layout, curves, clearance, local)
+    placed = [shapely.affinity.translate(polygon, low[0], low[1]) for polygon in polygons]
+    rectangles = piece_rectangles(layout, low, clearance)
+    labels = [piece_label(row, col) for row, col in layout.cells]
+    smallest = min(polygon.area for polygon in polygons)
+
+    print(f"Grid {grid.rows} x {grid.cols} = {layout.pieces} pieces, "
+          f"{grid.cell_width:.2f} x {grid.cell_height:.2f} mm cells ({grid.aspect:.2f}:1), "
+          f"smallest piece {smallest:,.0f} mm2 "
+          f"({smallest / (grid.cell_width * grid.cell_height):.0%} of a cell)", flush=True)
+    print(f"Joint: {floor:.3g} mm floor ({floor / profile.layer_height_mm:.0f} layers), "
+          f"{neck_mm:.2f} mm narrowest knob neck, {clearance:g} mm gap, "
+          f"{undercut:g} mm undercut leaving {interference:g} mm of lock", flush=True)
+    print(f"Knob: {knob_thickness:.3g} mm thick "
+          f"({knob_thickness / profile.layer_height_mm:.0f} layers), recessed {recess:g} mm "
+          "under its neighbour's surface", flush=True)
+
+    puzzle_id = args.puzzle_id or f"{args.input.stem}_{layout.pieces}"
+    directory = args.output_dir / puzzle_id
+    output = directory / f"{puzzle_id}.3mf"
+    plan = {
+        "puzzle_id": puzzle_id,
+        "schema_version": 1,
+        "source_model": str(args.input),
+        "command": shlex.join(sys.argv),
+        "rows": grid.rows, "cols": grid.cols, "pieces": layout.pieces,
+        "cells": [list(cell) for cell in layout.cells],
+        "outline_mm2": footprint.area, "outline_fill": fill,
+        "smallest_piece_mm2": smallest,
+        "min_piece_fill": args.min_piece_fill,
+        "model_mm": [width, height],
+        "piece_mm": [grid.cell_width, grid.cell_height],
+        "piece_aspect": grid.aspect,
+        "floor_mm": floor,
+        "clearance_mm": clearance,
+        "knob_recess_mm": recess,
+        "knob_thickness_mm": knob_thickness,
+        "nozzle_mm": profile.nozzle_mm,
+        "tab_size": args.tab_size, "tab_neck": args.tab_neck,
+        "tab_undercut_mm": undercut,
+        "interference_mm": interference,
+        "outer_wall_line_width_mm": profile.outer_wall_line_width_mm,
+        "narrowest_neck_mm": neck_mm,
+        "minimum_neck_mm": profile.narrowest_knob_neck_mm,
+        "crumb_volume_mm3": crumb_mm3,
+        "layer_height_mm": profile.layer_height_mm,
+        "knob_samples": samples,
+        "plate_mm": [plate_w, plate_h], "plate_margin_mm": margin,
+        "brim_width_mm": brim,
+        "seed": args.seed,
+        "labels": labels,
+    }
+
+    directory.mkdir(parents=True, exist_ok=True)
+    basemap = None
+    if args.preview:
+        basemap = render_basemap(solids, source.colors, low, high, args.preview_px_per_mm)
+        write_preview(directory / "preview.svg", grid, placed, low, basemap)
+        print(f"Preview {directory / 'preview.svg'} "
+              f"({basemap.shape[1]}x{basemap.shape[0]} px, {time.time() - started:.0f}s)",
+              flush=True)
+
+    if args.dry_run:
+        write_manifest(directory / "puzzle.json", plan)
+        print(f"Plan {directory / 'puzzle.json'}", flush=True)
+        print(json.dumps({k: v for k, v in plan.items() if k != "labels"}, indent=2), flush=True)
+        return 0
+
+    slab, upper = solids[foundation].split_by_plane([0.0, 0.0, -1.0], -floor)
+    surfaces = {foundation: upper}
+    for index, solid in enumerate(solids):
+        if index != foundation:
+            surfaces[index] = solid
+    print(f"Split at z={floor:g}: floor slab {slab.num_tri():,} triangles", flush=True)
+
+    floors = floor_prisms(slab, placed, rectangles, floor, recess)
+    print(f"Floor cut into {len(floors)} knobbed pieces "
+          f"({time.time() - started:.0f}s)", flush=True)
+
+    cut = {index: split_grid(solid, grid, low, clearance)
+           for index, solid in surfaces.items()}
+    print(f"Surfaces split on the {grid.rows} x {grid.cols} grid "
+          f"({time.time() - started:.0f}s)", flush=True)
+
+    import manifold3d as md
+    pieces = []
+    discarded = 0
+    for index, (row, col) in enumerate(layout.cells):
+        meshes, assembled = [], []
+        for material in sorted(surfaces):
+            solid = cut[material][row][col]
+            if material == foundation:
+                if solid.is_empty():
+                    raise PuzzleError(
+                        f"Piece {labels[index]} has no substrate above the floor plane")
+                solid = md.Manifold.batch_boolean([solid, floors[index]], md.OpType.Add)
+            if solid.is_empty() or solid.num_tri() == 0:
+                continue
+            solid, dropped, _ = drop_negligible_shells(solid, crumb_mm3)
+            discarded += dropped
+            if solid.is_empty():
+                continue
+            assembled.append(solid)
+            mesh, _, _ = prepare_export_mesh(solid, floor)
+            meshes.append((material, mesh))
+        if not meshes:
+            raise PuzzleError(f"Piece {labels[index]} is empty")
+        if foundation not in {material for material, _ in meshes}:
+            raise PuzzleError(
+                f"Piece {labels[index]} carries no substrate, so it has no floor to hold its "
+                "knobs")
+        # Connectivity is a property of the piece, not of one filament: a
+        # lawn, a roof and the ground under them are separate solids that
+        # print as one object. This is the rule validate_3mf applies to the
+        # whole map, applied to each piece the cut produced.
+        loose = [float(shell.volume())
+                 for shell in md.Manifold.batch_boolean(assembled, md.OpType.Add).decompose()
+                 if shell.volume() > crumb_mm3]
+        if len(loose) != 1:
+            raise PuzzleError(
+                f"Piece {labels[index]} is {len(loose)} disconnected printable components "
+                f"of {sorted(loose, reverse=True)[:6]} mm3. A straight cut through an "
+                "elevated road or a bridge can leave its deck floating; try a different "
+                "--seed, --pieces or --grid.")
+        pieces.append({"index": index, "name": f"Piece {labels[index]}", "meshes": meshes})
+        print(f"  {labels[index]}: "
+              f"{sum(len(mesh.faces) for _, mesh in meshes):,} triangles", flush=True)
+
+    plan["piece_triangles"] = [sum(len(mesh.faces) for _, mesh in piece["meshes"])
+                               for piece in pieces]
+    plan["negligible_shells_dropped"] = discarded
+    if discarded:
+        print(f"Dropped {discarded} sub-micron Boolean shells", flush=True)
+    thumbnail = (plate_thumbnail(basemap, grid, placed, low) if basemap is not None
+                 else source.thumbnail)
+    mesh_ids = write_project(output, source, pieces, grid, plan, project, thumbnail)
+    print(f"{output} {output.stat().st_size:,} bytes, {len(pieces)} pieces "
+          f"({time.time() - started:.0f}s)", flush=True)
+
+    if args.validate:
+        expected = {
+            "mesh_ids": list(mesh_ids.values()),
+            "owner": {identifier: key for key, identifier in mesh_ids.items()},
+            "counts": {mesh_ids[(piece["index"], material)]:
+                       (len(mesh.vertices), len(mesh.faces))
+                       for piece in pieces for material, mesh in piece["meshes"]},
+            "by_piece": {piece["index"]: [mesh_ids[(piece["index"], material)]
+                                          for material, _ in piece["meshes"]]
+                         for piece in pieces},
+            "crumb_mm3": crumb_mm3,
+            "nozzle_mm": profile.nozzle_mm,
+            "layer_height_mm": profile.layer_height_mm,
+        }
+        validation = validate_puzzle(output, source, expected, footprint,
+                                     clearance_mm=clearance, vertical_clearance_mm=recess,
+                                     layout=layout, labels=labels)
+        write_manifest(directory / "validation.json", validation)
+        print(f"Validation passed: {layout.pieces} pieces, closest neighbours "
+              f"{validation['minimum_neighbour_gap_mm']:.3f} mm apart "
+              f"({time.time() - started:.0f}s)", flush=True)
+        plan["validation"] = {"result": "passed",
+                              "minimum_neighbour_gap_mm": validation["minimum_neighbour_gap_mm"]}
+
+    write_manifest(directory / "puzzle.json", plan)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except PuzzleError as error:
+        print(f"error: {error}", file=sys.stderr)
+        sys.exit(2)
