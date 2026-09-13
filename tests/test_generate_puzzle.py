@@ -25,13 +25,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import generate_puzzle  # noqa: E402
 from generate_puzzle import (Grid, Layout, PrintProfile, PuzzleError,  # noqa: E402
                              choose_layout, cut_curves, floor_polygons, knob_interference,
-                             cell_box, knob_profile, layout_for, piece_label, seat_polygons,
+                             cell_box, knob_profile, layout_for, matches_cavity, piece_label,
+                             seat_polygons,
                              best_layout, derive_undercut, print_profile,
                              printed_head_ratio)
 
-# A 0.4 mm nozzle at 0.24 mm layers with two 0.45 mm walls on a 256 mm plate --
-# the profile the tracked example model was resolved against.
-P2S = PrintProfile(0.4, 0.24, 2, 0.45, 0.42, (256.0, 256.0), 3.0, 0.1, "by layer")
+# A 0.4 mm nozzle at 0.24 mm layers over a 0.2 mm first layer, two 0.45 mm
+# walls and an 85%-of-nozzle minimum bead, on a 256 mm plate -- the profile the
+# tracked example model was resolved against.
+P2S = PrintProfile(0.4, 0.24, 0.2, 0.34, 2, 0.45, 0.42, (256.0, 256.0), 3.0, 0.1, "by layer")
 
 
 def square_cut(pieces=25, size=235.0, clearance=P2S.clearance_mm, seed=0,
@@ -181,36 +183,49 @@ class KnobTests(unittest.TestCase):
         pinched[waist, 0] += 0.8          # squeeze the shoulder below the neck
         self.assertGreater(knob_interference(pinched), knob_interference(good) + 0.15)
 
-    def test_the_undercut_shrinks_with_the_knob_it_sits_on(self):
-        """Measured on real plates: at 60 pieces a 115 x 132 mm chunk has a
-        3.17 mm knob neck, and the lock that looks right on an 11 mm neck makes
-        a head 1.43 times its own neck there -- a lump on a stalk. The undercut
-        is therefore capped by the shape it prints, and the lock is whatever
-        survives, down to nothing."""
-        clearance, machine = 0.4, 0.2
-        big = derive_undercut(11.28, clearance, machine)
-        small = derive_undercut(3.17, clearance, machine)
-        self.assertAlmostEqual(big, clearance + machine)          # the machine's lock
-        self.assertLess(small, big)                               # the shape's cap
-        for neck in (2.5, 3.17, 4.7, 5.64, 7.05, 11.28):
+    def test_the_lock_is_guaranteed_whatever_it_costs_the_knobs_looks(self):
+        """The reversal: the undercut used to be capped to keep the printed head
+        slim, which on a small piece at a sliceable gap drove the lock to
+        nothing. A puzzle that will not hold together is a worse object than one
+        with chunky knobs, so the proportion gives instead."""
+        clearance, machine = P2S.clearance_mm, P2S.interference_mm
+        for neck in (4.70, 5.64, 7.05, 11.28):
             undercut = derive_undercut(neck, clearance, machine)
-            self.assertLessEqual(printed_head_ratio(neck, clearance, undercut),
-                                 generate_puzzle.TAB_TARGET_HEAD_RATIO + 1e-9, neck)
-        # A neck too small to out-reach the gap gets no lock, and says so by
-        # returning an undercut that does not cover the clearance.
-        self.assertLess(derive_undercut(3.17, clearance, machine), clearance)
+            self.assertAlmostEqual(undercut - clearance, machine, msg=f"{neck} mm neck")
 
-    def test_a_wider_gap_costs_the_knobs_shape(self):
-        """The measured trade-off behind the one-nozzle default: both halves of
-        a joint lose half the gap, so widening it slims the neck and the head
-        equally and the printed head/neck ratio gets worse. Over a 235 mm map at
-        a hundred pieces the neck is 5.64 mm."""
-        gentle = printed_head_ratio(5.64, 0.4, 0.4 + 0.2)
-        wide = printed_head_ratio(5.64, 0.84, 0.84 + 0.2)
-        self.assertLess(gentle, 1.3)                    # a normal jigsaw knob
-        self.assertGreater(wide, generate_puzzle.TAB_MAX_HEAD_RATIO)
-        # Bigger pieces absorb the same gap without complaint.
-        self.assertLess(printed_head_ratio(11.28, 0.84, 1.04), 1.25)
+    def test_a_smaller_piece_buys_its_lock_with_a_chunkier_knob(self):
+        """Both halves of a joint lose half the gap, so the same lock on a
+        smaller neck prints a fatter head. That is reported, not prevented --
+        until it is genuinely a lump on a stalk."""
+        clearance = P2S.clearance_mm
+        ratios = [printed_head_ratio(neck, clearance,
+                                     derive_undercut(neck, clearance, P2S.interference_mm))
+                  for neck in (11.28, 7.05, 5.64)]
+        self.assertEqual(ratios, sorted(ratios), "a smaller neck must print a fatter head")
+        self.assertLess(ratios[0], generate_puzzle.TAB_TARGET_HEAD_RATIO)   # 25 pieces: slim
+        self.assertLess(ratios[-1], generate_puzzle.TAB_MAX_HEAD_RATIO)     # 100 pieces: allowed
+        # ... but a neck small enough makes a head the run should refuse.
+        tiny = 4.03
+        self.assertGreater(
+            printed_head_ratio(tiny, clearance,
+                               derive_undercut(tiny, clearance, P2S.interference_mm)),
+            generate_puzzle.TAB_MAX_HEAD_RATIO)
+
+    def test_the_gap_clears_a_bead_laid_on_a_sub_bead_feature(self):
+        """Why the gap is two line widths and not one nozzle.
+
+        A city at this scale carries thousands of details finer than one bead --
+        the uncut example model has 133 sub-bead islands at the layer that first
+        failed. The slicer still lays a full bead down the middle of each, and
+        Arachne widens a lone bead up to about twice nominal, so it can spill a
+        line width past the feature. Two facing across a seam need two line
+        widths between them.
+
+        Measured against the real slicer on a hundred-piece cut: 0.40 mm and
+        0.50 mm are refused, 0.84 mm slices clean."""
+        self.assertAlmostEqual(P2S.clearance_mm, 2 * P2S.outer_wall_line_width_mm)
+        self.assertGreater(P2S.clearance_mm, P2S.nozzle_mm)
+        self.assertGreaterEqual(P2S.clearance_mm, 2 * 0.42 - 1e-9)
 
     def test_a_knob_too_big_for_its_edge_is_refused(self):
         with self.assertRaises(PuzzleError):
@@ -224,6 +239,7 @@ class ProfileTests(unittest.TestCase):
 
     SETTINGS = json.dumps({
         "nozzle_diameter": ["0.4"], "layer_height": "0.24", "wall_loops": "2",
+        "initial_layer_print_height": "0.2", "min_bead_width": "85%",
         "inner_wall_line_width": "0.45", "outer_wall_line_width": "0.42",
         "brim_type": "outer_only", "brim_width": "3.0", "brim_object_gap": "0.1",
         "printable_area": ["0x0", "256x0", "256x256", "0x256"],
@@ -235,25 +251,51 @@ class ProfileTests(unittest.TestCase):
         self.assertTrue(profile.complete())
         self.assertEqual(profile.plate_mm, (256.0, 256.0))
         self.assertAlmostEqual(profile.brim_margin_mm, 3.1)
-        self.assertAlmostEqual(profile.clearance_mm, 0.4)       # one nozzle
+        self.assertAlmostEqual(profile.clearance_mm, 0.84)      # two outer wall lines
         self.assertAlmostEqual(profile.interference_mm, 0.2)    # half a nozzle
         # Both halves of a joint are eroded by half the gap, so the undercut has
         # to cover the whole gap before any lock is left.
         self.assertAlmostEqual(
-            derive_undercut(11.28, profile.clearance_mm, profile.interference_mm), 0.4 + 0.2)
+            derive_undercut(11.28, profile.clearance_mm, profile.interference_mm), 0.84 + 0.2)
         self.assertAlmostEqual(profile.narrowest_knob_neck_mm, 1.8)   # 2 * 2 walls * 0.45
         self.assertAlmostEqual(profile.crumb_mm3, 0.4 ** 2 * 0.24)
         self.assertAlmostEqual(profile.vertical_clearance_mm, 0.48)   # two layers
+
+    def test_the_narrowest_printable_section_is_two_minimum_beads(self):
+        """Measured against Bambu on a hundred-piece cut of the tracked model:
+        every layer it dropped was 0.644 mm across or narrower, every layer it
+        kept was 0.677 mm or wider. Two minimum beads is 0.68 mm, and it is the
+        bound the empty-layer check has to use -- a piece with an empty layer is
+        refused outright, where the uncut map never notices because the layer
+        belongs to one object spanning the whole city."""
+        profile = print_profile(self.SETTINGS)
+        self.assertAlmostEqual(profile.min_bead_width_mm, 0.34)      # 85% of nozzle
+        self.assertAlmostEqual(profile.minimum_printable_width_mm, 0.68)
+        # A profile stating the bead in millimetres is read the same way.
+        settings = json.loads(self.SETTINGS)
+        settings["min_bead_width"] = "0.3"
+        self.assertAlmostEqual(
+            print_profile(json.dumps(settings).encode()).minimum_printable_width_mm, 0.6)
+
+    def test_layers_are_numbered_the_way_the_slicer_numbers_them(self):
+        """The first layer has its own height, so a section measured against an
+        evenly spaced ladder would be half a layer out all the way up."""
+        profile = print_profile(self.SETTINGS)
+        self.assertAlmostEqual(profile.layer_top_mm(1), 0.44)        # 0.2 + 0.24
+        self.assertAlmostEqual(profile.layer_top_mm(50), 12.2)
+        # A layer counts when its top is above the floor and at or below the peak.
+        self.assertEqual(list(profile.layer_indices(1.64, 2.6)), [7, 8, 9, 10])
+        self.assertEqual(list(profile.layer_indices(12.2, 12.2)), [])
 
     def test_a_brim_is_kept_only_when_it_cannot_reach_across_a_seam(self):
         """A brim is laid outward from every object and clipped back from the
         others by the object gap. Where an extrusion still fits in what is left,
         the first layer of the print welds the whole puzzle into a tile."""
         profile = print_profile(self.SETTINGS)
-        # 0.4 - 2*0.1 = 0.2 mm free, and a 0.42 mm line does not fit.
-        self.assertFalse(profile.brim_bridges_gap(profile.clearance_mm))
-        # 0.84 - 2*0.1 = 0.64 mm free, and it does.
-        self.assertTrue(profile.brim_bridges_gap(0.84))
+        # 0.84 - 2*0.1 = 0.64 mm free, and a 0.42 mm line fits, so it is dropped.
+        self.assertTrue(profile.brim_bridges_gap(profile.clearance_mm))
+        # 0.4 - 2*0.1 = 0.2 mm free, and it does not.
+        self.assertFalse(profile.brim_bridges_gap(0.4))
 
     def test_a_project_without_a_brim_never_bridges(self):
         settings = json.loads(self.SETTINGS)
@@ -278,6 +320,39 @@ class ProfileTests(unittest.TestCase):
         self.assertFalse(print_profile(None).complete())
         self.assertFalse(print_profile(b"not json").complete())
         self.assertFalse(print_profile(b'{"nozzle_diameter": ["0.4"]}').complete())
+
+
+class CavityTests(unittest.TestCase):
+    """A sealed chamber inside a piece is only the cut's fault if the cut made it.
+
+    `generate_3mf` runs the assembly Boolean only under `--full-validation`, so a
+    model generated without it has never had the check applied. Plate A5 of the
+    tracked Manhattan plan turns out to carry three sealed chambers of its own,
+    and the puzzle cut from it reported one of them verbatim -- (0.459 mm3,
+    0.234 mm). Failing the puzzle for that blames the cut for the map.
+    """
+
+    A5_SOURCE = [(1.710, 0.265), (0.474, 0.241), (0.459, 0.234)]
+
+    def test_a_chamber_the_map_already_had_is_recognised(self):
+        self.assertTrue(matches_cavity((0.459, 0.234), self.A5_SOURCE))
+        self.assertTrue(matches_cavity((1.710, 0.265), self.A5_SOURCE))
+
+    def test_a_chamber_the_map_does_not_have_is_not_excused(self):
+        """The symmetric case: a void the cut sealed off must still be caught."""
+        self.assertFalse(matches_cavity((6.2, 0.51), self.A5_SOURCE))
+        self.assertFalse(matches_cavity((0.459, 0.90), self.A5_SOURCE))   # same size, far deeper
+        self.assertFalse(matches_cavity((0.90, 0.234), self.A5_SOURCE))   # same depth, far bigger
+
+    def test_matching_survives_the_wobble_of_a_second_boolean(self):
+        """The piece is unioned separately from the whole map, so the same void
+        measures slightly differently; matching has to tolerate that and no more."""
+        volume, thickness = self.A5_SOURCE[2]
+        self.assertTrue(matches_cavity((volume * 1.01, thickness * 0.99), self.A5_SOURCE))
+        self.assertFalse(matches_cavity((volume * 1.30, thickness), self.A5_SOURCE))
+
+    def test_nothing_is_excused_when_the_map_has_no_chambers(self):
+        self.assertFalse(matches_cavity((0.459, 0.234), []))
 
 
 class CutTests(unittest.TestCase):

@@ -7,6 +7,7 @@ from map_common import CACHE_DIR, VALID, write_json
 EXTRUSION=re.compile(r'(?:^|\s)E([-+]?(?:\d+(?:\.\d*)?|\.\d+))(?=\s|$)')
 GEOMETRY=re.compile(r'^3D/(Objects/|_rels/)')
 SLICER=Path('/Applications/BambuStudio.app/Contents/MacOS/BambuStudio')
+SLICE_ERROR_LINES=6                     # distinct [error] lines kept from a failed log
 
 
 def printer_model_id(printer_model,slicer=SLICER):
@@ -103,11 +104,41 @@ def run_slice(model,output,slicer=SLICER,export_project=False,announce=True):
     record.update(exit_code=result.returncode,elapsed_seconds=time.monotonic()-started,
         finished=datetime.datetime.now().astimezone().isoformat(),
         result='completed' if result.returncode==0 else 'failed')
+    if result.returncode:record['diagnosis']=slice_failure(output)
     exported=output/f'{model.stem}.gcode.3mf'
     if export_project and result.returncode==0 and exported.exists():
         record['sliced_file']=str(as_sliced_file(exported,slicer))
     write_json(output/'run.json',record)
     return record
+
+
+def slice_failure(output):
+    """Say why the slicer refused, from the two places it actually says so.
+
+    The exit status is only ever 155, and the reason sits either in
+    ``result.json`` -- which Bambu writes for the failures it has a message for
+    -- or as ``[error]`` lines several thousand lines into a log that runs to
+    the better part of a megabyte.  Neither is somewhere a caller should have to
+    go digging, and a conflict between two named objects is a one-line answer.
+    """
+    diagnosis={}
+    report=output/'result.json'
+    if report.exists():
+        try:payload=json.loads(report.read_text())
+        except ValueError:payload={}
+        message=str(payload.get('error_string','')).strip()
+        if message:diagnosis['error_string']=message
+        if payload.get('return_code') is not None:diagnosis['return_code']=payload['return_code']
+    log=output/'slice.log'
+    if log.exists():
+        errors=[]
+        with log.open(errors='replace') as stream:
+            for line in stream:
+                if '[error]' in line:
+                    text=line.split('[error]',1)[1].strip()
+                    if text and text not in errors:errors.append(text)
+        if errors:diagnosis['errors']=errors[-SLICE_ERROR_LINES:]
+    return diagnosis or None
 
 
 def main():

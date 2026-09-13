@@ -20,16 +20,17 @@ script defends is derived from that rather than assumed.
 
 ```text
 Profile: 0.4 mm nozzle, 0.24 mm layers, 2 walls of 0.45 mm, 256 x 256 mm plate
+Model 235.000 x 235.000 mm, 4 filaments, 4,434,194 triangles
+Outline: 55,225 mm2, 100.0% of its bounding box, 1 part(s)
 Brim: disabled because a brim loop fits the 0.64 mm left between two pieces
       after the 0.1 mm object gap, so it would weld the first layer together.
-Model 235.000 x 235.000 mm, 4 filaments, 4,434,194 triangles
-Grid 5 x 5 = 25 pieces, 47.00 x 47.00 mm each (1.00:1)
+Grid 5 x 5 = 25 pieces, 47.00 x 47.00 mm cells (1.00:1), smallest piece 1,787 mm2 (81% of a cell)
 Joint: 1.64 mm floor (7 layers), 11.28 mm narrowest knob neck, 0.84 mm gap,
        1.04 mm undercut leaving 0.2 mm of lock
-Knob: 1.16 mm thick (5 layers), recessed 0.48 mm under its neighbour's surface
+Knob: 1.16 mm thick (5 layers), recessed 0.48 mm under its neighbour's surface,
+      head 1.20 x its own neck
 ...
-output/puzzles/34_w_76_235_25/34_w_76_235_25.3mf 43,151,370 bytes, 25 pieces
-Validation passed: 25 pieces, closest neighbours 0.480 mm apart (74s)
+Validation passed: 25 pieces, closest neighbours 0.480 mm apart
 ```
 
 That writes `output/puzzles/34_w_76_235_25/`:
@@ -84,10 +85,11 @@ profile, and the cut reads its bounds back out of it:
 
 | Bound | Derived from | Why that quantity |
 | --- | --- | --- |
-| Gap between pieces | one nozzle diameter | The width below which the slicer cannot resolve a void between two pieces at all, and several times the machine's own placement error. Every piece prints at once, side by side, and the plate has to come off in pieces rather than as one tile. |
-| Knob undercut | the gap plus half a nozzle, capped by the knob's own shape | See below. |
+| Gap between pieces | two outer-wall line widths | Not the width the slicer can resolve — that is one nozzle — but the width the *toolpaths* need. See below. |
+| Knob undercut | the gap plus half a nozzle | The gap is subtracted from the joint before any of it is left to lock with, so the undercut has to cover it first and then add the lock. See below. |
+| Narrowest printable section | `2 x min_bead_width` | Below it the slicer lays no extrusion at all, and the layer becomes an empty layer *of that piece*. See below. |
 | Knob recess | two layer heights | A knob lies *under* its neighbour's surface tier. Without a gap in Z the printer lays that surface straight onto the knob. Two layers: one of air, one for the sag of the layer bridged across it. |
-| Brim | kept only when a loop cannot fit the gap | A brim is laid outward from every object and clipped back from the others by `brim_object_gap`. Where an extrusion still fits in what is left, the first layer welds the puzzle into a tile. |
+| Brim | kept only when a loop cannot fit the gap | A brim is laid outward from every object and clipped back from the others by `brim_object_gap`. Where an extrusion still fits in what is left, the first layer welds the puzzle into a tile. At a two-line-width gap it does fit, so the brim is normally dropped and the run says so. |
 | Floor plane | one layer below the lowest non-foundation geometry | The mesh states where the map's colour begins. One layer under it is the same shape of bound the generator sets itself, and keeps the cut off a colour skin's underside rather than grazing it. Measured across twenty-one generated models it lands anywhere from 1.64 to 3.08 mm, because it follows the map's own lowest ground rather than a constant. |
 | Outline | the cross section of the floor slab | Whatever polygon the map was cropped to, holes included, together with a check that it does not change with depth. |
 | Narrowest knob neck | `2 x wall_loops x wall line width` | Below it a knob is two walls touching rather than a solid section, so it has no strength to give. |
@@ -109,7 +111,46 @@ cartographic-style design choices, in the same class as
 `_material_layers.PAVEMENT_PAD_RELIEF_MM`: they are the proportions of a
 cardboard puzzle, held as module constants and scaled with the edge they sit on.
 
-## The joint: why the gap sets the undercut, and the knob caps it
+## The gap: why two line widths, not one nozzle
+
+One nozzle diameter is the width below which a slicer cannot resolve a void at
+all, and it is the obvious gap to leave between two pieces. On this map it does
+not slice. Bambu Studio refuses a 100-piece plate with
+
+```text
+Object 34_w_76_235_100_E5 and 34_w_76_235_100_F5 have overlapping gcode paths
+```
+
+and the refusal has nothing to do with the joint: the conflicting layer is
+z 8.60-8.84 mm, five times above the floor plane, up among the buildings.
+
+The cause is the map's own detail. At 1:5670 a city carries thousands of
+features narrower than a single bead -- a parapet, a setback, a fire escape.
+Arachne centres one bead on each, and widens a lone bead up to about twice the
+nominal line width, so an extrusion spills as much as a full line width past the
+feature it is tracing. Two such features facing each other across a seam each
+spill a line width into it, and the toolpaths meet in the middle.
+
+That is invisible on the uncut map for a reason worth knowing: the whole map is
+**one object**, and Bambu only reports path conflicts *between* objects. Cutting
+the map into pieces does not create the near-touching extrusions, it just makes
+the slicer able to see them. Measured at the failing layer, the uncut model
+holds 133 sub-bead islands against 6 across the two pieces it blamed.
+
+Measured end to end at 100 pieces:
+
+| gap | result |
+| --- | --- |
+| 0.40 mm (one nozzle) | refused |
+| 0.50 mm | refused, at a different pair |
+| 0.84 mm (two 0.42 mm outer walls) | slices clean |
+
+So the gap is `2 x outer_wall_line_width`. It is derived from the profile rather
+than fixed, because the quantity it has to clear is a bead of that profile's own
+outer wall. `--clearance-mm` overrides it for a sparser map that does not need
+it.
+
+## The joint: the lock wins, the knob's proportion gives
 
 Both halves of a joint are cut from one curve and then each eroded by half the
 gap. So a knob's head loses half the gap and the notch it has to enter gains
@@ -119,41 +160,54 @@ half the gap, and the interference the two pieces actually feel is
 lock = undercut - clearance
 ```
 
-An undercut sized on its own — half a nozzle, say — vanishes completely once a
+An undercut sized on its own -- half a nozzle, say -- vanishes completely once a
 gap wide enough to separate the pieces is subtracted, and the puzzle falls apart
-in the hand. So the undercut has to cover the gap first.
+in the hand. So the undercut covers the gap first and adds the lock on top:
+`undercut = clearance + nozzle/2`.
 
-But the same erosion slims the neck as well as the head, so a fixed undercut on
-a smaller knob makes a fatter knob. Measured over a 235 mm map, with the lock
-held at half a nozzle:
+The same erosion slims the neck as well as the head, so a fixed undercut on a
+smaller knob makes a proportionally fatter knob. Measured over a 235 mm map,
+with the lock held at half a nozzle:
 
 | pieces | knob neck | head/neck at a 0.4 mm gap | at 0.84 mm |
 | --- | --- | --- | --- |
 | 25 | 11.28 mm | 1.11 | 1.20 |
 | 100 | 5.64 mm | 1.23 | 1.43 |
+| 144 | 4.70 mm | 1.27 | 1.54 |
 | 196 | 4.03 mm | 1.33 | 1.65 |
 
-A cardboard jigsaw sits near 1.2; by 1.4 the head is a lump on a stalk and the
-stalk is what breaks. That measurement is why the gap is one nozzle rather than
-the two wall widths this script first used — widening the gap is not free, it is
-paid for in the knob.
+A cardboard jigsaw sits near 1.2; by 1.4 the head is a lump on a stalk. So the
+gap is not free -- it is paid for in the knob, and at the gap this map needs, a
+100-piece puzzle has chunky knobs.
 
-`derive_undercut` therefore takes the smaller of the two: the machine's lock,
-or whatever keeps the printed head within `TAB_TARGET_HEAD_RATIO` of its own
-neck. Where the cap bites, the lock is whatever survives, and the run says so:
+Which of the two gives is the one real design decision here, and it is the lock:
+a puzzle that will not hold together is a worse object than one with fat knobs.
+`derive_undercut` therefore always returns `clearance + nozzle/2`, the run
+reports the printed proportion, notes it past `TAB_TARGET_HEAD_RATIO` (1.25)
 
 ```text
-warning: at a 3.17 mm knob neck, a head that stays within 1.25 times its own
-neck cannot out-reach the 0.4 mm gap, so the pieces will locate each other but
-not hold together. Narrow --clearance-mm, or ask for fewer, larger pieces.
+note: a 5.64 mm knob neck across a 0.84 mm gap prints a head 1.43 times its own
+neck, past the 1.25 a cardboard puzzle sits at. It keeps the lock, which is the
+point, but the knobs are chunky; fewer, larger pieces slim them.
 ```
 
-That is a real limit, not a tuning failure: below a certain piece size a gap
-wide enough to separate two pieces is already wider than the joint has to give.
+and refuses only past `TAB_MAX_HEAD_RATIO` (1.6), where the knob has stopped
+being a knob:
 
-`tests/test_generate_puzzle.py` checks this the way a hand does: it pulls one
-piece straight away from its neighbour and asserts the knob is caught on the way
-out, and that it is *not* caught when the undercut only matches the gap.
+```text
+error: At 196 pieces a 4.03 mm knob neck across a 0.84 mm gap prints a head 1.65
+times its own neck, past 1.6. Both halves of the joint lose half the gap, so on
+a piece this small the head that would still lock is a lump on a stalk. Ask for
+fewer, larger pieces, or accept a free fit with --tab-undercut-mm 0.
+```
+
+That ceiling is a real limit of the map's density, not a tuning failure: below a
+certain piece size, a gap wide enough for this map to slice is already most of
+what the joint had to give.
+
+`tests/test_generate_puzzle.py` checks the lock the way a hand does: it pulls
+one piece straight away from its neighbour and asserts the knob is caught on the
+way out, and that it is *not* caught when the undercut only matches the gap.
 
 The joint needs a second clearance that a flat jigsaw does not. A knob reaches
 *under* the neighbour it locks into, and that neighbour's surface tier starts at
@@ -181,6 +235,43 @@ neighbouring pieces and try the fit before committing a full plate.** If they
 will not go together, raise `--clearance-mm` or lower `--tab-undercut-mm`; if
 they fall apart, do the reverse. Nothing in mesh or slicer validation can settle
 this for you.
+
+## Spires: what a piece may not contain
+
+Cutting the map into pieces asks one more question of it that the whole map was
+never asked. A slicer lays no extrusion into a section narrower than two minimum
+beads, so the top of a mast or a finial slices away to nothing. On the uncut map
+that is invisible: the layer belongs to a single object covering the whole city,
+and the rest of the city fills it. Give the spire an object of its own and the
+layer really is empty, and Bambu refuses the plate:
+
+```text
+Object can't be printed for empty layer between 11.24 and 12.2.
+Object: Piece C5
+Maybe parts of the object at these height are too thin, or the object has faulty mesh
+```
+
+So every piece is measured the way the slicer will measure it — layer by layer,
+on the union of its filaments — and trimmed at the top of the layer below the
+lowest one that slices away:
+
+```text
+Trimmed spire tips off 46 piece(s), at most 9.51 mm (piece E8): below 0.68 mm
+across, the slicer lays no extrusion and the layer would be an empty one of that
+object.
+```
+
+*Lowest*, not highest: a layer that prints nothing carries nothing above it
+either, so whatever sits over it is hanging in mid-air however wide its own
+section is. Piece E8's 9.51 mm is one such needle — a mast that tapers from
+0.684 mm to 0.014 mm over 40 layers, every one of them below the bound.
+
+Nothing printable is lost. The material removed is material the slicer already
+declines to lay down, on the uncut map exactly as here; the puzzle only has to
+say so, because an object may not contain it. The threshold is measured, not
+assumed — against Bambu on a hundred-piece cut of the tracked example, every
+layer it dropped was 0.644 mm across or narrower and every layer it kept was
+0.677 mm or wider, and `2 x min_bead_width` is 0.68 mm.
 
 ## Any outline, not just a rectangle
 
@@ -288,8 +379,11 @@ The per-piece rules are `validate_3mf`'s own, applied one piece at a time:
   every carried-through metadata member byte-identical to the source model's;
 - every material mesh closed, wound consistently, positive in volume, free of
   degenerate triangles, and inside the map's own footprint and above the plate;
-- each piece's filaments unioning to exactly one printable component with no
-  sealed printable chamber, judged against the shared crumb bound;
+- each piece's filaments unioning to exactly one printable component, judged
+  against the shared crumb bound;
+- no sealed printable chamber that the map did not already have — see below;
+- no empty layer: every layer of every piece holds a section the slicer can lay
+  an extrusion into, re-measured against the profile written into the archive;
 - `print_sequence` still `by layer`, because a multi-object plate printed piece
   by piece would drive the toolhead through pieces already standing;
 - no brim wide enough to reach across a seam.
@@ -303,12 +397,42 @@ come off in pieces. The closest pair is reported:
 Validation passed: 25 pieces, closest neighbours 0.480 mm apart
 ```
 
-That 0.48 mm is the knob recess: across the seam the pieces stand 0.84 mm apart,
-and the closest they ever come is a knob under its neighbour's surface.
+Which of the two shows up depends on the profile. On this one the seam
+(0.84 mm, two 0.42 mm outer walls) is wider than the recess (0.48 mm, two
+0.24 mm layers), so the recess is the tighter. On the Manhattan plates, printed
+at 0.16 mm layers, the recess is 0.32 mm and it governs by more still.
 
 A straight cut can sever a bridge abutment and leave its deck floating; that is
 what the one-printable-component rule catches, and it names the piece and the
 fragment volumes so you can try a different `--seed`, `--pieces` or `--grid`.
+
+### Chambers the map already had
+
+A cut can also seal a void — close off at both ends something that used to vent
+through ground now belonging to another piece. But a piece is a subset of the
+map, so a chamber found inside one may equally be something the map was already
+carrying, and the puzzle should not be blamed for that.
+
+This matters in practice because `generate_3mf` runs the assembly Boolean only
+under `--full-validation`. A model generated without it has never had the check
+applied. Plate A5 of the tracked Manhattan plan turns out to hold three sealed
+chambers of its own —
+
+```text
+(1.710 mm3, 0.265 mm)  (0.474 mm3, 0.241 mm)  (0.459 mm3, 0.234 mm)
+```
+
+— and the first puzzle cut from it reported the last of those verbatim.
+
+So the run compares. Only when a piece reports a chamber does it spend the one
+large Boolean that measures the uncut model, and it fails only for chambers that
+are not there:
+
+```text
+note: 1 sealed chamber(s) in the pieces are already in manhattan_2m_240_A5.3mf;
+the cut did not make them. Regenerate that model with --full-validation to see
+them reported there.
+```
 
 The hermetic geometry tests run separately:
 
