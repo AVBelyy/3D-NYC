@@ -11,19 +11,23 @@ leaves a puzzle that falls apart in the hand.
 """
 
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
 
 import numpy as np
+import shapely
 import shapely.affinity
 from shapely.geometry import box
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import generate_puzzle  # noqa: E402
-from generate_puzzle import (Grid, PrintProfile, PuzzleError, choose_grid,  # noqa: E402
-                             cut_curves, floor_polygons, knob_interference, knob_profile,
-                             piece_label, piece_rectangles, print_profile)
+from generate_puzzle import (Grid, Layout, PrintProfile, PuzzleError,  # noqa: E402
+                             choose_layout, cut_curves, floor_polygons, knob_interference,
+                             cell_box, knob_profile, layout_for, piece_label, seat_polygons,
+                             best_layout, derive_undercut, print_profile,
+                             printed_head_ratio)
 
 # A 0.4 mm nozzle at 0.24 mm layers with two 0.45 mm walls on a 256 mm plate --
 # the profile the tracked example model was resolved against.
@@ -32,33 +36,41 @@ P2S = PrintProfile(0.4, 0.24, 2, 0.45, 0.42, (256.0, 256.0), 3.0, 0.1, "by layer
 
 def square_cut(pieces=25, size=235.0, clearance=P2S.clearance_mm, seed=0,
                tab=generate_puzzle.DEFAULT_TAB_SIZE, neck=generate_puzzle.DEFAULT_TAB_NECK,
-               undercut=P2S.undercut_mm):
-    grid = choose_grid(size, size, pieces, 1.6)
-    curves = cut_curves(grid, np.random.default_rng(seed), size=tab, neck=neck,
+               undercut=None, footprint=None):
+    outline = box(0.0, 0.0, size, size) if footprint is None else footprint
+    layout = choose_layout(outline, size, size, pieces, 1.6, 0.35)
+    if undercut is None:
+        undercut = derive_undercut(
+            neck * min(layout.grid.cell_width, layout.grid.cell_height),
+            clearance, P2S.interference_mm)
+    curves = cut_curves(layout.grid, np.random.default_rng(seed), size=tab, neck=neck,
                         undercut=undercut)
-    return grid, curves, floor_polygons(grid, curves, clearance)
+    return layout, curves, floor_polygons(layout, curves, clearance, outline)
 
 
 class GridTests(unittest.TestCase):
+    @staticmethod
+    def square(size=235.0):
+        return box(0.0, 0.0, size, size)
+
     def test_the_piece_count_is_exact(self):
         for pieces in (1, 4, 12, 24, 25, 36, 100):
-            grid = choose_grid(235.0, 235.0, pieces, 3.0)
-            self.assertEqual(grid.pieces, pieces, pieces)
+            layout = choose_layout(self.square(), 235.0, 235.0, pieces, 3.0, 0.35)
+            self.assertEqual(layout.pieces, pieces, pieces)
 
-    def test_the_squarest_factorisation_wins(self):
-        self.assertEqual((choose_grid(200.0, 200.0, 36, 3.0).rows,
-                          choose_grid(200.0, 200.0, 36, 3.0).cols), (6, 6))
+    def test_the_squarest_grid_wins(self):
+        layout = choose_layout(self.square(200.0), 200.0, 200.0, 36, 3.0, 0.35)
+        self.assertEqual((layout.grid.rows, layout.grid.cols), (6, 6))
         # A 2:1 map wants a 2:1 grid to get square pieces back out of it.
-        grid = choose_grid(200.0, 100.0, 8, 3.0)
-        self.assertEqual((grid.rows, grid.cols), (2, 4))
-        self.assertAlmostEqual(grid.aspect, 1.0)
+        layout = choose_layout(box(0.0, 0.0, 200.0, 100.0), 200.0, 100.0, 8, 3.0, 0.35)
+        self.assertEqual((layout.grid.rows, layout.grid.cols), (2, 4))
+        self.assertAlmostEqual(layout.grid.aspect, 1.0)
 
-    def test_a_count_that_cannot_be_divided_fails_and_names_alternatives(self):
+    def test_a_count_a_rectangle_cannot_be_divided_into_fails_with_alternatives(self):
         with self.assertRaises(PuzzleError) as raised:
-            choose_grid(235.0, 235.0, 23, 1.6)
+            choose_layout(self.square(), 235.0, 235.0, 23, 1.6, 0.35)
         message = str(raised.exception)
         self.assertIn("23 pieces", message)
-        self.assertIn("1 x 23", message)
         for suggestion in ("20", "24", "25"):
             if suggestion in message:
                 break
@@ -67,9 +79,65 @@ class GridTests(unittest.TestCase):
 
     def test_a_workable_count_of_the_same_size_is_not_rejected(self):
         """The symmetric case: 24 is next door to 23 and must pass."""
-        grid = choose_grid(235.0, 235.0, 24, 1.6)
-        self.assertEqual(grid.pieces, 24)
-        self.assertLessEqual(grid.aspect, 1.6)
+        layout = choose_layout(self.square(), 235.0, 235.0, 24, 1.6, 0.35)
+        self.assertEqual(layout.pieces, 24)
+        self.assertLessEqual(layout.grid.aspect, 1.6)
+
+    # An L, the shape a street-following plate actually comes out as: it fills
+    # its own bounding box and leaves one corner empty.
+    L_SHAPE = box(0.0, 0.0, 200.0, 200.0).difference(box(120.0, 120.0, 200.0, 200.0))
+
+    def test_an_irregular_outline_is_cut_to_the_count_it_was_asked_for(self):
+        """A generated chunk is whatever polygon the planner cut, so the grid is
+        no longer tied to the piece count: what has to come out exactly is the
+        number of cells the model actually reaches."""
+        reachable = [n for n in range(8, 40)
+                     if best_layout(self.L_SHAPE, 200.0, 200.0, n, 1.6, 0.35)]
+        self.assertGreater(len(reachable), 5, "an L this simple should offer many counts")
+        for pieces in reachable:
+            layout = choose_layout(self.L_SHAPE, 200.0, 200.0, pieces, 1.6, 0.35)
+            self.assertEqual(layout.pieces, pieces, pieces)
+            self.assertLess(layout.pieces, layout.grid.rows * layout.grid.cols,
+                            "the empty corner should cost the grid some cells")
+
+    def test_a_count_the_outline_cannot_make_names_counts_it_can(self):
+        """Not every count is reachable on an irregular outline, so the refusal
+        has to hand back ones that are -- and they have to actually work."""
+        unreachable = [n for n in range(8, 40)
+                       if not best_layout(self.L_SHAPE, 200.0, 200.0, n, 1.6, 0.35)]
+        self.assertTrue(unreachable, "this L should not offer every count")
+        with self.assertRaises(PuzzleError) as raised:
+            choose_layout(self.L_SHAPE, 200.0, 200.0, unreachable[0], 1.6, 0.35)
+        for suggestion in re.findall(r"\b\d+\b", str(raised.exception).split("Try", 1)[1]):
+            self.assertIsNotNone(
+                best_layout(self.L_SHAPE, 200.0, 200.0, int(suggestion), 1.6, 0.35),
+                f"suggested {suggestion} pieces, which does not work either")
+
+    def test_a_cell_the_outline_clips_to_a_crumb_joins_its_neighbour(self):
+        """Rejecting those grids instead does not survive a real plate: over the
+        tracked Manhattan plan, a plate whose outline carries a thousand vertices
+        has almost no grid that escapes clipping something, and the count asked
+        for becomes unreachable at every size. So a crumb is absorbed, which is
+        what gives an irregular jigsaw its odd border pieces."""
+        # A 5 x 5 grid has 40 mm cells starting at x=120; a notch cut back to
+        # 125 leaves those cells holding a quarter of themselves or less.
+        notched = box(0.0, 0.0, 200.0, 200.0).difference(box(125.0, 125.0, 200.0, 200.0))
+        grid = Grid(5, 5, 200.0, 200.0)
+        layout, stranded = layout_for(grid, notched, 0.35)
+        self.assertEqual(stranded, 0, "every crumb should have found a host")
+        self.assertTrue(any(len(group) > 1 for group in layout.groups),
+                        "the clipped cells should have been absorbed, not kept")
+        # Every cell the model reaches belongs to exactly one piece, and no
+        # piece is a crumb.
+        owner = layout.owner()
+        cell_area = grid.cell_width * grid.cell_height
+        for group in layout.groups:
+            area = shapely.union_all([cell_box(grid, cell) for cell in group])
+            self.assertGreaterEqual(area.intersection(notched).area, 0.35 * cell_area)
+        for row in range(grid.rows):
+            for col in range(grid.cols):
+                covered = cell_box(grid, (row, col)).intersection(notched).area
+                self.assertEqual(covered > 1e-6, (row, col) in owner)
 
     def test_piece_labels_are_unique_and_spreadsheet_shaped(self):
         labels = [piece_label(row, col) for row in range(3) for col in range(30)]
@@ -113,6 +181,37 @@ class KnobTests(unittest.TestCase):
         pinched[waist, 0] += 0.8          # squeeze the shoulder below the neck
         self.assertGreater(knob_interference(pinched), knob_interference(good) + 0.15)
 
+    def test_the_undercut_shrinks_with_the_knob_it_sits_on(self):
+        """Measured on real plates: at 60 pieces a 115 x 132 mm chunk has a
+        3.17 mm knob neck, and the lock that looks right on an 11 mm neck makes
+        a head 1.43 times its own neck there -- a lump on a stalk. The undercut
+        is therefore capped by the shape it prints, and the lock is whatever
+        survives, down to nothing."""
+        clearance, machine = 0.4, 0.2
+        big = derive_undercut(11.28, clearance, machine)
+        small = derive_undercut(3.17, clearance, machine)
+        self.assertAlmostEqual(big, clearance + machine)          # the machine's lock
+        self.assertLess(small, big)                               # the shape's cap
+        for neck in (2.5, 3.17, 4.7, 5.64, 7.05, 11.28):
+            undercut = derive_undercut(neck, clearance, machine)
+            self.assertLessEqual(printed_head_ratio(neck, clearance, undercut),
+                                 generate_puzzle.TAB_TARGET_HEAD_RATIO + 1e-9, neck)
+        # A neck too small to out-reach the gap gets no lock, and says so by
+        # returning an undercut that does not cover the clearance.
+        self.assertLess(derive_undercut(3.17, clearance, machine), clearance)
+
+    def test_a_wider_gap_costs_the_knobs_shape(self):
+        """The measured trade-off behind the one-nozzle default: both halves of
+        a joint lose half the gap, so widening it slims the neck and the head
+        equally and the printed head/neck ratio gets worse. Over a 235 mm map at
+        a hundred pieces the neck is 5.64 mm."""
+        gentle = printed_head_ratio(5.64, 0.4, 0.4 + 0.2)
+        wide = printed_head_ratio(5.64, 0.84, 0.84 + 0.2)
+        self.assertLess(gentle, 1.3)                    # a normal jigsaw knob
+        self.assertGreater(wide, generate_puzzle.TAB_MAX_HEAD_RATIO)
+        # Bigger pieces absorb the same gap without complaint.
+        self.assertLess(printed_head_ratio(11.28, 0.84, 1.04), 1.25)
+
     def test_a_knob_too_big_for_its_edge_is_refused(self):
         with self.assertRaises(PuzzleError):
             knob_profile(10.0, 9.0, 2.0, 0.25)
@@ -136,12 +235,12 @@ class ProfileTests(unittest.TestCase):
         self.assertTrue(profile.complete())
         self.assertEqual(profile.plate_mm, (256.0, 256.0))
         self.assertAlmostEqual(profile.brim_margin_mm, 3.1)
-        self.assertAlmostEqual(profile.clearance_mm, 0.84)      # two outer wall lines
+        self.assertAlmostEqual(profile.clearance_mm, 0.4)       # one nozzle
         self.assertAlmostEqual(profile.interference_mm, 0.2)    # half a nozzle
         # Both halves of a joint are eroded by half the gap, so the undercut has
         # to cover the whole gap before any lock is left.
-        self.assertAlmostEqual(profile.undercut_mm, 0.84 + 0.2)
-        self.assertGreater(profile.undercut_mm, profile.clearance_mm)
+        self.assertAlmostEqual(
+            derive_undercut(11.28, profile.clearance_mm, profile.interference_mm), 0.4 + 0.2)
         self.assertAlmostEqual(profile.narrowest_knob_neck_mm, 1.8)   # 2 * 2 walls * 0.45
         self.assertAlmostEqual(profile.crumb_mm3, 0.4 ** 2 * 0.24)
         self.assertAlmostEqual(profile.vertical_clearance_mm, 0.48)   # two layers
@@ -151,10 +250,10 @@ class ProfileTests(unittest.TestCase):
         others by the object gap. Where an extrusion still fits in what is left,
         the first layer of the print welds the whole puzzle into a tile."""
         profile = print_profile(self.SETTINGS)
-        # 0.84 - 2*0.1 = 0.64 mm free, and a 0.42 mm line fits.
-        self.assertTrue(profile.brim_bridges_gap(profile.clearance_mm))
-        # 0.4 - 2*0.1 = 0.2 mm free, and it does not.
-        self.assertFalse(profile.brim_bridges_gap(0.4))
+        # 0.4 - 2*0.1 = 0.2 mm free, and a 0.42 mm line does not fit.
+        self.assertFalse(profile.brim_bridges_gap(profile.clearance_mm))
+        # 0.84 - 2*0.1 = 0.64 mm free, and it does.
+        self.assertTrue(profile.brim_bridges_gap(0.84))
 
     def test_a_project_without_a_brim_never_bridges(self):
         settings = json.loads(self.SETTINGS)
@@ -187,10 +286,14 @@ class CutTests(unittest.TestCase):
         curves = cut_curves(grid, np.random.default_rng(1), size=0.2, neck=0.24, undercut=0.25)
         expected = grid.rows * (grid.cols - 1) + grid.cols * (grid.rows - 1)
         self.assertEqual(len(curves), expected)
+        # Every key names the two cells the edge separates, both on the grid.
+        for (a, b) in curves:
+            for row, col in (a, b):
+                self.assertTrue(0 <= row < grid.rows and 0 <= col < grid.cols)
 
     def test_exactly_n_single_pieces_come_out(self):
         for pieces in (4, 9, 25, 48):
-            grid, _, polygons = square_cut(pieces)
+            layout, _, polygons = square_cut(pieces)
             self.assertEqual(len(polygons), pieces)
             for polygon in polygons:
                 self.assertEqual(polygon.geom_type, "Polygon")
@@ -199,7 +302,8 @@ class CutTests(unittest.TestCase):
 
     def test_the_clearance_is_the_gap_between_neighbours(self):
         clearance = 0.24
-        grid, _, polygons = square_cut(25, clearance=clearance)
+        layout, _, polygons = square_cut(25, clearance=clearance)
+        grid = layout.grid
         for row in range(grid.rows):
             for col in range(grid.cols):
                 here = polygons[row * grid.cols + col]
@@ -212,19 +316,20 @@ class CutTests(unittest.TestCase):
     def test_the_outer_edge_keeps_the_models_dimensions(self):
         """Only interior cuts are widened; a puzzle that shrank by a clearance
         on every side would no longer be the map it was cut from."""
-        grid, _, polygons = square_cut(25, clearance=0.4)
+        layout, _, polygons = square_cut(25, clearance=0.4)
         union_bounds = np.array([polygon.bounds for polygon in polygons])
         self.assertAlmostEqual(union_bounds[:, 0].min(), 0.0, places=9)
         self.assertAlmostEqual(union_bounds[:, 1].min(), 0.0, places=9)
-        self.assertAlmostEqual(union_bounds[:, 2].max(), grid.width, places=9)
-        self.assertAlmostEqual(union_bounds[:, 3].max(), grid.height, places=9)
+        self.assertAlmostEqual(union_bounds[:, 2].max(), layout.grid.width, places=9)
+        self.assertAlmostEqual(union_bounds[:, 3].max(), layout.grid.height, places=9)
 
     def test_pieces_tile_the_map_apart_from_the_gaps(self):
-        grid, curves, polygons = square_cut(25, clearance=0.2)
+        layout, curves, polygons = square_cut(25, clearance=0.2)
         covered = sum(polygon.area for polygon in polygons)
-        gap = sum(curve.length for curve in curves) * 0.2
-        self.assertLess(grid.width * grid.height - covered, gap * 1.3)
-        self.assertGreater(grid.width * grid.height - covered, gap * 0.5)
+        gap = sum(curve.length for curve in curves.values()) * 0.2
+        area = layout.grid.width * layout.grid.height
+        self.assertLess(area - covered, gap * 1.3)
+        self.assertGreater(area - covered, gap * 0.5)
 
     def test_pieces_do_not_overlap(self):
         _, _, polygons = square_cut(16)
@@ -233,8 +338,8 @@ class CutTests(unittest.TestCase):
                 self.assertLess(polygon.intersection(other).area, 1e-9)
 
     def test_every_piece_is_inside_the_map(self):
-        grid, _, polygons = square_cut(25)
-        outline = box(0.0, 0.0, grid.width, grid.height)
+        layout, _, polygons = square_cut(25)
+        outline = box(0.0, 0.0, layout.grid.width, layout.grid.height)
         for polygon in polygons:
             self.assertLess(polygon.difference(outline).area, 1e-9)
 
@@ -243,7 +348,7 @@ class CutTests(unittest.TestCase):
         deliver fewer pieces than were asked for."""
         with self.assertRaises(PuzzleError) as raised:
             square_cut(25, tab=0.9, neck=0.5)
-        self.assertIn("regions", str(raised.exception))
+        self.assertIn("knobs overlapped", str(raised.exception))
 
     def test_a_knob_that_stays_on_its_own_edge_is_not_refused(self):
         """The symmetric case, one notch below the failure above."""
@@ -281,8 +386,8 @@ class CutTests(unittest.TestCase):
         A piece may have no knobs at all: when all four of its edges point
         inward it is all sockets, which is an ordinary jigsaw piece and locks
         just as well. What no piece may lack is a seat."""
-        grid, _, polygons = square_cut(25, clearance=P2S.clearance_mm)
-        rectangles = piece_rectangles(grid, (0.0, 0.0), P2S.clearance_mm)
+        layout, _, polygons = square_cut(25, clearance=P2S.clearance_mm)
+        rectangles = seat_polygons(layout, (0.0, 0.0), P2S.clearance_mm)
         self.assertEqual(len(rectangles), len(polygons))
         knobbed = 0
         for polygon, rectangle in zip(polygons, rectangles):

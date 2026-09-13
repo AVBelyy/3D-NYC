@@ -84,11 +84,12 @@ profile, and the cut reads its bounds back out of it:
 
 | Bound | Derived from | Why that quantity |
 | --- | --- | --- |
-| Gap between pieces | `2 x outer_wall_line_width` | One extrusion of squish allowance on each side of the seam. Every piece prints at once, side by side, and the plate has to come off in pieces rather than as one tile. |
-| Knob undercut | the gap, plus half a nozzle | See below — the gap is subtracted from the joint before any of the overhang is left to lock with. |
+| Gap between pieces | one nozzle diameter | The width below which the slicer cannot resolve a void between two pieces at all, and several times the machine's own placement error. Every piece prints at once, side by side, and the plate has to come off in pieces rather than as one tile. |
+| Knob undercut | the gap plus half a nozzle, capped by the knob's own shape | See below. |
 | Knob recess | two layer heights | A knob lies *under* its neighbour's surface tier. Without a gap in Z the printer lays that surface straight onto the knob. Two layers: one of air, one for the sag of the layer bridged across it. |
 | Brim | kept only when a loop cannot fit the gap | A brim is laid outward from every object and clipped back from the others by `brim_object_gap`. Where an extrusion still fits in what is left, the first layer welds the puzzle into a tile. |
-| Floor plane | one layer below the lowest non-foundation geometry | The mesh states where the map's colour begins. One layer under it is the same shape of bound the generator sets itself, and keeps the cut off a colour skin's underside rather than grazing it. |
+| Floor plane | one layer below the lowest non-foundation geometry | The mesh states where the map's colour begins. One layer under it is the same shape of bound the generator sets itself, and keeps the cut off a colour skin's underside rather than grazing it. Measured across twenty-one generated models it lands anywhere from 1.64 to 3.08 mm, because it follows the map's own lowest ground rather than a constant. |
+| Outline | the cross section of the floor slab | Whatever polygon the map was cropped to, holes included, together with a check that it does not change with depth. |
 | Narrowest knob neck | `2 x wall_loops x wall line width` | Below it a knob is two walls touching rather than a solid section, so it has no strength to give. |
 | Loose-fragment threshold | `nozzle² x layer height` | One extrusion voxel — the same bound `validate_3mf` uses on the finished map, shared through `mesh_precision.minimum_printable_shell_volume_mm3`. |
 | Plate area | `printable_area` | The printer the project was resolved for. |
@@ -108,7 +109,7 @@ cartographic-style design choices, in the same class as
 `_material_layers.PAVEMENT_PAD_RELIEF_MM`: they are the proportions of a
 cardboard puzzle, held as module constants and scaled with the edge they sit on.
 
-## The joint, and why the gap sets the undercut
+## The joint: why the gap sets the undercut, and the knob caps it
 
 Both halves of a joint are cut from one curve and then each eroded by half the
 gap. So a knob's head loses half the gap and the notch it has to enter gains
@@ -120,12 +121,35 @@ lock = undercut - clearance
 
 An undercut sized on its own — half a nozzle, say — vanishes completely once a
 gap wide enough to separate the pieces is subtracted, and the puzzle falls apart
-in the hand. So the undercut is derived from whatever gap is in force rather
-than from the profile alone, and the run reports both:
+in the hand. So the undercut has to cover the gap first.
+
+But the same erosion slims the neck as well as the head, so a fixed undercut on
+a smaller knob makes a fatter knob. Measured over a 235 mm map, with the lock
+held at half a nozzle:
+
+| pieces | knob neck | head/neck at a 0.4 mm gap | at 0.84 mm |
+| --- | --- | --- | --- |
+| 25 | 11.28 mm | 1.11 | 1.20 |
+| 100 | 5.64 mm | 1.23 | 1.43 |
+| 196 | 4.03 mm | 1.33 | 1.65 |
+
+A cardboard jigsaw sits near 1.2; by 1.4 the head is a lump on a stalk and the
+stalk is what breaks. That measurement is why the gap is one nozzle rather than
+the two wall widths this script first used — widening the gap is not free, it is
+paid for in the knob.
+
+`derive_undercut` therefore takes the smaller of the two: the machine's lock,
+or whatever keeps the printed head within `TAB_TARGET_HEAD_RATIO` of its own
+neck. Where the cap bites, the lock is whatever survives, and the run says so:
 
 ```text
-0.84 mm gap, 1.04 mm undercut leaving 0.2 mm of lock
+warning: at a 3.17 mm knob neck, a head that stays within 1.25 times its own
+neck cannot out-reach the 0.4 mm gap, so the pieces will locate each other but
+not hold together. Narrow --clearance-mm, or ask for fewer, larger pieces.
 ```
+
+That is a real limit, not a tuning failure: below a certain piece size a gap
+wide enough to separate two pieces is already wider than the joint has to give.
 
 `tests/test_generate_puzzle.py` checks this the way a hand does: it pulls one
 piece straight away from its neighbour and asserts the knob is caught on the way
@@ -158,23 +182,53 @@ will not go together, raise `--clearance-mm` or lower `--tab-undercut-mm`; if
 they fall apart, do the reverse. Nothing in mesh or slicer validation can settle
 this for you.
 
-## Piece count and grid
+## Any outline, not just a rectangle
 
-`--pieces` is exact. The planner picks the factorisation of that number whose
-pieces come out squarest for the map's proportions — 25 over a square map is
-5 x 5, and 8 over a 2:1 map is 2 x 4.
+A generated map is whatever polygon it was cropped to. A `--latitude/--longitude`
+crop is a rectangle; a plate from [a multi-plate plan](plan_map_chunks.md) is the
+street-following polygon the planner cut, and fills as little as half its own
+bounding box. The outline is therefore measured off the model rather than
+assumed — it is the cross section of the floor slab, holes and all — and the
+grid is laid over its bounding box with the cells the model never reaches
+discarded.
 
-A count that does not factor into acceptable pieces fails rather than quietly
-producing ribbons:
+So `--pieces` counts the cells that *are* pieces. Over a rectangle that is still
+a factorisation of the count; over an irregular outline the grid is no longer
+tied to the count at all, and an 11 x 8 grid may be the one that yields exactly
+sixty pieces.
+
+Where the outline crosses a cell it leaves a piece smaller than the rest, and
+below `--min-piece-fill` (default 0.35 of a cell) that piece is too small to
+print a knob on or to pick up. Those cells are not dropped — that would cut a
+notch out of the map — and the grid is not rejected either. The cell joins
+whichever neighbouring piece already holds the most, which is exactly the
+odd-shaped border piece an irregular jigsaw has.
+
+Cell adjacency is not region adjacency, which is the trap here: on an outline
+that wanders, two neighbouring cells can each hold a corner of the map that
+never touches the other, and joining them would make one piece in two halves.
+A crumb is therefore attached only to a host it shares a real edge with, and a
+group whose covered area does not come out as one polygon disqualifies the grid.
+
+Rejecting the grid whenever it clips *anything* is the obvious first thing to
+try, and it does not survive contact with a real plate. Measured over the twenty tracked Manhattan
+plates, asking for a grid that clips nothing leaves between **zero and
+twenty-six** usable piece counts in the range 20–160, and none at all on the
+plates whose outlines carry thousands of vertices. Absorbing the crumb instead
+leaves **47 to 86** counts on every plate, never more than nine apart, with no
+piece under a third of a cell.
+
+Not every count survives even so. The refusal names ones that do:
 
 ```text
-error: 23 pieces over a 235 x 235 mm map only factors into shapes as narrow as
-1 x 23 (23.00:1 pieces), past the 1.6:1 limit. Try 20, 24, 25 pieces, raise
---max-piece-aspect, or set --grid ROWSxCOLS explicitly.
+error: No grid cuts exactly 60 pieces from this 173.95 x 238 mm outline (90% of
+its bounding box) at 1.6:1 pieces and a 35% minimum fill. Try 59, 66, 68 pieces,
+or relax --max-piece-aspect or --min-piece-fill.
 ```
 
-`--max-piece-aspect` (default 1.6) sets how oblong a piece may be, and
-`--grid ROWSxCOLS` overrides the choice entirely.
+`--max-piece-aspect` (default 1.6) sets how oblong a piece may be and is the
+setting that most widens the reachable counts; `--grid ROWSxCOLS` overrides the
+search entirely.
 
 There is no minimum piece size in millimetres, because the real limit is the
 knob, not the piece. Asking for too many pieces fails on the neck instead, in
