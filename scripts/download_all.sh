@@ -39,6 +39,10 @@ Download every raw source dataset into data/raw/, then run
 scripts/cache_all.sh to build the caches scripts/generate_3mf.py reads.
 
 Options:
+  --no-lidar
+        Fetch no LiDAR collection at all. Pair it with cache_all.sh --no-lidar
+        and generate_3mf.py --elevation-source vector, which builds terrain
+        from surveyed spot elevations and models the canopy instead.
   --lidar-dataset NAME
         Which LiDAR collection to fetch: nyc_lidar_2021 (default, about 39 GB
         of published per-borough rasters) or nyc_lidar_2017, for which only
@@ -73,9 +77,15 @@ run() {
 
 lidar_dataset=nyc_lidar_2021
 land_cover_dataset=nyc_land_cover_2021
+no_lidar=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --no-lidar)
+      no_lidar=1
+      shift
+      continue
+      ;;
     --lidar-dataset)
       [[ $# -ge 2 ]] || die '--lidar-dataset needs a value'
       case $2 in
@@ -121,7 +131,9 @@ done
 # only its tile index, because its LAZ are selected by area and pulled on
 # demand by cache_all.sh. Fetching just the selected one keeps a 2017 build
 # from dragging in 39 GB it will never cache.
-if [[ $lidar_dataset == nyc_lidar_2021 ]]; then
+if [[ $no_lidar -eq 1 ]]; then
+  printf '\n==> skipping every LiDAR download\n' >&2
+elif [[ $lidar_dataset == nyc_lidar_2021 ]]; then
   run "$PYTHON" scripts/download_nyc_lidar_2021.py
 else
   run "$PYTHON" scripts/download_nyc_lidar_2017.py --index-only

@@ -52,13 +52,24 @@ from _cache_land_cover import (
 )
 from _datasets import DATASETS
 from download_data import ROOT, download
-from cache_common import read_tiled_geoparquet
+from cache_common import NYC_BOUNDS, read_tiled_geoparquet
 from crossings import structural_roof_thickness_mm
 from _material_layers import (
     DRAWN_LINE_RELIEF_MM, FIRST_LAYER_HEIGHT_MM, MATERIAL_NAMES, pavement_pad_relief_mm,
     printable_width_mm,DRAWN_LINE_BEADS,MINIMUM_FEATURE_BEADS,
     surface_color_depth_mm)
 from road_symbols import TRAIL_HIGHWAYS
+from _surface_styles import LAND_COVER_TREE_CANOPY
+from _vector_elevation import (
+    CANOPY_CROWN_SCALE_M,
+    CANOPY_EDGE_HEIGHT_M,
+    CANOPY_MATURE_HEIGHT_M,
+    canopy_model_report,
+    control_point_floor,
+    crown_canopy_height,
+    ground_control_points,
+    interpolate_terrain_grid,
+)
 
 
 PIPELINE_VERSION = 25
@@ -69,6 +80,13 @@ MESH_PIPELINE_VERSION = 24
 PACKAGE_PIPELINE_VERSION = 9
 VALIDATION_PIPELINE_VERSION = 4
 SLICE_PIPELINE_VERSION = 2
+# Only the vector terrain stage carries a key; the LiDAR stage never has.
+TERRAIN_PIPELINE_VERSION = 1
+# How far beyond the crop surveyed ground elevations are read for the
+# triangulation. Several times the roughly twenty-metre control spacing, so the
+# whole crop lies well inside the convex hull and neighbouring plates share the
+# same points across a seam.
+TERRAIN_CONTROL_HALO_M = 150.0
 FT = 0.3048006096012192
 PLATE_MM = 256.0
 PLATE_EDGE_CLEARANCE_MM = 0.1
@@ -163,7 +181,6 @@ def installed_presets(printer_model: str, slicer: Path) -> dict:
     return {"machines": machines, "processes": processes}
 
 
-NYC_BOUNDS = (-74.27, 40.47, -73.68, 40.93)
 MATERIAL_COLORS = ["#F2F0E8", "#5FAA72", "#A9D5DF", "#C79A61"]
 BUILDING_COLOR_ALIASES = {
     "ivory": 0,
@@ -306,7 +323,8 @@ def count_osm_semantic_features(
     }
 
 
-def stage_variants(cache_identity, land_cover_dataset: str = LAND_COVER_DATASETS[0]):
+def stage_variants(cache_identity, land_cover_dataset: str = LAND_COVER_DATASETS[0],
+                   elevation_source: str = "lidar"):
     """Every stage's cache key, including the keys of the stages it reads.
 
     A stage is skipped when the config hash and this key both match what its
@@ -326,12 +344,21 @@ def stage_variants(cache_identity, land_cover_dataset: str = LAND_COVER_DATASETS
         "nyc_planimetrics_2022", "nyc_building_footprints", "nyc_parks_trails",
     )}}
     citygml = {"cache": cache_identity("nyc_3d_buildings_2014")}
-    # The LiDAR stage validates its own source every run and has never carried
-    # a key.  Naming it None here keeps it that way while still recording that
-    # the fields are built from it.
-    lidar = None
     landcover = {"dataset": land_cover_dataset,
                  "cache": cache_identity(land_cover_dataset)}
+    # The LiDAR stage validates its own source every run and has never carried
+    # a key.  Naming it None here keeps it that way while still recording that
+    # the fields are built from it.  The vector terrain stage has to carry one:
+    # it reads the cached vector datasets and applies a canopy model of its
+    # own, and neither can announce a change any other way.
+    terrain = None if elevation_source == "lidar" else {
+        "terrain_pipeline_version": TERRAIN_PIPELINE_VERSION,
+        "elevation_source": elevation_source,
+        "caches": {name: cache_identity(name) for name in (
+            "nyc_planimetrics_2022", "nyc_building_footprints",
+        )},
+        "landcover": landcover,
+    }
     osm = {"cache": cache_identity("new_york_osm")}
     details = {"detail_pipeline_version": DETAIL_PIPELINE_VERSION, "caches": {
         name: cache_identity(name) for name in (
@@ -341,7 +368,7 @@ def stage_variants(cache_identity, land_cover_dataset: str = LAND_COVER_DATASETS
     fields = {"field_pipeline_version": FIELD_PIPELINE_VERSION,
         "details": "parks structures and subway entrances",
         "inputs": {"prepare_vectors": vectors, "extract_citygml": citygml,
-            "prepare_lidar": lidar, "prepare_landcover": landcover,
+            "prepare_lidar": terrain, "prepare_landcover": landcover,
             "extract_osm": osm, "prepare_details": details}}
     crossings = {"crossing_validation_version": CROSSING_VALIDATION_VERSION,
         "coverage": "tagged_bridges_and_surface_routes_over_tunnels",
@@ -356,7 +383,7 @@ def stage_variants(cache_identity, land_cover_dataset: str = LAND_COVER_DATASETS
     slicing = {"slice_pipeline_version": SLICE_PIPELINE_VERSION,
         "inputs": {"package_3mf": package}}
     return {
-        "prepare_vectors": vectors, "extract_citygml": citygml, "prepare_lidar": lidar,
+        "prepare_vectors": vectors, "extract_citygml": citygml, "prepare_lidar": terrain,
         "prepare_landcover": landcover, "extract_osm": osm, "prepare_details": details,
         "build_fields": fields, "validate_crossing_fields": crossings,
         "build_meshes": meshes, "render_preview": meshes,
@@ -383,6 +410,7 @@ class Pipeline:
             else (self.data_dir / "cache").resolve()
         )
         self.lidar_source = args.lidar_source
+        self.elevation_source = config.get("elevation_source", args.elevation_source)
         # The land-cover collection is selectable, so the download that
         # backs an uncached run has to follow the selection rather than
         # the module default.
@@ -552,6 +580,10 @@ class Pipeline:
             source.extractall(archive.parent)
         return folder
 
+    @property
+    def uses_lidar(self) -> bool:
+        return self.elevation_source == "lidar"
+
     def ensure_lidar_index(self) -> gpd.GeoDataFrame:
         path = self.raw / "nyc_lidar_2017/index.geojson"
         if path.exists():
@@ -659,7 +691,7 @@ class Pipeline:
         # Validate a local cache before downloading any of the other shared
         # inputs.  An in-progress cache should fail fast instead of leaving a
         # large partially prepared generation job behind.
-        if self.lidar_source == "cache":
+        if self.uses_lidar and self.lidar_source == "cache":
             cache, manifest, catalog = self.ensure_lidar_cache()
             if catalog[catalog.intersects(self.source_aoi_2263)].empty:
                 raise RuntimeError(
@@ -687,6 +719,15 @@ class Pipeline:
             self.ensure_download(key)
         if "nyc_planimetrics_2022" not in available_components:
             self.ensure_planimetrics()
+        if not self.uses_lidar:
+            self.log.info("elevation_source_selected", elevation_source=self.elevation_source,
+                          terrain="Planimetrics spot elevations and building ground elevations",
+                          canopy="crown-size model over the land-cover canopy class")
+            atomic_json(
+                self.job / "raw_ready.json",
+                {"datasets": list(self.downloads), "elevation_source": self.elevation_source},
+            )
+            return
         if self.lidar_source == "cache":
             self.log.info(
                 "lidar_cache_ready",
@@ -1300,6 +1341,118 @@ class Pipeline:
             "transform": transform,
         }
 
+    def raster_profile(self, grid: dict, dtype: str, nodata) -> dict:
+        """One GeoTIFF profile for every raster written on the job grid."""
+        return {
+            "driver": "GTiff", "width": grid["width"], "height": grid["height"],
+            "count": 1, "dtype": dtype, "crs": "EPSG:2263",
+            "transform": grid["transform"], "compress": "deflate", "tiled": True,
+            "nodata": nodata,
+        }
+
+    def terrain_control_points(self, grid: dict):
+        """Surveyed ground elevations for this job, with a shared-edge halo.
+
+        The halo is read in world coordinates rather than clipped to the crop,
+        so two neighbouring plates triangulate the same points either side of
+        the seam they share and agree on the terrain there.
+        """
+        pad_ft = TERRAIN_CONTROL_HALO_M / FT
+        minx, miny, maxx, maxy = self.source_aoi_2263.bounds
+        bounds = (minx - pad_ft, miny - pad_ft, maxx + pad_ft, maxy + pad_ft)
+        planimetrics = self.cached_dataset("nyc_planimetrics_2022")
+        if planimetrics is None:
+            raise RuntimeError(
+                "Vector terrain needs the cached Planimetrics ELEVATION layer; "
+                "build it with scripts/cache_nyc_planimetrics_2022.py"
+            )
+        elevations = read_geoparquet_bbox(planimetrics[0] / "ELEVATION.parquet", bounds)
+        footprints = None
+        buildings = self.cached_dataset("nyc_building_footprints")
+        if buildings is not None:
+            footprints = read_tiled_geoparquet(
+                buildings[0], bounds,
+                deduplicate_by=["objectid", "doitt_id"], source_order=["source_order"],
+            )
+        else:
+            path = self.processed / "buildings_aoi.parquet"
+            if path.exists():
+                footprints = gpd.read_parquet(path)
+        return ground_control_points(elevations, footprints)
+
+    def prepare_terrain_from_vectors(self):
+        """Build both elevation rasters without reading any LiDAR.
+
+        Terrain is a linear triangulation of surveyed spot and building-base
+        elevations.  The upper surface carries the modelled canopy and nothing
+        else: rooftop fixture heights fall back to the inferred minimum the
+        configuration already states rather than being invented from a surface
+        that never measured a roof.
+        """
+        grid = self.lidar_destination_grid()
+        points = self.terrain_control_points(grid)
+        ground = interpolate_terrain_grid(
+            points, grid["transform"], (grid["height"], grid["width"])
+        )
+
+        landcover_path = self.processed / "rasters/landcover.tif"
+        if not landcover_path.is_file():
+            raise RuntimeError(
+                f"Vector terrain reads the land-cover raster for canopy extent: {landcover_path}"
+            )
+        with rasterio.open(landcover_path) as source:
+            if (source.height, source.width) != (grid["height"], grid["width"]):
+                raise RuntimeError("Land-cover raster is not on this job's destination grid")
+            canopy_mask = source.read(1) == LAND_COVER_TREE_CANOPY
+        cell_m = grid["resolution_ft"] * FT
+        canopy = crown_canopy_height(
+            canopy_mask, cell_m=cell_m,
+            edge_height_m=self.config.get("canopy_edge_height_m", CANOPY_EDGE_HEIGHT_M),
+            mature_height_m=self.config.get("canopy_mature_height_m", CANOPY_MATURE_HEIGHT_M),
+            crown_scale_m=self.config.get("canopy_crown_scale_m", CANOPY_CROWN_SCALE_M),
+        )
+        # The upper surface is written everywhere rather than left no-data off
+        # the canopy: the field builder resamples it bilinearly through a halo,
+        # and a raster that is mostly no-data smears that gap back over the
+        # canopy edge. Off the canopy it equals the terrain, which is below
+        # every roof, so rooftop fixtures take the configured inferred minimum.
+        upper = (ground + canopy).astype(np.float32)
+
+        rasters = self.processed / "rasters"
+        rasters.mkdir(parents=True, exist_ok=True)
+        profile = self.raster_profile(grid, "float32", np.nan)
+        for name, array in {"ground_m": ground, "upper_surface_m": upper}.items():
+            with rasterio.open(rasters / f"{name}.tif", "w", **profile) as target:
+                target.write(array.astype(np.float32, copy=False), 1)
+        # Diagnostics that only exist when individual LAZ returns are binned.
+        for name in ["ground_distance_m", "return_count", "ground_return_count"]:
+            (rasters / f"{name}.tif").unlink(missing_ok=True)
+        atomic_json(self.analysis / "lidar.json", {
+            "source": "vector",
+            "elevation_source": self.elevation_source,
+            "terrain_control_points": len(points),
+            "terrain_control_halo_m": TERRAIN_CONTROL_HALO_M,
+            "terrain_method": (
+                "linear triangulation of Planimetrics spot elevations and "
+                "Building Footprints ground elevations; nearest value outside the hull"
+            ),
+            "terrain_control_point_floor_m": control_point_floor(points),
+            "upper_surface_describes": "modelled canopy only; no measured roofs or structures",
+            "canopy_model": canopy_model_report(
+                cell_m,
+                edge_height_m=self.config.get("canopy_edge_height_m", CANOPY_EDGE_HEIGHT_M),
+                mature_height_m=self.config.get("canopy_mature_height_m", CANOPY_MATURE_HEIGHT_M),
+                crown_scale_m=self.config.get("canopy_crown_scale_m", CANOPY_CROWN_SCALE_M),
+                cells=int(canopy_mask.sum()),
+            ),
+            "shape": [grid["height"], grid["width"]],
+            "ground_observed_fraction": 1.0,
+            "ground_filled_fraction": 0.0,
+            "classes": {},
+            "return_counts_available": False,
+            **points.provenance,
+        })
+
     def mosaic_lidar_cache(self, catalog: gpd.GeoDataFrame, cache: Path, name: str, grid: dict):
         """Reproject one canonical cache field into this job's rotated grid."""
         destination = np.full((grid["height"], grid["width"]), np.nan, np.float32)
@@ -1378,6 +1531,9 @@ class Pipeline:
         })
 
     def prepare_lidar(self):
+        if not self.uses_lidar:
+            self.prepare_terrain_from_vectors()
+            return
         if self.lidar_source == "cache":
             self.prepare_lidar_from_cache()
             return
@@ -1472,10 +1628,14 @@ class Pipeline:
         })
 
     def prepare_landcover(self):
-        reference_path = self.processed / "rasters/ground_m.tif"
-        with rasterio.open(reference_path) as reference:
-            shape, transform, crs = reference.shape, reference.transform, reference.crs
-            profile = reference.profile.copy()
+        # The destination grid is a function of the job configuration alone, so
+        # land cover no longer waits on an elevation raster to learn its shape.
+        # Terrain can then be the stage that reads land cover, which is what a
+        # modelled canopy needs.
+        grid = self.lidar_destination_grid()
+        shape = (grid["height"], grid["width"])
+        transform, crs = grid["transform"], "EPSG:2263"
+        profile = self.raster_profile(grid, "uint8", 0)
         collection = LAND_COVER_COLLECTIONS[self.land_cover_dataset]
         cached = self.cached_dataset(collection.name)
         if cached is not None:
@@ -1495,7 +1655,7 @@ class Pipeline:
                 dst_transform=transform, dst_crs=crs,
                 resampling=Resampling.nearest, dst_nodata=0,
             )
-        profile.update(dtype="uint8", nodata=0, count=1)
+        (self.processed / "rasters").mkdir(parents=True, exist_ok=True)
         with rasterio.open(self.processed / "rasters/landcover.tif", "w", **profile) as target:
             target.write(classes.astype(np.uint8), 1)
         values, counts = np.unique(classes, return_counts=True)
@@ -1665,7 +1825,8 @@ class Pipeline:
             self.download_sources,
             cacheable=False,
         )
-        variants = stage_variants(self.cache_identity, self.land_cover_dataset)
+        variants = stage_variants(self.cache_identity, self.land_cover_dataset,
+                                  self.elevation_source)
         vector_outputs = [self.processed / f"planimetrics_{name}_aoi.parquet" for name in PLANIMETRIC_LAYERS]
         vector_outputs += [
             self.processed / "buildings_projected_aoi.parquet",
@@ -1681,14 +1842,16 @@ class Pipeline:
             self.processed / "citygml_buildings_aoi.parquet",
             self.processed / "citygml_surfaces_aoi.parquet",
         ], self.extract_citygml, variant=variants["extract_citygml"])
-        self.stage("prepare_lidar", [
-            self.processed / "rasters/ground_m.tif",
-            self.processed / "rasters/upper_surface_m.tif",
-        ], self.prepare_lidar, variant=variants["prepare_lidar"])
+        # Land cover comes first: it needs only the configured destination
+        # grid, and a modelled canopy needs it before the upper surface exists.
         self.stage(
             "prepare_landcover", [self.processed / "rasters/landcover.tif"], self.prepare_landcover,
             variant=variants["prepare_landcover"],
         )
+        self.stage("prepare_lidar", [
+            self.processed / "rasters/ground_m.tif",
+            self.processed / "rasters/upper_surface_m.tif",
+        ], self.prepare_lidar, variant=variants["prepare_lidar"])
         python = Path(sys.executable)
         self.stage("extract_osm", [self.work / "osm_detail.parquet"], lambda: self.run_command(
             "extract_osm", [str(python), str(SCRIPT_DIR / "extract_osm.py")]
@@ -2152,8 +2315,15 @@ def parser() -> argparse.ArgumentParser:
         help="Root for generated jobs, models, plans, and other disposable output",
     )
     result.add_argument(
+        "--elevation-source", choices=["lidar", "vector"], default="lidar",
+        help="Where terrain and canopy come from: measured LiDAR surfaces "
+             "(default) or surveyed spot elevations with a modelled canopy, "
+             "which needs no LiDAR collection at all",
+    )
+    result.add_argument(
         "--lidar-source", choices=["cache", "laz"], default="cache",
-        help="Elevation source: cached 0.5 m rasters (default) or raw LAZ tiles",
+        help="Which LiDAR surfaces to read when --elevation-source is lidar: "
+             "cached 0.5 m rasters (default) or raw LAZ tiles",
     )
     result.add_argument(
         "--lidar-cache-dir", type=Path,
@@ -2372,6 +2542,7 @@ def build_config(args) -> tuple[dict, str, Path]:
         "terrain_relief_factor": args.terrain_relief_factor,
         "minimum_terrain_levels": args.minimum_terrain_levels,
         "infer_hidden_road_profiles": args.infer_hidden_road_profiles,
+        "elevation_source": args.elevation_source,
         "lidar_source": args.lidar_source,
         "cache_dir": str(cache_dir),
         "building_color_overrides": args.building_colors,
@@ -2404,6 +2575,7 @@ def build_config(args) -> tuple[dict, str, Path]:
         "scale_denominator": effective_scale, "grid_step_mm": args.grid_step_mm,
         "aoi_wgs84": aoi_geojson, "frame_epsg2263": frame,
         "source_padding_m": args.source_padding_m,
+        "elevation_source": args.elevation_source,
         "lidar_source": args.lidar_source,
         "lidar_cache_dir": str(lidar_cache_dir),
         "cache_dir": str(cache_dir),
@@ -2420,6 +2592,9 @@ def build_config(args) -> tuple[dict, str, Path]:
         "canopy_max_height_m": 36.0, "canopy_minimum_source_height_m": 1.0,
         "canopy_smoothing_m": 1.0, "canopy_maximum_closed_gap_mm": 0.75,
         "canopy_edge_roll_mm": 0.50, "canopy_trail_setback_mm": 0.30,
+        "canopy_edge_height_m": CANOPY_EDGE_HEIGHT_M,
+        "canopy_mature_height_m": CANOPY_MATURE_HEIGHT_M,
+        "canopy_crown_scale_m": CANOPY_CROWN_SCALE_M,
         "infer_hidden_road_profiles": args.infer_hidden_road_profiles, "minimum_tunnel_clearance_mm": 0.48,
         "minimum_tunnel_cover_mm": structural_roof, "minimum_tunnel_evidence_mm": 0.08,
         "maximum_tunnel_clearance_mm": 1.40, "tunnel_portal_transition_fraction": 0.15,
@@ -2454,7 +2629,10 @@ def build_config(args) -> tuple[dict, str, Path]:
         "prime_tower_position_mm": list(PRIME_TOWER_POSITION_MM),
         "prime_tower_layout": proposed_prime_layout,
         "source_notes": (
-            f"Generated from cached/downloaded free NYC sources (LiDAR source: {args.lidar_source}); "
+            "Generated from cached/downloaded free NYC sources (elevation source: "
+            + (f"LiDAR, {args.lidar_source}" if args.elevation_source == "lidar"
+               else "surveyed spot elevations with a modelled canopy, no LiDAR")
+            + "); "
             "contains OpenStreetMap data © OpenStreetMap contributors, available under ODbL 1.0; "
             "see ATTRIBUTION.md, the job manifest, and logs."
         ),

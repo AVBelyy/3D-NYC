@@ -31,8 +31,18 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data"
 DEFAULT_CACHE_ROOT = DATA / "cache"
 DEFAULT_COVERAGE = DATA / "cache/nyc_lidar_2021/catalog.geojson"
+#: ``--coverage supported-area`` instead of a catalog path. It is not bounded
+#: coverage: it is the whole area the generator accepts a request inside, so a
+#: cache built to it is as complete as one built to a LiDAR catalog and stays
+#: production-ready. It is what a LiDAR-free build takes its extent from.
+SUPPORTED_AREA = Path("supported-area")
 CRS = "EPSG:2263"
 CACHE_FORMAT_VERSION = 1
+#: WGS84 bounding box of the area the generator will accept a request inside.
+#: It lives here because the cache builders need the same bound: a cache that
+#: does not span it cannot serve every model the generator would allow, and a
+#: cache built larger is work no model can use.
+NYC_BOUNDS = (-74.27, 40.47, -73.68, 40.93)
 
 
 def utc_now() -> str:
@@ -233,15 +243,64 @@ def format_duration(seconds: float) -> str:
     return f"{hours:d}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes:d}:{seconds:02d}"
 
 
+def supported_area_bounds() -> tuple[float, float, float, float]:
+    """``NYC_BOUNDS`` as an EPSG:2263 envelope.
+
+    The extent ``--coverage supported-area`` resolves to, and the one a cache
+    built without a LiDAR catalog covers.
+    """
+    envelope = gpd.GeoSeries([box(*NYC_BOUNDS)], crs=4326).to_crs(CRS).total_bounds
+    return tuple(float(value) for value in envelope)
+
+
+def is_supported_area(catalog) -> bool:
+    """Whether ``--coverage`` named the supported area rather than a catalog."""
+    return Path(catalog) == SUPPORTED_AREA
+
+
+def resolved_coverage(catalog) -> Path:
+    """``--coverage`` as ``load_coverage`` wants it: a real path, or the sentinel."""
+    catalog = Path(catalog)
+    return catalog if is_supported_area(catalog) else catalog.resolve()
+
+
+def coverage_signature(catalog, bounds) -> dict | None:
+    """Identity of the file a cache took its coverage from, where there is one.
+
+    Explicit bounds and the supported-area envelope are both stated in the
+    configuration itself, so neither has a source file to sign.
+    """
+    if bounds is not None or is_supported_area(catalog):
+        return None
+    return file_signature(Path(catalog).resolve())
+
+
+def coverage_label(catalog, bounds) -> str | None:
+    """What a cache manifest records as the coverage it was built to."""
+    if bounds is not None:
+        return None
+    return str(SUPPORTED_AREA) if is_supported_area(catalog) else str(Path(catalog).resolve())
+
+
+def coverage_mode(catalog, bounds) -> str:
+    """How a cache manifest states which of the three extents it was built to."""
+    if bounds is not None:
+        return "explicit_bounds"
+    return "supported_area_envelope" if is_supported_area(catalog) else "catalog_envelope"
+
+
 def load_coverage(catalog: Path = DEFAULT_COVERAGE, bounds: Iterable[float] | None = None):
     if bounds is not None:
         values = tuple(float(value) for value in bounds)
         if len(values) != 4 or values[0] >= values[2] or values[1] >= values[3]:
             raise ValueError("--bounds must be xmin ymin xmax ymax in EPSG:2263")
         return box(*values)
+    if is_supported_area(catalog):
+        return box(*supported_area_bounds())
     if not catalog.exists():
         raise FileNotFoundError(
-            f"Coverage catalog is missing: {catalog}. Build the LiDAR cache first or pass --bounds."
+            f"Coverage catalog is missing: {catalog}. Build the LiDAR cache first, "
+            f"pass --coverage {SUPPORTED_AREA} for the whole supported area, or pass --bounds."
         )
     frame = gpd.read_file(catalog)
     if frame.crs is None:

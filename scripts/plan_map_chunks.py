@@ -30,6 +30,7 @@ from shapely.geometry import Polygon
 
 import _chunk_geometry as geometry
 from _chunk_cost import (
+    ELEVATION_SOURCES,
     LAND_COVER_DATASETS,
     LIDAR_DATASETS,
     CostWeights,
@@ -388,6 +389,11 @@ def command_for(chunk: dict, shared: dict, paths: dict) -> list[str]:
     land_cover = shared.get("land_cover_dataset", LAND_COVER_DATASETS[0])
     if land_cover != LAND_COVER_DATASETS[0]:
         command += ["--land-cover-dataset", land_cover]
+    # The shared datum and the relief factor above were measured from one
+    # elevation source; a plate built from the other would step at every seam.
+    elevation_source = shared.get("elevation_source", ELEVATION_SOURCES[0])
+    if elevation_source != ELEVATION_SOURCES[0]:
+        command += ["--elevation-source", elevation_source]
     if shared["offline"]:
         command.append("--offline")
     if shared["no_preview"]:
@@ -646,6 +652,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--data-dir", type=Path, default=ROOT / "data", help="Shared input-data root")
     result.add_argument("--cache-dir", type=Path, help="Dataset cache root (defaults to <data-dir>/cache)")
     result.add_argument(
+        "--elevation-source", choices=ELEVATION_SOURCES, default=ELEVATION_SOURCES[0],
+        help="Where the cut-cost surface gets terrain and standing height: measured "
+             "LiDAR (default) or surveyed spot elevations with a modelled canopy. "
+             "The choice is pinned into every chunk command so the plates match.",
+    )
+    result.add_argument(
         "--lidar-dataset", choices=LIDAR_DATASETS, default=LIDAR_DATASETS[0],
         help="Cached LiDAR collection the cut-cost surface measures height from. "
              "Both publish the same contract; the plan records which one it used.",
@@ -835,6 +847,7 @@ def run(args, log) -> dict:
     surface = build_cost_surface(
         frame, target_ft,
         cache_dir=resolved["cache_dir"],
+        elevation_source=args.elevation_source,
         lidar_dataset=args.lidar_dataset,
         land_cover_dataset=args.land_cover_dataset,
         resolution_m=args.cost_resolution_m,
@@ -921,6 +934,7 @@ def run(args, log) -> dict:
         "source_padding_m": args.source_padding_m,
         "prime_tower": args.prime_tower,
         "land_cover_dataset": args.land_cover_dataset,
+        "elevation_source": args.elevation_source,
         "offline": args.offline,
         "no_preview": args.generate_no_preview,
         "model_dir": str(args.output_dir / "models"),
@@ -1033,6 +1047,11 @@ def report(directory: Path, chunks, quality: dict, shared: dict, scale: float,
                   f"on the {'/'.join(item['between'])} seam)")
     print(f"  shared datum   {shared['terrain_origin_m']:.2f} m NAVD88, "
           f"relief factor {shared['terrain_relief_factor']:.3f}")
+    # Say so when the heights above are not measurements, so nobody reads a
+    # modelled canopy or a triangulated datum as survey evidence.
+    if shared.get("elevation_source", ELEVATION_SOURCES[0]) != ELEVATION_SOURCES[0]:
+        print("  elevation      triangulated spot elevations, modelled canopy; "
+              "heights above are not measured")
     print(f"  wrote          {directory}")
     print(f"  run            {directory / 'commands.sh'}")
 

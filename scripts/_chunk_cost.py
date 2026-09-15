@@ -44,9 +44,22 @@ from _chunk_geometry import (
     to_points,
 )
 from cache_common import read_tiled_geoparquet
+from _vector_elevation import (
+    VectorElevationError,
+    crown_canopy_height,
+    ground_control_points,
+    interpolate_terrain_grid,
+)
 
 
 COST_SURFACE_VERSION = 1
+#: Where elevation evidence comes from. "lidar" reads the cached measured
+#: surfaces; "vector" triangulates surveyed spot elevations and models the
+#: canopy, so a plan can be made where no LiDAR collection exists.
+ELEVATION_SOURCES = ("lidar", "vector")
+#: Halo for the terrain control points, matching generate_3mf so a plan and the
+#: plates it produces triangulate the same evidence.
+TERRAIN_CONTROL_HALO_M = 150.0
 CRS = 2263
 # Price for a cell inside a hard keep-out. Large enough that no reasonable
 # corridor prefers it, finite so prefix sums stay well defined.
@@ -66,6 +79,7 @@ STRUCTURE_LAYER = "TRANSPORT_STRUCTURE"
 # raster's legend is relied on here, and both published surveys share it, so
 # the two collections are interchangeable for this purpose.
 VEGETATION_CLASSES = (1, 2)
+TREE_CANOPY_CLASS = 1
 
 
 class SourceDataError(RuntimeError):
@@ -291,10 +305,10 @@ def _lidar_mosaics(cache_dir: Path, grid: FrameGrid,
     return result
 
 
-def _land_cover_vegetation(
+def _land_cover_classes(
     cache_dir: Path, grid: FrameGrid, dataset: str = LAND_COVER_DATASETS[0]
 ) -> np.ndarray | None:
-    """Majority-resample the documented vegetation classes, or return None."""
+    """Majority-resample the land-cover legend onto the grid, or return None."""
     path = cache_dir / dataset / "landcover_native.tif"
     if not path.is_file():
         return None
@@ -306,7 +320,78 @@ def _land_cover_vegetation(
             dst_transform=grid.transform, dst_crs=CRS,
             resampling=Resampling.mode, src_nodata=0, dst_nodata=0,
         )
-    return np.isin(classes, VEGETATION_CLASSES)
+    return classes
+
+
+def _vector_elevation(
+    cache_dir: Path, grid: FrameGrid, footprints: gpd.GeoDataFrame,
+    canopy_mask: np.ndarray | None,
+) -> dict[str, np.ndarray]:
+    """Elevation evidence without LiDAR, on the same contract as the mosaics.
+
+    Terrain is the same triangulation of surveyed spot and building-base
+    elevations the generator uses, so a plan's shared datum and the plates
+    built against it agree.  ``ground_min`` stays a true lower bound: a linear
+    interpolant never dips below its control points, so combining the
+    triangulated grid with the control values that land in each cell bounds
+    whatever the generator samples at its own finer resolution.
+
+    The upper surface is built rather than measured -- recorded roof heights
+    where a footprint stands, the crown-size canopy model where the land cover
+    says trees -- because those are the two things a seam must not cut through.
+    """
+    minx, miny, maxx, maxy = grid.world_bounds
+    pad_ft = TERRAIN_CONTROL_HALO_M / FT
+    bounds = (minx - pad_ft, miny - pad_ft, maxx + pad_ft, maxy + pad_ft)
+    path = cache_dir / "nyc_planimetrics_2022" / "ELEVATION.parquet"
+    if not path.is_file():
+        raise SourceDataError(f"Planimetrics layer ELEVATION is missing at {path}")
+    haloed = read_tiled_geoparquet(
+        cache_dir / "nyc_building_footprints", bounds,
+        deduplicate_by=["doitt_id", "bin"], source_order=["source_order"],
+    )
+    try:
+        points = ground_control_points(gpd.read_parquet(path, bbox=bounds), haloed)
+    except VectorElevationError as error:
+        raise SourceDataError(str(error)) from error
+    ground = interpolate_terrain_grid(points, grid.transform, grid.shape)
+
+    # A control point inside a cell is a value the generator can sample there.
+    # The inverse of the grid transform is what turns a world coordinate into a
+    # cell; grid.rows and grid.columns take frame-local feet, not EPSG:2263.
+    ground_min = ground.copy()
+    columns, rows = ~grid.transform * (points.x, points.y)
+    cell_rows = np.floor(rows).astype(int)
+    cell_columns = np.floor(columns).astype(int)
+    inside = (
+        (cell_rows >= 0) & (cell_rows < grid.height)
+        & (cell_columns >= 0) & (cell_columns < grid.width)
+    )
+    if inside.any():
+        np.minimum.at(
+            ground_min, (cell_rows[inside], cell_columns[inside]),
+            points.z_m[inside].astype(np.float32),
+        )
+
+    upper = ground.copy()
+    if canopy_mask is not None and canopy_mask.any():
+        canopy = crown_canopy_height(canopy_mask, cell_m=grid.resolution_ft * FT)
+        upper = np.maximum(upper, ground + canopy)
+    if len(footprints) and "height_roof" in footprints:
+        heights = pd.to_numeric(footprints["height_roof"], errors="coerce") * FT
+        usable = (heights.notna() & (heights > 0)).to_numpy()
+        if usable.any():
+            # Shortest first, so where footprints overlap a cell the tallest
+            # one is the last burnt and the one the seam has to respect.
+            order = np.argsort(heights.to_numpy()[usable], kind="stable")
+            shapes = list(zip(footprints.geometry.values[usable][order],
+                              heights.to_numpy()[usable][order].astype(float)))
+            built = rasterize(
+                shapes, out_shape=grid.shape, transform=grid.transform,
+                fill=0.0, dtype="float32", all_touched=True,
+            )
+            upper = np.maximum(upper, ground + built)
+    return {"upper_max": upper, "ground_mean": ground, "ground_min": ground_min}
 
 
 # build_map_fields.py:219,242 selects crossings from OSM highway LineStrings
@@ -638,7 +723,7 @@ class CostSurface(CutChooser):
         ground_min = self.ground_min_m[inside & np.isfinite(self.ground_min_m)]
         ground = self.ground_m[inside & np.isfinite(self.ground_m)]
         if not ground_min.size or not ground.size:
-            raise SourceDataError("No LiDAR ground elevations fall inside the target polygon")
+            raise SourceDataError("No ground elevations fall inside the target polygon")
         dry = inside & np.isfinite(self.ground_m) & ~self.layers.get(
             "water", np.zeros(self.grid.shape, dtype=bool)
         )
@@ -829,6 +914,7 @@ def build_cost_surface(
     target_ft: Polygon,
     *,
     cache_dir: Path,
+    elevation_source: str = ELEVATION_SOURCES[0],
     lidar_dataset: str = LIDAR_DATASETS[0],
     land_cover_dataset: str = LAND_COVER_DATASETS[0],
     resolution_m: float = 4.0,
@@ -839,12 +925,18 @@ def build_cost_surface(
 ) -> CostSurface:
     """Rasterize every cut-cost input onto one frame-aligned grid."""
     weights = weights or CostWeights()
+    if elevation_source not in ELEVATION_SOURCES:
+        raise ValueError(f"Unknown elevation source: {elevation_source!r}")
     grid = FrameGrid.covering(frame, target_ft, resolution_m, margin_m)
+    elevation_caches = (
+        (lidar_dataset,) if elevation_source == "lidar" else ()
+    )
     sources = {
         name: cache_signature(cache_dir, name)
-        for name in (lidar_dataset, "nyc_planimetrics_2022",
-                     "nyc_building_footprints", "new_york_osm")
+        for name in elevation_caches + ("nyc_planimetrics_2022",
+                                        "nyc_building_footprints", "new_york_osm")
     }
+    sources["elevation_source"] = elevation_source
     if use_land_cover:
         sources[land_cover_dataset] = cache_signature(
             cache_dir, land_cover_dataset, required=False
@@ -852,15 +944,8 @@ def build_cost_surface(
     key = surface_key(frame, target_ft, resolution_m, weights, sources)
     if log:
         log.info("cost_surface_building", key=key, shape=list(grid.shape),
-                 resolution_m=resolution_m)
+                 resolution_m=resolution_m, elevation_source=elevation_source)
     world = grid.world_bounds
-    elevation = _lidar_mosaics(cache_dir, grid, lidar_dataset)
-    upper, ground, ground_min = (
-        elevation["upper_max"], elevation["ground_mean"], elevation["ground_min"]
-    )
-    height = upper - ground
-    observed = np.isfinite(height)
-    height_positive = np.where(observed, np.clip(height, 0.0, None), np.nan)
 
     buffer_ft = weights.keep_out_buffer_m / FT
     layers: dict[str, np.ndarray] = {}
@@ -870,6 +955,24 @@ def build_cost_surface(
         deduplicate_by=["doitt_id", "bin"], source_order=["source_order"],
     )
     layers["building"] = _burn(grid, footprints.geometry.values)
+
+    classes = (
+        _land_cover_classes(cache_dir, grid, land_cover_dataset)
+        if use_land_cover else None
+    )
+    if elevation_source == "lidar":
+        elevation = _lidar_mosaics(cache_dir, grid, lidar_dataset)
+    else:
+        elevation = _vector_elevation(
+            cache_dir, grid, footprints,
+            None if classes is None else classes == TREE_CANOPY_CLASS,
+        )
+    upper, ground, ground_min = (
+        elevation["upper_max"], elevation["ground_mean"], elevation["ground_min"]
+    )
+    height = upper - ground
+    observed = np.isfinite(height)
+    height_positive = np.where(observed, np.clip(height, 0.0, None), np.nan)
     # Reporting uses center-burnt footprints so it measures the same thing the
     # keep-out constrains. The all-touched layer above dilates every footprint
     # by up to a cell and would score a seam running cleanly down a street as
@@ -898,12 +1001,8 @@ def build_cost_surface(
     layers["park"] = _burn(grid, parks.geometry.values)
     crossings = _osm_crossings(cache_dir, grid, buffer_ft)
     layers["osm_structure"] = _burn(grid, crossings.geometry.values)
-    vegetation = (
-        _land_cover_vegetation(cache_dir, grid, land_cover_dataset)
-        if use_land_cover else None
-    )
-    if vegetation is not None:
-        layers["vegetation"] = vegetation
+    if classes is not None:
+        layers["vegetation"] = np.isin(classes, VEGETATION_CLASSES)
 
     keep_out = layers["structure"] | layers["osm_structure"] | layers["tall_building"]
     named = gpd.GeoDataFrame(

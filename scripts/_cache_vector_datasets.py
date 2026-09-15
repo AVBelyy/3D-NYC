@@ -36,7 +36,11 @@ from cache_common import (
     directory_signature,
     file_signature,
     finish_manifest,
+    coverage_label,
+    coverage_mode,
+    coverage_signature,
     load_coverage,
+    resolved_coverage,
     output_record,
     parse_bounds,
     reusable_manifest,
@@ -62,7 +66,8 @@ PLANIMETRIC_LAYERS = [
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
-    value.add_argument("--coverage", type=Path, default=DEFAULT_COVERAGE)
+    value.add_argument("--coverage", type=Path, default=DEFAULT_COVERAGE,
+                       help='Coverage catalog to take the citywide extent from, or "supported-area" for the envelope of everywhere the generator accepts a request, which needs no LiDAR cache')
     value.add_argument("--bounds", type=float, nargs=4, metavar=("XMIN", "YMIN", "XMAX", "YMAX"))
     value.add_argument("--planimetrics", type=Path, default=DATA / "raw/nyc_planimetrics_2022/Planimetric_2022.gdb")
     value.add_argument("--tile-span-ft", type=float, default=10000.0)
@@ -452,15 +457,16 @@ VECTOR_DATASETS = (
 
 def manifest_context(args: argparse.Namespace, coverage, bounds, source: Path) -> tuple[dict, dict]:
     sources = {"source": file_signature(source.resolve(), with_hash=args.hash_sources)}
-    if bounds is None:
-        sources["coverage_catalog"] = file_signature(args.coverage.resolve())
+    catalog = coverage_signature(args.coverage, bounds)
+    if catalog is not None:
+        sources["coverage_catalog"] = catalog
     configuration = {
         "pipeline_version": PIPELINE_VERSION,
         "cache_format_version": CACHE_FORMAT_VERSION,
         "crs": CRS,
         "coverage_bounds": list(map(float, coverage.bounds)),
-        "coverage_catalog": None if bounds else str(args.coverage.resolve()),
-        "coverage_mode": "explicit_bounds" if bounds else "catalog_envelope",
+        "coverage_catalog": coverage_label(args.coverage, bounds),
+        "coverage_mode": coverage_mode(args.coverage, bounds),
     }
     return configuration, sources
 
@@ -505,7 +511,7 @@ def main_for(dataset: str) -> None:
             "--tile-span-ft and --api-page-size must be positive; retry settings cannot be negative"
         )
     bounds = parse_bounds(args.bounds)
-    coverage = box(*load_coverage(args.coverage.resolve(), bounds).bounds)
+    coverage = box(*load_coverage(resolved_coverage(args.coverage), bounds).bounds)
     component_dir = args.cache_root.resolve() / dataset
     component_dir.mkdir(parents=True, exist_ok=True)
     hash_outputs = not args.skip_output_hashes
@@ -523,15 +529,16 @@ def main_for(dataset: str) -> None:
         if not source.is_dir():
             raise FileNotFoundError(source)
         sources = {"source": directory_signature(source)}
-        if bounds is None:
-            sources["coverage_catalog"] = file_signature(args.coverage.resolve())
+        catalog = coverage_signature(args.coverage, bounds)
+        if catalog is not None:
+            sources["coverage_catalog"] = catalog
         configuration = {
             "pipeline_version": PIPELINE_VERSION,
             "cache_format_version": CACHE_FORMAT_VERSION,
             "crs": CRS,
             "coverage_bounds": list(map(float, coverage.bounds)),
-            "coverage_catalog": None if bounds else str(args.coverage.resolve()),
-            "coverage_mode": "explicit_bounds" if bounds else "catalog_envelope",
+            "coverage_catalog": coverage_label(args.coverage, bounds),
+            "coverage_mode": coverage_mode(args.coverage, bounds),
             "layers": PLANIMETRIC_LAYERS,
         }
         existing = None if args.force else reusable_manifest(component_dir, configuration, sources)

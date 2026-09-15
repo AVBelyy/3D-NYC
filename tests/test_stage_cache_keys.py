@@ -28,9 +28,10 @@ FEEDS_THE_FIELDS = ("prepare_vectors", "extract_citygml", "prepare_landcover",
                     "extract_osm", "prepare_details")
 
 
-def keys(**cache_versions):
+def keys(elevation_source="lidar", **cache_versions):
     """Stage keys as one identity per source, so a changed source is visible."""
-    return stage_variants(lambda name: {"cache": cache_versions.get(name, name)})
+    return stage_variants(lambda name: {"cache": cache_versions.get(name, name)},
+                          elevation_source=elevation_source)
 
 
 class StageDependencyTests(unittest.TestCase):
@@ -90,6 +91,45 @@ class StageDependencyTests(unittest.TestCase):
         self.assertEqual(before["extract_citygml"], after["extract_citygml"])
         self.assertEqual(before["prepare_vectors"], after["prepare_vectors"])
         self.assertNotEqual(before["extract_osm"], after["extract_osm"])
+
+    def test_vector_terrain_is_the_one_case_where_the_lidar_stage_has_a_key(self):
+        """Reading a measured raster announces nothing; building one must."""
+        self.assertIsNone(keys()["prepare_lidar"])
+        self.assertIsNotNone(keys("vector")["prepare_lidar"])
+
+    def test_a_terrain_version_bump_reaches_the_fields_only_under_vector_terrain(self):
+        before = keys("vector")
+        with patch.object(generate_3mf, "TERRAIN_PIPELINE_VERSION",
+                          generate_3mf.TERRAIN_PIPELINE_VERSION + 1):
+            after = keys("vector")
+            lidar_after = keys()
+        self.assertNotEqual(before["prepare_lidar"], after["prepare_lidar"])
+        for stage in DERIVED_FROM_FIELDS:
+            with self.subTest(stage=stage):
+                self.assertNotEqual(before[stage], after[stage])
+        for stage in FEEDS_THE_FIELDS:
+            with self.subTest(stage=stage):
+                self.assertEqual(before[stage], after[stage])
+        # The measured path does not build a surface, so nothing of its own can
+        # go stale: a terrain bump must leave every LiDAR job alone.
+        self.assertEqual(keys(), lidar_after)
+
+    def test_vector_terrain_restales_on_the_caches_it_actually_triangulates(self):
+        for source in ("nyc_planimetrics_2022", "nyc_building_footprints",
+                       "nyc_land_cover_2021"):
+            with self.subTest(source=source):
+                self.assertNotEqual(keys("vector")["prepare_lidar"],
+                                    keys("vector", **{source: "rebuilt"})["prepare_lidar"])
+        self.assertEqual(keys("vector")["prepare_lidar"],
+                         keys("vector", new_york_osm="rebuilt")["prepare_lidar"])
+
+    def test_choosing_the_other_elevation_source_restales_the_model(self):
+        """Two sources, two terrains: a cached job may not be reused across them."""
+        before = keys()
+        after = keys("vector")
+        for stage in ("prepare_lidar",) + DERIVED_FROM_FIELDS:
+            with self.subTest(stage=stage):
+                self.assertNotEqual(before[stage], after[stage])
 
     def test_every_cacheable_stage_the_pipeline_runs_declares_a_key(self):
         """A stage wired without an entry here would cache on its config alone."""

@@ -30,7 +30,10 @@ A building the survey no longer describes takes its shape from mapped
 OpenStreetMap `building:part` massing where that exists, read under the same
 two rules and never allowed above the roof height the footprint record states;
 only a building with neither prints as a plain extrusion. It uses
-LiDAR for ground and upper-surface measurements. Roads, paths, land use,
+LiDAR for ground and upper-surface measurements, or, where no LiDAR collection
+exists, triangulates the surveyed ground elevations the vector sources carry and
+models canopy height from the width of each canopy patch; see
+[the generation guide](generate_3mf.md) for that substitution. Roads, paths, land use,
 bridges, tunnels, and current semantic context combine NYC sources with
 OpenStreetMap. Classified carriageway centerlines become fixed-width ivory
 ribbons, drawn as raised lines standing above the pavement pad rather than as
@@ -78,7 +81,7 @@ For exact commands and prerequisites, use the
 
 ## Data and reproducibility
 
-Most geometry is processed in EPSG:2263. LiDAR elevations are stored in metres
+Most geometry is processed in EPSG:2263. Elevations are stored in metres
 relative to NAVD88, and final model dimensions are millimetres. Generated job
 metadata records the transformations and normalization choices used.
 

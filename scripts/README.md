@@ -89,6 +89,8 @@ scripts/cache_all.sh
 
 They cover all of NYC, which is the extent of the LiDAR tile index, and LiDAR
 is built first because the other builders take their coverage from its catalog.
+`--no-lidar` on both scripts builds neither, taking coverage from the supported
+area instead, for `generate_3mf.py --elevation-source vector`.
 Caching a smaller area means running the individual pairs; see the
 [cache runbook](../docs/cache_source_datasets.md).
 
@@ -110,9 +112,9 @@ generated configuration and environment. Treat those stage scripts as pipeline
 internals unless you are debugging a specific stage.
 
 `cache_common.py`, `_datasets.py`, `_download_dataset.py`,
-`_cache_vector_datasets.py`, `_chunk_geometry.py`, `_chunk_cost.py`, and
-`_chunk_preview.py` are shared implementation modules, not command-line entry
-points.
+`_cache_vector_datasets.py`, `_chunk_geometry.py`, `_chunk_cost.py`,
+`_chunk_preview.py`, and `_vector_elevation.py` are shared implementation
+modules, not command-line entry points.
 
 Run the test suite with:
 

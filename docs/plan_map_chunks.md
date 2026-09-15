@@ -16,6 +16,14 @@ building-footprint, and OpenStreetMap caches, and optionally land cover. See
 the [cache runbook](cache_source_datasets.md). The emitted generation commands
 need the full source set that `generate_3mf.py` requires.
 
+`--elevation-source vector` drops the LiDAR cache from both halves of that.
+Terrain becomes a triangulation of the surveyed ground elevations already in the
+Planimetrics and building-footprint caches, and standing height becomes the
+recorded roof height of each footprint together with a modelled canopy. The
+choice is pinned into every emitted generation command, because the shared
+vertical datum and relief factor a plan fixes were measured from one source and
+a plate built from the other would step at every seam.
+
 ## Quick start
 
 ```bash
@@ -77,7 +85,7 @@ Cut placement scores a raster built from real measurements:
 
 | Evidence | Effect on a cut |
 | --- | --- |
-| LiDAR `upper_surface_m - ground_m` | Primary cost. Cuts prefer low ground. |
+| LiDAR `upper_surface_m - ground_m`, or with `--elevation-source vector` the recorded roof heights and modelled canopy over triangulated terrain | Primary cost. Cuts prefer low ground. |
 | Building footprints | Keep-out. A seam may not cross a building. |
 | Planimetrics `TRANSPORT_STRUCTURE`, OSM road bridges and tunnels | Keep-out. |
 | Planimetrics `ROADBED`, `MEDIAN`, `PLAZA`, `PARKING_LOT` | Cheap. Seams follow pavement. |

@@ -50,8 +50,14 @@ there is not evidence that `.venv` accepts it.
   `data/cache/X/`, with documented exceptions such as streamed Building
   Footprints and the borough-selective LiDAR collections. The generator reads
   the 2021 LiDAR cache by default; the 2017 collection is still reachable
-  through `--lidar-source laz`. Land cover is a 2017/2021 pair chosen by
-  `--land-cover-dataset`, and that choice is part of the stage variant.
+  through `--lidar-source laz`. `--elevation-source vector` reads no LiDAR at
+  all: `_vector_elevation` triangulates the surveyed ground elevations in the
+  Planimetrics and Building Footprints caches and models canopy height from the
+  shape of the land-cover canopy patches. The generator and the planner take the
+  same flag, and a plan pins its choice into every chunk command, because the
+  shared datum it fixes is only a bound for the source it measured. Land cover
+  is a 2017/2021 pair chosen by `--land-cover-dataset`, and that choice is part
+  of the stage variant.
 - `data/raw/`, `data/cache/`, and `output/` are ignored, potentially large, and
   may contain expensive user-generated state. Do not delete or rebuild them
   unless the task explicitly requires it.
@@ -149,9 +155,13 @@ the fix did nothing.
   either restales every stage of every job with no bump at all.
 - Six stages have no constant. `prepare_vectors`, `extract_citygml` and
   `extract_osm` key only on their source cache identity, `prepare_landcover` on
-  that plus the dataset name, `prepare_lidar` deliberately carries no key, and
-  `render_preview` rides the mesh key. Changing what one of them builds
-  invalidates nothing: say so in the change, and rerun with `--force`.
+  that plus the dataset name, `prepare_lidar` deliberately carries no key when
+  it reads LiDAR, and `render_preview` rides the mesh key. Changing what one of
+  them builds invalidates nothing: say so in the change, and rerun with
+  `--force`. `--elevation-source vector` is the exception: there `prepare_lidar`
+  builds both surfaces itself from the vector caches and a canopy model, so it
+  does carry a key, and `TERRAIN_PIPELINE_VERSION` is the only way a change to
+  either surface can announce itself.
 - `--force` reruns every stage of the job, expensive LiDAR and extraction
   included, so prefer the constants when an existing job should be rerun
   surgically. The two also differ in scope: `--force` is about the job in front

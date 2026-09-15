@@ -15,11 +15,18 @@ from shapely.geometry import box
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from cache_common import (  # noqa: E402
     CRS,
+    SUPPORTED_AREA,
     TiledGeoParquetWriter,
+    coverage_label,
+    coverage_mode,
+    coverage_signature,
     finish_manifest,
+    load_coverage,
     read_tiled_geoparquet,
+    resolved_coverage,
     reusable_manifest,
     start_manifest,
+    supported_area_bounds,
 )
 from cache_nyc_3d_buildings_2014 import parse_member  # noqa: E402
 from _cache_vector_datasets import (  # noqa: E402
@@ -71,6 +78,41 @@ class TiledGeoParquetTests(unittest.TestCase):
                 deduplicate_by=["feature_id"], source_order=["source_order"],
             )
             self.assertEqual(boundary.feature_id.tolist(), ["crossing"])
+
+
+class CoverageSelectionTests(unittest.TestCase):
+    """A cache can state its extent without a LiDAR catalog to read it from."""
+
+    def test_the_supported_area_covers_everywhere_a_request_is_accepted(self):
+        from cache_common import NYC_BOUNDS
+
+        accepted = gpd.GeoSeries([box(*NYC_BOUNDS)], crs=4326).to_crs(CRS).iloc[0]
+        self.assertTrue(load_coverage(SUPPORTED_AREA).covers(accepted))
+
+    def test_the_supported_area_needs_no_file_on_disk(self):
+        """The point of the sentinel: nothing is read, so nothing can be missing."""
+        self.assertEqual(resolved_coverage(SUPPORTED_AREA), SUPPORTED_AREA)
+        self.assertIsNone(coverage_signature(SUPPORTED_AREA, None))
+        self.assertEqual(load_coverage(SUPPORTED_AREA).bounds,
+                         tuple(supported_area_bounds()))
+
+    def test_a_missing_catalog_is_still_an_error_rather_than_a_substitution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(FileNotFoundError):
+                load_coverage(Path(directory) / "absent.geojson")
+
+    def test_the_manifest_distinguishes_all_three_ways_of_stating_coverage(self):
+        catalog = Path("data/cache/nyc_lidar_2021/catalog.geojson")
+        self.assertEqual(coverage_mode(catalog, None), "catalog_envelope")
+        self.assertEqual(coverage_mode(SUPPORTED_AREA, None), "supported_area_envelope")
+        self.assertEqual(coverage_mode(SUPPORTED_AREA, [0, 0, 1, 1]), "explicit_bounds")
+        self.assertEqual(coverage_label(SUPPORTED_AREA, None), str(SUPPORTED_AREA))
+        self.assertIsNone(coverage_label(SUPPORTED_AREA, [0, 0, 1, 1]))
+
+    def test_explicit_bounds_still_win_over_the_sentinel(self):
+        """--bounds is the deliberately partial cache, whatever --coverage says."""
+        self.assertEqual(load_coverage(SUPPORTED_AREA, [0, 0, 10, 20]).bounds,
+                         (0.0, 0.0, 10.0, 20.0))
 
 
 class ManifestTests(unittest.TestCase):

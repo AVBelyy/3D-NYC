@@ -11,6 +11,12 @@
 # converts the borough rasters already on disk. With --lidar-dataset
 # nyc_lidar_2017 it is instead a long streaming build: each LAZ is pulled in and
 # deleted after its last use, keeping resident source under the builder's cap.
+#
+# --no-lidar builds every other cache and none of the LiDAR one, for
+# generate_3mf.py --elevation-source vector. Coverage then comes from the
+# EPSG:2263 envelope of the area the generator accepts a request inside, which
+# cache_common.supported_area_bounds derives from the same constant the
+# generator checks, so nothing has to read a LiDAR catalog that is not there.
 
 set -euo pipefail
 
@@ -48,6 +54,12 @@ Options:
   --skip-lidar
         Keep the existing LiDAR cache and build only the rest. The other
         builders still need its catalog, so it has to exist already.
+  --no-lidar
+        Build no LiDAR cache at all and take coverage from the supported-area
+        envelope instead of a catalog. The result serves
+        generate_3mf.py --elevation-source vector and
+        plan_map_chunks.py --elevation-source vector; the LiDAR elevation
+        source has nothing to read after it.
   --lidar-dataset NAME
         Which LiDAR collection to build and take citywide coverage from:
         nyc_lidar_2021 (default, published rasters) or nyc_lidar_2017
@@ -80,6 +92,7 @@ run() {
 }
 
 skip_lidar=0
+no_lidar=0
 lidar_dataset=nyc_lidar_2021
 land_cover_dataset=nyc_land_cover_2021
 keep_sources=0
@@ -108,6 +121,10 @@ while [[ $# -gt 0 ]]; do
       shift 2
       continue
       ;;
+    --no-lidar)
+      no_lidar=1
+      shift
+      ;;
     --skip-lidar)
       skip_lidar=1
       shift
@@ -128,7 +145,12 @@ done
 
 cd "$ROOT"
 
-if [[ $skip_lidar -eq 1 ]]; then
+[[ $no_lidar -eq 0 || $skip_lidar -eq 0 ]] ||
+  die '--no-lidar and --skip-lidar are different answers to the same question'
+
+if [[ $no_lidar -eq 1 ]]; then
+  printf '\n==> building no LiDAR cache; coverage is the supported-area envelope\n' >&2
+elif [[ $skip_lidar -eq 1 ]]; then
   printf '\n==> skipping %s\n' "$lidar_dataset" >&2
   [[ -f "data/cache/$lidar_dataset/catalog.geojson" ]] ||
     die "data/cache/$lidar_dataset/catalog.geojson is missing; the other builders read it for coverage"
@@ -152,8 +174,16 @@ else
 fi
 
 # The vector builders take their citywide extent from the LiDAR catalog, so they
-# have to read the one just built rather than the default.
-coverage=("--coverage" "data/cache/$lidar_dataset/catalog.geojson")
+# have to read the one just built rather than the default. Without a LiDAR cache
+# they take the same extent as explicit bounds instead.
+if [[ $no_lidar -eq 1 ]]; then
+  # Not --bounds: bounded caches are deliberately not production-ready, and this
+  # one is not bounded. It covers everywhere the generator will accept a
+  # request, which is exactly as complete as a catalog envelope.
+  coverage=("--coverage" "supported-area")
+else
+  coverage=("--coverage" "data/cache/$lidar_dataset/catalog.geojson")
+fi
 
 DATASETS=("${DATASETS[@]/LAND_COVER/$land_cover_dataset}")
 

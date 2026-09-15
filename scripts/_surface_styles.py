@@ -8,6 +8,7 @@ from scipy import ndimage
 # NYC Land Cover survey classes.  Only 1 and 2 record standing vegetation; 3 is
 # unvegetated natural ground, and every remaining class is built or water.
 LAND_COVER_VEGETATION = (1, 2)
+LAND_COVER_TREE_CANOPY = 1
 LAND_COVER_BARE_SOIL = 3
 
 

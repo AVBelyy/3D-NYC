@@ -50,7 +50,7 @@ build plates; see [the planner guide](plan_map_chunks.md).
 | `--data-dir` | `data/` | Checked-in and transient input root |
 | `--cache-dir` | `data/cache/` | Per-dataset reusable caches |
 | `--output-dir` | `output/` | Jobs, default models, plans, and other generated files |
-| `--lidar-cache-dir` | `<cache-dir>/nyc_lidar_2021` | Optional LiDAR cache override |
+| `--lidar-cache-dir` | `<cache-dir>/nyc_lidar_2021` | Optional LiDAR cache override; unused with `--elevation-source vector` |
 | `--project-settings-template` | `data/bambu/project_settings.json` | Bambu project-settings input |
 
 `--output-dir` controls the generated-data root. It does not change an explicit
@@ -60,11 +60,43 @@ The cache directories are named for their exact source datasets. See
 [the source-cache runbook](cache_source_datasets.md) for the full
 `download_X.py -> data/raw/X` and `cache_X.py -> data/cache/X` mapping.
 
+## Elevation source
+
+`--elevation-source` chooses where terrain and canopy come from.
+
+`lidar` is the default and the measured path: the cached bare-earth surface is
+the terrain, and the cached upper surface gives every tree the height it was
+measured at. `--lidar-source` then selects the cached rasters or raw LAZ tiles.
+
+`vector` reads no LiDAR at all. Terrain is a linear triangulation of the
+surveyed ground elevations the project already caches -- Planimetrics spot
+elevations on roadbeds and at water surfaces, and the `ground_elevation` each
+Building Footprints record carries -- taken with a fixed halo beyond the crop so
+neighbouring plates triangulate the same points across the seam they share.
+Canopy height is modelled rather than measured: the land-cover survey still says
+where the trees are, and `_vector_elevation.crown_canopy_height` gives each
+canopy cell a height that rises from an isolated tree's `canopy_edge_height_m`
+toward a closed stand's `canopy_mature_height_m` over `canopy_crown_scale_m`.
+Rooftop fixtures fall back to `inferred_cooling_height_mm`, because a modelled
+surface is not evidence about a roof.
+
+Everything else is unchanged: buildings, bridges, tunnels, stairs, water levels
+and every drawn surface already come from vector records.
+
+The job records which source it used in `config.json`, in the 3MF's source
+note, and in `analysis/lidar.json`, where the vector path also records the
+control-point counts and states that the canopy was not measured.
+`field_build_report.json` names the evidence behind each decision the same way,
+so a modelled canopy or a triangulated portal elevation is never reported as a
+measurement.
+
 ## Network and cache behavior
 
-The default `--lidar-source cache` requires a completed LiDAR raster cache that
+`--elevation-source lidar` with the default `--lidar-source cache` requires a
+completed LiDAR raster cache that
 covers the crop plus source padding; the generator does not build that cache on
-demand. For every other dataset, a complete production-ready cache is
+demand. `--elevation-source vector` requires none of it. For every other
+dataset, a complete production-ready cache is
 preferred. If a cache is absent, an online run downloads the matching raw
 source and processes the crop. A present but incomplete or non-production-ready
 cache is an error rather than a signal to fall back silently.
@@ -73,6 +105,8 @@ Use `--offline` to forbid all network access. Offline generation may use
 completed caches or already-downloaded raw sources, but the default LiDAR mode
 still requires its raster cache. `--lidar-source laz` instead uses raw LAZ tiles
 for the selected crop and is intended mainly for diagnostics.
+`--elevation-source vector` needs neither, and reads only the Planimetrics,
+Building Footprints and land-cover caches it shares with the rest of the run.
 
 Address-based building colors use NYC Planning GeoSearch. Responses are cached
 under `data/cache/nyc_geosearch/`; repeated runs reuse them, and an offline run
@@ -292,7 +326,8 @@ is serialized as float32. The diagonal-contact pass therefore runs after this
 one and repairs those junctions; it also subsumes the older single-cell cleanup,
 since a one-cell island can never be covered by a bead-wide disk.
 
-LiDAR upper-surface heights define the varied canopy relief. The generator
+LiDAR upper-surface heights define the varied canopy relief, and
+`--elevation-source vector` substitutes a modelled height for them. The generator
 closes only narrow gaps in the canopy classification, smooths measured heights
 using a source halo, and rolls remaining canopy edges down over a print-scaled
 distance. Mapped trails are applied after gap closing and receive a clear canopy

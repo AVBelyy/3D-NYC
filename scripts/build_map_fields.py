@@ -22,6 +22,13 @@ from road_symbols import TRAIL_HIGHWAYS,constructs_bridge_deck,drawn_route_class
 from _surface_styles import LAND_COVER_BARE_SOIL,apply_street_palette,paint_bridge_decks,paint_trail_ribbons,stair_tread_mask,vegetated_ground_mask
 from terrain_relief import absolute_elevation_to_mm,choose_terrain_relief
 
+# What the two elevation rasters actually are, so a report names the evidence it
+# used rather than the evidence the measured path would have used. Terrain is
+# always a surface; the upper surface is only a measurement under LiDAR.
+MEASURED_ELEVATION=CFG.get('elevation_source','lidar')=='lidar'
+TERRAIN_EVIDENCE='LiDAR' if MEASURED_ELEVATION else 'triangulated survey'
+SURFACE_EVIDENCE='LiDAR' if MEASURED_ELEVATION else 'modelled canopy'
+
 def burn(shapes,dtype='float32',fill=0):
     shapes=[(shapely.make_valid(g.intersection(AOI)),v) for g,v in shapes if not g.is_empty and g.intersects(AOI)]
     return rasterize(shapes,out_shape=SHAPE,transform=TRANSFORM,fill=fill,dtype=dtype) if shapes else np.full(SHAPE,fill,dtype=dtype)
@@ -428,9 +435,9 @@ def main():
     transport=read('planimetrics_TRANSPORT_STRUCTURE')
 
     def endpoint_road_elevation(point):
-        """Prefer a surveyed road spot near a portal, checked against LiDAR ground."""
+        """Prefer a surveyed road spot near a portal, checked against the terrain."""
         rr,cc=cells_for_points([point.x],[point.y]);r=int(np.clip(rr[0],0,NY-1));c=int(np.clip(cc[0],0,NX-1))
-        fallback=float(ground[r,c]);method='LiDAR ground at mapped portal'
+        fallback=float(ground[r,c]);method=f'{TERRAIN_EVIDENCE} ground at mapped portal'
         nearby=road_spot_elev[road_spot_elev.distance(point)<=12/FT].copy()
         if len(nearby):
             nearby['_distance']=nearby.distance(point)
@@ -438,7 +445,7 @@ def main():
             nearby=nearby[np.isfinite(nearby._elevation_m)&(np.abs(nearby._elevation_m-fallback)<=3.)]
             if len(nearby):
                 value=float(nearby.nsmallest(3,'_distance')._elevation_m.median())
-                return value,'planimetric road spot elevation checked against LiDAR ground'
+                return value,f'planimetric road spot elevation checked against {TERRAIN_EVIDENCE} ground'
         return fallback,method
 
     # Retain the source anchors and portal evidence with each hidden segment;
@@ -712,10 +719,14 @@ def main():
         'osm_parking_canopy_cells':int((canopy_mask&osm_parking_fallback_mask).sum()),
         'trail_canopy_setback_mm':trail_setback,
         'trail_clearance_cells':int(trail_clearance.sum()),
-        'source_role':'LiDAR upper-surface heights define the varied printed canopy relief'}
+        'source_role':('LiDAR upper-surface heights define the varied printed canopy relief'
+            if MEASURED_ELEVATION else
+            'no tree heights were measured; relief is modelled from canopy-patch width')}
     del ground_halo,upper_halo,lc_halo
     print('Smoothed measured canopy',canopy_report['printable_canopy_cells'],flush=True)
-    # Measured rooftop tanks; cooling heights inferred only when later outlines lack usable LiDAR evidence.
+    # Measured rooftop tanks; cooling heights inferred only when later outlines
+    # lack usable upper-surface evidence, which is every one of them when the
+    # upper surface is modelled canopy rather than a measured roof.
     fixtures=[]
     for name in ['WATER_TANK','COOLING_TOWERS']:
         for _,r in read('planimetrics_'+name).iterrows():
@@ -739,7 +750,8 @@ def main():
                 observed=float(np.percentile(points,70)) if len(points) else roof_z
                 h=np.clip(observed-roof_z,0,4.)
                 minimum=mm_to_source(CFG['inferred_cooling_height_mm'])
-                target=roof_z+max(float(h),minimum);method='LiDAR difference' if h>=minimum else 'inferred minimum fixture height'
+                target=roof_z+max(float(h),minimum)
+                method=f'{SURFACE_EVIDENCE} difference' if h>=minimum else 'inferred minimum fixture height'
             top[sl][mask]=np.maximum(top[sl][mask],target);material[sl][mask]=0
             fixtures.append({'layer':name,'bin':str(r.BIN),'height_above_roof_m':target-roof_z,'method':method})
     report['layers']['fixtures']=fixtures

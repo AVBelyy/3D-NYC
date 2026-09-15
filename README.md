@@ -39,8 +39,12 @@ scripts/cache_all.sh
 ```
 
 That covers all of NYC and is a long one-time build, safe to rerun and safe to
-interrupt. See the [source-cache guide](docs/cache_source_datasets.md) for the
-per-dataset commands behind it, caching a smaller area, and offline options.
+interrupt. Most of it is the LiDAR survey; `--no-lidar` on both scripts leaves
+it out, and `--elevation-source vector` then builds terrain from surveyed spot
+elevations and models the canopy instead of measuring it. See the
+[source-cache guide](docs/cache_source_datasets.md) for the per-dataset commands
+behind it, caching a smaller area, and offline options, and the
+[generation guide](docs/generate_3mf.md) for what the vector source substitutes.
 
 ## Generate a 3MF
 

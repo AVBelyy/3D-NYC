@@ -24,7 +24,11 @@ from cache_common import (
     clean_staging,
     file_signature,
     finish_manifest,
+    coverage_label,
+    coverage_mode,
+    coverage_signature,
     load_coverage,
+    resolved_coverage,
     parse_bounds,
     reusable_manifest,
     start_manifest,
@@ -48,7 +52,8 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description=__doc__)
     value.add_argument("--source", type=Path, default=DATA / "raw/new_york_osm/new-york-latest.osm.pbf")
     value.add_argument("--cache-root", type=Path, default=DEFAULT_CACHE_ROOT)
-    value.add_argument("--coverage", type=Path, default=DEFAULT_COVERAGE)
+    value.add_argument("--coverage", type=Path, default=DEFAULT_COVERAGE,
+                       help='Coverage catalog to take the citywide extent from, or "supported-area" for the envelope of everywhere the generator accepts a request, which needs no LiDAR cache')
     value.add_argument("--bounds", type=float, nargs=4, metavar=("XMIN", "YMIN", "XMAX", "YMAX"))
     value.add_argument("--tile-span-ft", type=float, default=10000.0)
     value.add_argument("--batch-rows", type=int, default=50000)
@@ -74,8 +79,8 @@ def main() -> None:
         "cache_format_version": CACHE_FORMAT_VERSION,
         "crs": CRS,
         "coverage_bounds": list(bounds) if bounds else None,
-        "coverage_catalog": None if bounds else str(args.coverage.resolve()),
-        "coverage_mode": "catalog_envelope",
+        "coverage_catalog": coverage_label(args.coverage, bounds),
+        "coverage_mode": coverage_mode(args.coverage, bounds),
         "tile_span_ft": args.tile_span_ft,
         "keys": list(KEYS),
         "area_keys": sorted(AREA_KEYS),
@@ -83,8 +88,9 @@ def main() -> None:
         "limit_objects": args.limit_objects,
     }
     sources = {"pbf": file_signature(source, with_hash=args.hash_source)}
-    if bounds is None:
-        sources["coverage_catalog"] = file_signature(args.coverage.resolve())
+    catalog = coverage_signature(args.coverage, bounds)
+    if catalog is not None:
+        sources["coverage_catalog"] = catalog
     if not args.force:
         existing = reusable_manifest(component_dir, configuration, sources)
         if existing:
@@ -94,7 +100,7 @@ def main() -> None:
             )
             return
 
-    coverage_2263 = box(*load_coverage(args.coverage.resolve(), bounds).bounds)
+    coverage_2263 = box(*load_coverage(resolved_coverage(args.coverage), bounds).bounds)
     coverage_wgs84 = gpd.GeoSeries([coverage_2263], crs=CRS).to_crs(4326).iloc[0]
     prepared = shapely.prepare(coverage_wgs84)
     # shapely.prepare mutates in place and returns None in Shapely 2.

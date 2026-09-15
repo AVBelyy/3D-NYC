@@ -36,7 +36,8 @@ scripts/cache_all.sh
 ```
 
 `download_all.sh` fetches the citywide sources plus the LiDAR and land-cover
-collections it was asked for, and nothing else. The default `nyc_lidar_2021`
+collections it was asked for, and nothing else. `--no-lidar` fetches no LiDAR
+collection at all, which is most of the bytes. The default `nyc_lidar_2021`
 surfaces are published per borough, so there is no area to select and nothing
 to stream: about 39 GB in ten files. With `--lidar-dataset nyc_lidar_2017` it
 takes only that collection's tile index instead, because its LAZ are selected
@@ -46,7 +47,14 @@ catalog, not a bounding box anyone has to look up.
 
 `cache_all.sh` builds LiDAR before anything else, because the remaining builders
 read its catalog for their coverage, and `--skip-lidar` leaves an existing LiDAR
-cache alone and rebuilds only the rest. The streaming controls belong to the
+cache alone and rebuilds only the rest. `--no-lidar` builds no LiDAR cache at
+all: it passes `--coverage supported-area` instead of a catalog, so coverage
+comes from the EPSG:2263 envelope of the area the generator accepts a request
+inside and no catalog has to exist. That is full coverage, not a bounded cache,
+so the result stays production-ready. That cache serves
+`generate_3mf.py --elevation-source vector` and
+`plan_map_chunks.py --elevation-source vector` and nothing else -- the LiDAR
+elevation source has no surfaces to read after it. The streaming controls belong to the
 2017 path alone: a citywide LAZ build reads far more source than it is worth
 keeping, so with `--lidar-dataset nyc_lidar_2017` the builder streams each tile
 in and deletes it after its last use, and `--keep-lidar-sources` retains them
@@ -70,7 +78,10 @@ Run a pair from the repository root, for example:
 
 The vector cache builders take citywide coverage from a LiDAR catalog, so build
 the LiDAR cache first. `nyc_lidar_2021` is the default; `cache_all.sh` passes the
-catalog it built to every builder that accepts `--coverage`. Planimetrics automatically extracts
+catalog it built to every builder that accepts `--coverage`. Each of those
+builders also accepts `--coverage supported-area`, which is the whole area the
+generator accepts a request inside and needs no LiDAR cache, and
+`--bounds XMIN YMIN XMAX YMAX` in EPSG:2263 for a deliberately partial cache. Planimetrics automatically extracts
 its downloaded FileGDB archive. The building-footprint cache is the exception
 to the normal pair: it is always built by streaming the official feature
 service, and never reads `data/raw/nyc_building_footprints`. Its download
@@ -127,10 +138,16 @@ LiDAR options point at `nyc_lidar_2021` (or `nyc_lidar_2017`) itself.
 
 For a cache-only offline generation run, cache the eight non-LiDAR datasets
 in the table (one land-cover collection, not both) plus one LiDAR collection.
+`--elevation-source vector` needs only those eight: terrain comes from the
+Planimetrics ELEVATION layer and the `ground_elevation` on each building
+footprint, and canopy extent from land cover. See
+[the generation guide](generate_3mf.md) for what that substitutes and what it
+gives up.
 
 To choose seams, `scripts/plan_map_chunks.py` reads complete, production-ready
 caches for LiDAR, Planimetrics, building footprints, and OpenStreetMap, and uses
-land cover when it is present. It does not read parks, 3D buildings, or MTA
+land cover when it is present. With `--elevation-source vector` it reads the
+same set without LiDAR. It does not read parks, 3D buildings, or MTA
 entrances. The generation commands it emits are ordinary `generate_3mf.py` runs,
 so those still need whatever the generator itself requires.
 
