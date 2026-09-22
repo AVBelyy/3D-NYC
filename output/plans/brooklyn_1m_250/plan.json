@@ -5179,7 +5179,7 @@
     "land_cover_dataset": "nyc_land_cover_2021",
     "offline": false,
     "no_preview": false,
-    "model_dir": "/Users/anton/Projects/3D-NYC/output/models"
+    "model_dir": "output/models"
   },
   "envelope_mm": [
     250.0,
@@ -37672,7 +37672,7 @@
       "vertices": 286,
       "elevation_cells": 10264436.545487499,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_F1.geojson",
@@ -38886,7 +38886,7 @@
       "vertices": 29,
       "elevation_cells": 21450341.473402,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_D1.geojson",
@@ -39072,7 +39072,7 @@
       "vertices": 37,
       "elevation_cells": 9245708.542786,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_G1.geojson",
@@ -39290,7 +39290,7 @@
       "vertices": 42,
       "elevation_cells": 26680475.073688,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_C1.geojson",
@@ -39528,7 +39528,7 @@
       "vertices": 17,
       "elevation_cells": 5343296.946346,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_B2.geojson",
@@ -39666,7 +39666,7 @@
       "vertices": 39,
       "elevation_cells": 27319678.418524,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_A2.geojson",
@@ -39892,7 +39892,7 @@
       "vertices": 62,
       "elevation_cells": 24676842.58,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_F2.geojson",
@@ -40210,7 +40210,7 @@
       "vertices": 28,
       "elevation_cells": 11469692.00842,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_E2.geojson",
@@ -40392,7 +40392,7 @@
       "vertices": 87,
       "elevation_cells": 6204447.8576380005,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_G2.geojson",
@@ -40810,7 +40810,7 @@
       "vertices": 27,
       "elevation_cells": 16496368.531246,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_C2.geojson",
@@ -40988,7 +40988,7 @@
       "vertices": 158,
       "elevation_cells": 21914655.8212,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_A2.2.geojson",
@@ -41690,7 +41690,7 @@
       "vertices": 7,
       "elevation_cells": 4119804.2783259996,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_B3.geojson",
@@ -41788,7 +41788,7 @@
       "vertices": 30,
       "elevation_cells": 26660918.461312003,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_D3.geojson",
@@ -41978,7 +41978,7 @@
       "vertices": 20,
       "elevation_cells": 13893958.932015998,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_F3.geojson",
@@ -42128,7 +42128,7 @@
       "vertices": 7,
       "elevation_cells": 8895905.965374999,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_G3.geojson",
@@ -42226,7 +42226,7 @@
       "vertices": 21,
       "elevation_cells": 24104937.795892004,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_B4.geojson",
@@ -42380,7 +42380,7 @@
       "vertices": 10,
       "elevation_cells": 13043719.837234,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_D4.geojson",
@@ -42490,7 +42490,7 @@
       "vertices": 17,
       "elevation_cells": 18860219.893299997,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_B4.2.geojson",
@@ -42628,7 +42628,7 @@
       "vertices": 18,
       "elevation_cells": 14224574.316304002,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_E4.geojson",
@@ -42770,7 +42770,7 @@
       "vertices": 20,
       "elevation_cells": 20110831.773916,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_F4.geojson",
@@ -42920,7 +42920,7 @@
       "vertices": 63,
       "elevation_cells": 19048212.838719998,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_A4.geojson",
@@ -43242,7 +43242,7 @@
       "vertices": 174,
       "elevation_cells": 16337646.679467997,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_A5.geojson",
@@ -44008,7 +44008,7 @@
       "vertices": 16,
       "elevation_cells": 13197912.159616003,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_E5.geojson",
@@ -44142,7 +44142,7 @@
       "vertices": 19,
       "elevation_cells": 9410365.9504,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_B5.geojson",
@@ -44288,7 +44288,7 @@
       "vertices": 13,
       "elevation_cells": 7869729.857109999,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_C5.geojson",
@@ -44410,7 +44410,7 @@
       "vertices": 19,
       "elevation_cells": 10776306.496720001,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_D5.geojson",
@@ -44556,7 +44556,7 @@
       "vertices": 17,
       "elevation_cells": 14198667.647698002,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_G5.geojson",
@@ -44694,7 +44694,7 @@
       "vertices": 109,
       "elevation_cells": 17614194.475033,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_A5.2.geojson",
@@ -45200,7 +45200,7 @@
       "vertices": 64,
       "elevation_cells": 27324455.3464,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_B6.geojson",
@@ -45526,7 +45526,7 @@
       "vertices": 65,
       "elevation_cells": 26615246.3704,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_C6.geojson",
@@ -45856,7 +45856,7 @@
       "vertices": 8,
       "elevation_cells": 5568198.7442499995,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_D6.geojson",
@@ -45958,7 +45958,7 @@
       "vertices": 33,
       "elevation_cells": 27396304.528,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_E6.geojson",
@@ -46160,7 +46160,7 @@
       "vertices": 17,
       "elevation_cells": 17360898.7525,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_G6.geojson",
@@ -46298,7 +46298,7 @@
       "vertices": 150,
       "elevation_cells": 26573045.619093996,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_C6.2.geojson",
@@ -46968,7 +46968,7 @@
       "vertices": 241,
       "elevation_cells": 13190167.335088002,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_B7.geojson",
@@ -48002,7 +48002,7 @@
       "vertices": 15,
       "elevation_cells": 7427715.999663999,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/brooklyn_1m_250/chunks/brooklyn_1m_250_E7.geojson",

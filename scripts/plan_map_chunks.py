@@ -54,6 +54,10 @@ from terrain_relief import choose_terrain_relief
 ROOT = Path(__file__).resolve().parents[1]
 PLANNER_VERSION = 1
 CRS = 2263
+# A plan is a tracked artifact, so it records a bare interpreter rather than
+# sys.executable: an absolute path would pin the plan to the machine that made
+# it. The commands run from the repository root with this on PATH.
+INTERPRETER = "python"
 # OSM highway classes worth a vote when reading the dominant street bearing,
 # weighted by how strongly each defines a neighbourhood's grid.
 BEARING_WEIGHTS = {
@@ -606,9 +610,29 @@ def chunk_records(frame: Frame, polygons, labels, shared: dict) -> list[dict]:
     return records
 
 
+def repo_relative(path: Path) -> Path:
+    """Express a path relative to the repository root when it lives inside it."""
+    return path.relative_to(ROOT) if path.is_relative_to(ROOT) else path
+
+
+def repo_relative_text(text: str) -> str:
+    """Rewrite an absolute in-repository path in recorded command-line text.
+
+    A plan is tracked, so a recorded invocation must not carry the planning
+    machine's directory layout. The project's own `@file` prefix is preserved,
+    and text that is already relative is returned as typed: by convention the
+    commands a plan records are run from the repository root.
+    """
+    prefix, path = ("@", text[1:]) if text.startswith("@") else ("", text)
+    if not path.startswith("/"):
+        return text
+    resolved = Path(path).resolve()
+    return f"{prefix}{repo_relative(resolved)}" if resolved.is_relative_to(ROOT) else text
+
+
 def command_for(chunk: dict, shared: dict, paths: dict) -> list[str]:
     command = [
-        shared["python"], "scripts/generate_3mf.py",
+        INTERPRETER, "scripts/generate_3mf.py",
         "--bounding-polygon", f"@{paths['polygon']}",
         "--print-frame", f"@{paths['frame']}",
         "--scale", f"{shared['scale']:.6f}",
@@ -656,12 +680,9 @@ def write_plan(directory: Path, plan: dict, chunks: list[dict], shared: dict) ->
         polygon_path.write_text(shapely.to_geojson(chunk["polygon_wgs84"]) + "\n")
         frame_path.write_text(json.dumps(chunk["print_frame"], indent=2) + "\n")
         paths = {
-            "polygon": polygon_path.relative_to(ROOT) if polygon_path.is_relative_to(ROOT)
-            else polygon_path,
-            "frame": frame_path.relative_to(ROOT) if frame_path.is_relative_to(ROOT)
-            else frame_path,
-            "model": model_path.relative_to(ROOT) if model_path.is_relative_to(ROOT)
-            else model_path,
+            "polygon": repo_relative(polygon_path),
+            "frame": repo_relative(frame_path),
+            "model": repo_relative(model_path),
         }
         chunk["command"] = command_for(chunk, shared, paths)
         chunk["files"] = {key: str(value) for key, value in paths.items()}
@@ -1243,7 +1264,6 @@ def run(args, log) -> dict:
 
     shared = {
         "plan_id": args.plan_id or default_plan_id(target_wgs, scale, resolved["envelope_mm"]),
-        "python": sys.executable,
         "scale": scale,
         "grid_step_mm": args.grid_step_mm,
         "layer_height": args.layer_height,
@@ -1256,7 +1276,7 @@ def run(args, log) -> dict:
         "land_cover_dataset": args.land_cover_dataset,
         "offline": args.offline,
         "no_preview": args.generate_no_preview,
-        "model_dir": str(args.output_dir / "models"),
+        "model_dir": repo_relative_text(str(args.output_dir / "models")),
     }
     shared["plan_id"] = re.sub(r"[^A-Za-z0-9_.-]+", "_", shared["plan_id"])
     chunks = chunk_records(frame, polygons, labels, shared)
@@ -1269,13 +1289,14 @@ def run(args, log) -> dict:
     plan = {
         "planner_version": PLANNER_VERSION,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "command": " ".join(shlex.quote(part) for part in sys.argv),
+        "command": " ".join(
+            shlex.quote(repo_relative_text(part)) for part in sys.argv),
         "target_wgs84": json.loads(shapely.to_geojson(target_wgs)),
         "target_area_km2": float(target.area * FT * FT / 1e6),
         "orientation": orientation,
         "continues": None if continued is None else {
             "plan_id": continued["shared_generation"].get("plan_id"),
-            "plan": str(args.continue_plan),
+            "plan": repo_relative_text(str(args.continue_plan)),
             **contact,
         },
         "frame": {
@@ -1283,7 +1304,7 @@ def run(args, log) -> dict:
             "y_axis": list(frame.y_axis), "bearing_deg": frame.bearing_deg,
             "manufacturing_cell_ft": frame.cell_ft,
         },
-        "shared_generation": {key: value for key, value in shared.items() if key != "python"},
+        "shared_generation": dict(shared),
         "envelope_mm": list(resolved["envelope_mm"]),
         "assembled_size_mm": list(assembled_size_mm(frame, target_ft)),
         "cut_settings": {

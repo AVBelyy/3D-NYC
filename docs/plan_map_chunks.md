@@ -27,10 +27,10 @@ need the full source set that `generate_3mf.py` requires.
 ```
 
 Inspect `output/plans/manhattan_2m/preview.svg` and `plan.json`, then build the
-plates:
+plates from the repository root, with the project environment first on `PATH`:
 
 ```bash
-output/plans/manhattan_2m/commands.sh
+PATH="$PWD/.venv/bin:$PATH" output/plans/manhattan_2m/commands.sh
 ```
 
 To choose the scale from a target chunk budget instead, pass `--fit-scale`. The
@@ -369,6 +369,20 @@ The cut-cost surface is rebuilt from `data/cache` on every run and never
 persisted, so a plan always reflects the caches as they are now. Building it
 dominates the runtime: roughly 70 of the 90 seconds a Manhattan-sized plan
 takes at `--cost-resolution-m 4`, against about 11 for the partition search.
+
+### Paths a plan records
+
+Every path a plan records is relative to the repository root, and the emitted
+commands name a bare `python`. A plan is a tracked artifact that outlives the
+checkout that wrote it, so it carries nothing about the machine that planned
+it. Run one with the repository root as the working directory and an
+interpreter that satisfies the [project README](../README.md) first on `PATH`;
+`commands.sh` resolves neither for you.
+
+Paths given on the command line are recorded the same way. An absolute path
+inside the repository is recorded relative to the root, and one outside it is
+recorded as typed — a plan that reaches outside the repository will not
+reproduce anywhere else.
 
 ## How many plates a target needs
 

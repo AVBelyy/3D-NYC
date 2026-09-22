@@ -58,7 +58,10 @@ there is not evidence that `.venv` accepts it.
 - `output/` is ignored; the chunk plans under `output/plans/` are the exception
   and are tracked by force-add (`plan.json`, `commands.sh`, `chunks.geojson`,
   `chunks/`). A plan records how a multi-plate map was cut and cannot be
-  reproduced from a rebuilt cache. Previews are not tracked.
+  reproduced from a rebuilt cache. Being tracked, a plan records only
+  repository-relative paths and a bare `python`, never a path from the planning
+  machine; `plan_map_chunks.repo_relative_text` enforces that, and a plan's
+  commands are run from the repository root. Previews are not tracked.
 - Do not use ignored generated models, plans, logs, or local cache inventories
   as the sole evidence for a tracked documentation claim.
 - `output/` holds artifacts a script produces for a named job, plan, or model,

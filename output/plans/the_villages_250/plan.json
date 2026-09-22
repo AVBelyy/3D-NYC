@@ -933,7 +933,7 @@
     "land_cover_dataset": "nyc_land_cover_2021",
     "offline": false,
     "no_preview": false,
-    "model_dir": "/Users/anton/Projects/3D-NYC/output/models"
+    "model_dir": "output/models"
   },
   "envelope_mm": [
     250.0,
@@ -1248,7 +1248,7 @@
       "vertices": 132,
       "elevation_cells": 27532462.502272747,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/the_villages_250/chunks/the_villages_250_A1.geojson",
@@ -1846,7 +1846,7 @@
       "vertices": 105,
       "elevation_cells": 13117664.863174377,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/the_villages_250/chunks/the_villages_250_B1.geojson",

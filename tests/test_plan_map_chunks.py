@@ -125,7 +125,7 @@ class OrientationTests(unittest.TestCase):
 class CommandTests(unittest.TestCase):
     def setUp(self):
         self.shared = {
-            "plan_id": "demo", "python": "/usr/bin/python3", "scale": 10533.0,
+            "plan_id": "demo", "scale": 10533.0,
             "grid_step_mm": 0.125, "layer_height": 0.24, "vertical_exaggeration": 1.0,
             "terrain_origin_m": -11.4712, "terrain_relief_factor": 1.0,
             "source_padding_m": 20.0, "prime_tower": "auto",
@@ -141,6 +141,13 @@ class CommandTests(unittest.TestCase):
                      "--vertical-exaggeration", "--terrain-origin-m",
                      "--terrain-relief-factor", "--source-padding-m"):
             self.assertIn(flag, command)
+
+    def test_the_command_names_a_bare_interpreter(self):
+        """A plan is tracked, so it must not record the planner's own python."""
+        command = planner.command_for({"label": "A1"}, self.shared, self.paths)
+        self.assertEqual(command[0], "python")
+        for token in command:
+            self.assertFalse(token.startswith("/"), token)
 
     def test_the_polygon_and_frame_are_passed_as_files(self):
         command = planner.command_for({"label": "A1"}, self.shared, self.paths)
@@ -186,6 +193,31 @@ def a_continued_plan(**overrides):
                 box(-74.01, 40.71, -74.00, 40.72)))},
         ],
     }
+
+
+class RecordedPathTests(unittest.TestCase):
+    """Paths a plan records are repository-relative, whoever planned it."""
+
+    def test_an_absolute_in_repository_path_is_recorded_relative(self):
+        self.assertEqual(
+            planner.repo_relative_text(str(planner.ROOT / "output" / "models")),
+            "output/models",
+        )
+
+    def test_the_file_argument_prefix_survives_the_rewrite(self):
+        self.assertEqual(
+            planner.repo_relative_text(f"@{planner.ROOT}/data/polygons/a.geojson"),
+            "@data/polygons/a.geojson",
+        )
+
+    def test_text_that_is_already_relative_is_recorded_as_typed(self):
+        for text in ("output/models", "@data/polygons/a.geojson", "--scale", "10533"):
+            self.assertEqual(planner.repo_relative_text(text), text)
+
+    def test_a_path_outside_the_repository_is_left_alone(self):
+        """The rewrite is not free to relocate a genuinely external path."""
+        for text in ("/usr/bin/python3", "@/var/tmp/a.geojson"):
+            self.assertEqual(planner.repo_relative_text(text), text)
 
 
 class ContinuedPlanTests(unittest.TestCase):
@@ -398,7 +430,7 @@ class PlanOutputTests(unittest.TestCase):
         ).polygons
         self.labels = geometry.grid_labels(self.frame, self.polygons, limits)
         self.shared = {
-            "plan_id": "demo", "python": sys.executable, "scale": 10000.0,
+            "plan_id": "demo", "scale": 10000.0,
             "grid_step_mm": 0.125, "layer_height": 0.24, "vertical_exaggeration": 1.0,
             "terrain_origin_m": -1.5, "terrain_relief_factor": 1.0,
             "source_padding_m": 20.0, "prime_tower": "auto", "offline": True,
@@ -441,6 +473,15 @@ class PlanOutputTests(unittest.TestCase):
             self.assertIn("generate_3mf.py", script)
             self.assertEqual(script.count("--print-frame"), len(records))
             self.assertTrue(script.startswith("#!/bin/sh"))
+
+    def test_the_written_plan_carries_no_path_from_the_planning_machine(self):
+        """plan.json and commands.sh are tracked; neither may name this checkout."""
+        records = planner.chunk_records(self.frame, self.polygons, self.labels, self.shared)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            planner.write_plan(root, {"planner_version": 1}, records, self.shared)
+            for name in ("plan.json", "commands.sh"):
+                self.assertNotIn(str(planner.ROOT), (root / name).read_text(), name)
 
     def test_the_written_frame_files_satisfy_the_generator_parser(self):
         from generate_3mf import parse_print_frame

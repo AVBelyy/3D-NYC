@@ -13587,7 +13587,7 @@
     "land_cover_dataset": "nyc_land_cover_2021",
     "offline": false,
     "no_preview": false,
-    "model_dir": "/Users/anton/Projects/3D-NYC/output/models"
+    "model_dir": "output/models"
   },
   "envelope_mm": [
     240.0,
@@ -16175,7 +16175,7 @@
       "vertices": 1148,
       "elevation_cells": 15607741.087100124,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_A1.geojson",
@@ -20837,7 +20837,7 @@
       "vertices": 487,
       "elevation_cells": 17680952.21836,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_A2.geojson",
@@ -22855,7 +22855,7 @@
       "vertices": 175,
       "elevation_cells": 17550557.36491,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_A3.geojson",
@@ -23625,7 +23625,7 @@
       "vertices": 61,
       "elevation_cells": 11608676.8599205,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_A4.geojson",
@@ -23939,7 +23939,7 @@
       "vertices": 151,
       "elevation_cells": 24796669.441909,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_B4.geojson",
@@ -24613,7 +24613,7 @@
       "vertices": 47,
       "elevation_cells": 19078401.814671997,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_A5.geojson",
@@ -24871,7 +24871,7 @@
       "vertices": 63,
       "elevation_cells": 14755168.956567999,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_B5.geojson",
@@ -25193,7 +25193,7 @@
       "vertices": 34,
       "elevation_cells": 7174255.183828001,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_A6.geojson",
@@ -25399,7 +25399,7 @@
       "vertices": 98,
       "elevation_cells": 18117058.190968,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_B6.geojson",
@@ -25861,7 +25861,7 @@
       "vertices": 113,
       "elevation_cells": 14208056.734460501,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_A7.geojson",
@@ -26383,7 +26383,7 @@
       "vertices": 69,
       "elevation_cells": 19859986.342735,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_B7.geojson",
@@ -26729,7 +26729,7 @@
       "vertices": 71,
       "elevation_cells": 11462689.011202,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_B8.geojson",
@@ -27083,7 +27083,7 @@
       "vertices": 57,
       "elevation_cells": 16785386.684605002,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_A8.geojson",
@@ -27381,7 +27381,7 @@
       "vertices": 12,
       "elevation_cells": 11132867.475856,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_B9.geojson",
@@ -27499,7 +27499,7 @@
       "vertices": 49,
       "elevation_cells": 3314930.1097,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_A9.geojson",
@@ -27765,7 +27765,7 @@
       "vertices": 147,
       "elevation_cells": 16494898.699686999,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_C9.geojson",
@@ -28423,7 +28423,7 @@
       "vertices": 125,
       "elevation_cells": 18682735.631349996,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_A10.geojson",
@@ -28993,7 +28993,7 @@
       "vertices": 25,
       "elevation_cells": 11140844.748736,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_B10.geojson",
@@ -29163,7 +29163,7 @@
       "vertices": 107,
       "elevation_cells": 13117664.863174377,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_C10.geojson",
@@ -29661,7 +29661,7 @@
       "vertices": 583,
       "elevation_cells": 14966358.91393,
       "command": [
-        "/Users/anton/Projects/3D-NYC/.venv/bin/python",
+        "python",
         "scripts/generate_3mf.py",
         "--bounding-polygon",
         "@output/plans/manhattan_2m_240/chunks/manhattan_2m_240_B11.geojson",
