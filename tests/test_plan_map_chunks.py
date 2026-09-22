@@ -159,6 +159,171 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(float(value), round(self.shared["terrain_origin_m"], 4))
 
 
+# One manufacturing cell at the scale these fixtures use, and the frame the
+# fixture plan was cut in.
+CELL_FT = 4.32
+A_FRAME = geometry.Frame((981000.0, 200000.0), (0.8, -0.6), (0.6, 0.8), 10000.0, 0.125)
+
+
+def a_continued_plan(**overrides):
+    """A minimal manifest of two square plates side by side, in WGS84."""
+    shared = {
+        "plan_id": "printed", "scale": 10000.0, "grid_step_mm": 0.125,
+        "layer_height": 0.16, "vertical_exaggeration": 1.0, "source_padding_m": 20.0,
+        "land_cover_dataset": "nyc_land_cover_2021",
+        "terrain_origin_m": -7.25, "terrain_relief_factor": 1.0,
+    }
+    shared.update(overrides)
+    return {
+        "frame": {"origin_ft": [981000.0, 200000.0],
+                  "x_axis": [0.8, -0.6], "y_axis": [0.6, 0.8]},
+        "cut_settings": {"snap_mm": 1.0},
+        "shared_generation": shared,
+        "chunks": [
+            {"label": "A1", "polygon_wgs84": json.loads(shapely.to_geojson(
+                box(-74.01, 40.72, -74.00, 40.73)))},
+            {"label": "A2", "polygon_wgs84": json.loads(shapely.to_geojson(
+                box(-74.01, 40.71, -74.00, 40.72)))},
+        ],
+    }
+
+
+class ContinuedPlanTests(unittest.TestCase):
+    """Joining a plan whose plates are already printed."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = Path(self.directory.name) / "plan.json"
+
+    def write(self, plan):
+        self.path.write_text(json.dumps(plan))
+        return self.path
+
+    def args(self, *arguments):
+        return parsed("--scale", "10000", "--layer-height", "0.16", *arguments)
+
+    def test_the_lattice_is_inherited_rather_than_derived_from_the_new_target(self):
+        plan = a_continued_plan()
+        anchor = geometry.Frame(
+            tuple(plan["frame"]["origin_ft"]), tuple(plan["frame"]["x_axis"]),
+            tuple(plan["frame"]["y_axis"]), 10000.0, 0.125,
+        )
+        elsewhere = box(1000000.0, 260000.0, 1002000.0, 262000.0)
+        frame = planner.build_frame(elsewhere, 0.0, 10000.0, 0.125, anchor=anchor)
+        self.assertEqual(frame.origin_ft, anchor.origin_ft)
+        self.assertEqual(frame.x_axis, anchor.x_axis)
+        self.assertEqual(frame.y_axis, anchor.y_axis)
+
+    def test_a_setting_the_two_plans_disagree_on_names_the_value_to_pass(self):
+        path = self.write(a_continued_plan(layer_height=0.24))
+        with self.assertRaises(planner.PlanError) as caught:
+            planner.load_continued_plan(path, self.args("--continue-plan", str(path)))
+        self.assertIn("--layer-height 0.24", str(caught.exception))
+
+    def test_matching_settings_are_accepted(self):
+        path = self.write(a_continued_plan())
+        plan = planner.load_continued_plan(path, self.args("--continue-plan", str(path)))
+        self.assertEqual(plan["shared_generation"]["plan_id"], "printed")
+
+    def test_fitting_the_scale_would_change_the_map_and_is_refused(self):
+        path = self.write(a_continued_plan())
+        with self.assertRaises(planner.PlanError) as caught:
+            planner.load_continued_plan(
+                path, self.args("--continue-plan", str(path), "--fit-scale")
+            )
+        self.assertIn("--fit-scale", str(caught.exception))
+
+    def test_a_file_that_is_not_a_manifest_says_so(self):
+        path = self.write({"hello": "world"})
+        with self.assertRaises(planner.PlanError) as caught:
+            planner.load_continued_plan(path, self.args("--continue-plan", str(path)))
+        self.assertIn("plan manifest", str(caught.exception))
+
+    def test_whole_plates_are_reported_as_replaced_or_met(self):
+        contact = planner.continued_contact(
+            a_continued_plan(), box(-74.01, 40.71, -74.00, 40.72), sliver_ft=CELL_FT
+        )
+        self.assertEqual(contact["replaces"], ["A2"])
+        self.assertEqual(contact["meets"], ["A1"])
+
+    def test_a_target_built_from_plates_carries_their_own_outline(self):
+        plan = a_continued_plan()
+        target = planner.plates_target(plan, ["A1", "A2"], frame=A_FRAME, sliver_ft=CELL_FT)
+        self.assertEqual(target.geom_type, "Polygon")
+        self.assertEqual(len(target.interiors), 0)
+        self.assertAlmostEqual(target.bounds[1], 40.71)
+        self.assertAlmostEqual(target.bounds[3], 40.73)
+        # The join it leaves behind is the printed plates' own boundary.
+        self.assertEqual(
+            planner.continued_contact(plan, target, sliver_ft=CELL_FT)["replaces"],
+            ["A1", "A2"],
+        )
+
+    def test_an_outline_off_its_lattice_by_a_projection_hair_is_put_back(self):
+        """A straight cut edge comes back from WGS84 with its ends apart.
+
+        Left alone, a new cut drawn to the same lattice position runs
+        straight while the outline slants, and the wedge between them is a
+        sliver the solid modelling turns into a spike.
+        """
+        frame = A_FRAME
+        step = round(1.0 / frame.grid_step_mm) * frame.cell_ft
+        edge = 40 * step
+        bent = Polygon([(0.0, 0.0), (edge, 0.0), (edge + 0.011, 30 * step), (0.0, 30 * step)])
+        fixed = planner.on_lattice(bent, {"cut_settings": {"snap_mm": 1.0}}, frame)
+        corners = sorted(round(x, 6) for x, _ in np.asarray(fixed.exterior.coords))
+        self.assertEqual(corners.count(round(edge, 6)), 2, "the edge is still bent")
+        self.assertAlmostEqual(fixed.area, bent.area, delta=abs(0.011 * 30 * step))
+
+    def test_a_plan_that_records_no_lattice_is_left_alone(self):
+        bent = Polygon([(0.0, 0.0), (100.0, 0.0), (100.011, 50.0), (0.0, 50.0)])
+        self.assertEqual(planner.on_lattice(bent, {}, A_FRAME), bent)
+
+    def test_naming_a_plate_the_plan_does_not_have_lists_the_ones_it_does(self):
+        with self.assertRaises(planner.PlanError) as caught:
+            planner.plates_target(a_continued_plan(), ["A1", "Z9"], frame=A_FRAME, sliver_ft=CELL_FT)
+        self.assertIn("Z9", str(caught.exception))
+        self.assertIn("A1, A2", str(caught.exception))
+
+    def test_plates_that_do_not_touch_cannot_be_one_target(self):
+        plan = a_continued_plan()
+        plan["chunks"][1]["polygon_wgs84"] = json.loads(shapely.to_geojson(
+            box(-73.98, 40.71, -73.97, 40.72)))
+        with self.assertRaises(planner.PlanError) as caught:
+            planner.plates_target(plan, ["A1", "A2"], frame=A_FRAME, sliver_ft=CELL_FT)
+        self.assertIn("connected", str(caught.exception))
+
+    def test_a_target_is_named_exactly_one_way(self):
+        with self.assertRaises(planner.PlanError) as caught:
+            planner.resolve(parsed("--replace-plates", "A1"))
+        self.assertIn("exactly one", str(caught.exception))
+        with self.assertRaises(planner.PlanError) as caught:
+            planner.resolve(planner.parser().parse_args([]))
+        self.assertIn("exactly one", str(caught.exception))
+
+    def test_replacing_plates_needs_the_plan_they_belong_to(self):
+        arguments = planner.parser().parse_args(["--replace-plates", "A1,A2"])
+        with self.assertRaises(planner.PlanError) as caught:
+            planner.resolve(arguments)
+        self.assertIn("--continue-plan", str(caught.exception))
+
+    def test_rings_that_only_graze_a_plate_are_not_a_partial_cover(self):
+        """A union's own boundary crosses its neighbour's ring by nanometres."""
+        plan = a_continued_plan()
+        grazing = box(-74.01, 40.71, -74.00, 40.72 + 1e-12)
+        self.assertEqual(
+            planner.continued_contact(plan, grazing, sliver_ft=CELL_FT)["replaces"], ["A2"]
+        )
+
+    def test_a_target_cutting_through_a_printed_plate_is_refused(self):
+        with self.assertRaises(planner.PlanError) as caught:
+            planner.continued_contact(
+                a_continued_plan(), box(-74.01, 40.71, -74.00, 40.725), sliver_ft=CELL_FT
+            )
+        self.assertIn("A1", str(caught.exception))
+
+
 class SummaryTests(unittest.TestCase):
     def test_quality_is_weighted_by_seam_length(self):
         seams = [
@@ -184,6 +349,20 @@ class SummaryTests(unittest.TestCase):
                   "crosses": [{"kind": "bridge", "name": "x", "length_ft": 1000.0}]}]
         summary = planner.summarise([], seams, 10000.0)
         self.assertAlmostEqual(summary["longest_crossing_mm"], 1000.0 * geometry.FT * 1000 / 10000)
+
+    def test_joint_fit_is_summarised_per_printed_metre_of_seam(self):
+        seams = [
+            {"length_ft": 1000.0, "sides": 1, "corners": 0, "shortest_side_ft": 1000.0,
+             "between": ["A1", "A2"]},
+            {"length_ft": 1000.0, "sides": 5, "corners": 4, "shortest_side_ft": 40.0,
+             "between": ["A2", "A3"]},
+        ]
+        joints = planner.summarise([], seams, 10000.0)["joints"]
+        metres = 2000.0 * geometry.FT * 1000 / 10000 / 1000
+        self.assertEqual((joints["sides"], joints["corners"]), (6, 4))
+        self.assertAlmostEqual(joints["corners_per_metre"], 4 / metres)
+        self.assertAlmostEqual(joints["shortest_side_mm"], 40.0 * geometry.FT * 1000 / 10000)
+        self.assertEqual(joints["worst_joint"], ["A2", "A3"])
 
     def test_no_seams_yields_no_weighted_values(self):
         summary = planner.summarise([], [], 10000.0)

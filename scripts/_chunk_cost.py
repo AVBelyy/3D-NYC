@@ -30,7 +30,7 @@ import shapely
 from affine import Affine
 from rasterio.features import rasterize
 from rasterio.warp import Resampling, reproject
-from shapely.geometry import Polygon, box
+from shapely.geometry import LineString, Polygon, box
 
 from _cache_land_cover import LAND_COVER_DATASETS
 from _chunk_geometry import (
@@ -40,6 +40,7 @@ from _chunk_geometry import (
     CutRequest,
     Frame,
     PlanGeometryError,
+    align_to_turns,
     rectilinear_path,
     to_points,
 )
@@ -479,8 +480,26 @@ class CostSurface(CutChooser):
             enters_at=enters_at,
             leaves_at=leaves_at,
         )
+        # The search has already held every level for a minimum run and
+        # stepped by a minimum jog, so the regularizer is given none: folding
+        # runs together here in feet would be free to undo the routing the
+        # search did on purpose, and measurably does -- on Upper Manhattan it
+        # moved a seam 45 mm along a structure. Only the jog positions are
+        # adjusted, onto the seams they cross.
         path_u, path_v = rectilinear_path(
             u, v[levels], snap_ft=level_ft, min_run_ft=0.0, min_jog_ft=0.0
+        )
+        # Pull whole levels onto the turns of the cuts this one crosses
+        # before straightening, so the straight segments are fitted to the
+        # path that will actually be used.
+        def blocked(candidate: np.ndarray) -> int:
+            line = LineString(to_points(request.axis, path_u, candidate))
+            if request.region is not None:
+                line = line.intersection(request.region)
+            return self.blocked(line)
+
+        path_v = align_to_turns(
+            path_v, request, np.asarray(request.crossing_turns, dtype=float), blocked
         )
         points = np.column_stack([path_u, path_v])
         if self.style == "angled":
@@ -517,7 +536,15 @@ class CostSurface(CutChooser):
                 clear, cost, length = self._segment_quality(
                     frame_points[source], frame_points[target]
                 )
-                if not clear:
+                # A step the path already takes is always available; only a
+                # shortcut has to prove itself clear. Requiring it of the
+                # steps too left the whole cut unreachable as soon as one of
+                # them touched a keep-out, and the straightening was then
+                # abandoned rather than done where it could be -- turning
+                # `angled` silently back into `staircase` on exactly the
+                # cuts with the most corners to lose. Stubby shortcuts are
+                # still discouraged, by the second term of the objective.
+                if not clear and source != target - 1:
                     continue
                 candidate = (
                     best[source][0] + 1.0,
@@ -534,15 +561,17 @@ class CostSurface(CutChooser):
         return points[np.asarray(sorted(order))]
 
     def _segment_quality(self, start, end) -> tuple[bool, float, float]:
-        """Whether a straight frame-local segment is keep-out free, its cost and length."""
+        """Whether a straight frame-local segment is keep-out free, its cost and length.
+
+        The cost is returned whether it is clear or not, because a caller may
+        have no choice but to keep a segment that is not.
+        """
         line = shapely.LineString([start, end])
         rows, columns = self._seam_samples(line)
         if not len(rows):
             return True, 0.0, float(line.length)
-        if self.keep_out[rows, columns].any():
-            return False, math.inf, float(line.length)
         priced = self.cost[rows, columns]
-        return (True,
+        return (not self.keep_out[rows, columns].any(),
                 float(np.where(np.isfinite(priced), priced, BLOCKED_COST).sum()),
                 float(line.length))
 

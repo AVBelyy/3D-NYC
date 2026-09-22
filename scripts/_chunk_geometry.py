@@ -225,6 +225,11 @@ class CutRequest:
     # level or treats the step as the jog it is; see :func:`continuing_levels`.
     continues_from: float | None = None
     continues_into: float | None = None
+    # Across-coordinates at which a cut across this one already turns. A
+    # level resting beside one strands the same sliver the other way round,
+    # so a chooser pulls its levels onto them; see
+    # :func:`perpendicular_turns` and :func:`align_to_turns`.
+    crossing_turns: tuple[float, ...] = ()
 
     @property
     def samples(self) -> np.ndarray:
@@ -304,11 +309,11 @@ def rectilinear_path(
     runs = _absorb_short_runs(runs, min_run_ft)
     runs = _merge_small_jogs(runs, min_jog_ft, snap_ft)
     runs = _absorb_short_runs(runs, min_run_ft)
-    # Jogs land on the same lattice as levels. The along-coordinate comes from
-    # evenly spaced samples, so without this a jog can sit a fraction of a step
-    # from a seam already running the other way and stranding a strip of plate
-    # between the two, far too narrow to print. Snapping cannot reorder the
-    # runs: each boundary is held at or after the one before it.
+    # Jogs land on the same lattice as levels. The along-coordinate comes
+    # from evenly spaced samples, so without this a jog can sit a fraction of
+    # a step from a seam already running the other way and strand a strip of
+    # plate between the two, far too narrow to print. Snapping cannot reorder
+    # the runs: each boundary is held at or after the one before it.
     for index in range(1, len(runs)):
         boundary = round(runs[index][0] / snap_ft) * snap_ft
         boundary = min(max(boundary, runs[index - 1][0]), runs[index][1])
@@ -432,6 +437,82 @@ class PlacedCut:
     u_end: float
     v_start: float
     v_end: float
+    # Along-coordinates where this cut steps between levels. Each is a corner
+    # two plates already share, and a cut crossing this one pulls its own
+    # levels onto them; see :func:`perpendicular_turns`.
+    turns: tuple[float, ...] = ()
+
+
+# How far a level may be pulled to land on a perpendicular seam's turn, in
+# snap steps. A turn missed by one step is the case this exists for; a cut
+# that is genuinely somewhere else is further off than a printed joint's own
+# tolerance and must not be dragged there.
+ALIGNMENT_STEPS = 2
+
+
+def perpendicular_turns(
+    placed: Sequence[PlacedCut], axis: int, u_start: float, u_end: float
+) -> np.ndarray:
+    """Across-coordinates where a crossing cut already turns.
+
+    A cut chooses its level on the same lattice a perpendicular cut chooses
+    its jog positions on, but nothing makes the two agree, so they can land a
+    single step apart. What that leaves is not a tidy corner: it is a finger
+    of plate one step wide reaching the length of the jog, with a slot of the
+    same size in the plate wrapped around it. Neither prints, and at a
+    three-plate corner it is exactly where the assembly has least tolerance.
+    """
+    turns: list[float] = []
+    for cut in placed:
+        if cut.axis == axis:
+            continue
+        # Only a turn this cut could actually run into is worth meeting.
+        if cut.v_start > u_end and cut.v_end > u_end:
+            continue
+        if cut.v_start < u_start and cut.v_end < u_start:
+            continue
+        turns.extend(cut.turns)
+    return np.unique(np.asarray(turns, dtype=float)) if turns else np.empty(0)
+
+
+def align_to_turns(
+    path_v: np.ndarray,
+    request: "CutRequest",
+    turns: np.ndarray,
+    blocked,
+) -> np.ndarray:
+    """Pull each level onto a perpendicular seam's turn a step or two away.
+
+    Moved one level at a time, and only when the move is inside the deviation
+    allowance, leaves every jog at least a minimum jog, and crosses no more
+    keep-out than staying put did. A cut that has to go through something to
+    tidy a corner is not tidying it.
+    """
+    if not len(turns):
+        return path_v
+    low = request.v_nominal - request.deviation_ft
+    high = request.v_nominal + request.deviation_ft
+    reach = ALIGNMENT_STEPS * request.snap_ft
+    adjusted = np.asarray(path_v, dtype=float).copy()
+    for level in np.unique(adjusted):
+        candidates = turns[(np.abs(turns - level) <= reach) & (turns >= low) & (turns <= high)]
+        candidates = candidates[np.abs(candidates - level) > 1e-9]
+        if not len(candidates):
+            continue
+        target = float(candidates[np.argmin(np.abs(candidates - level))])
+        trial = np.where(np.abs(adjusted - level) < 1e-9, target, adjusted)
+        steps = np.abs(np.diff(trial))
+        if np.any((steps > 1e-9) & (steps < request.min_jog_ft - 1e-9)):
+            continue
+        if blocked(trial) <= blocked(adjusted):
+            adjusted = trial
+    return adjusted
+
+
+def turning_along(path_u: np.ndarray, path_v: np.ndarray) -> tuple[float, ...]:
+    """Along-coordinates at which a cut steps between levels."""
+    changed = np.abs(np.diff(np.asarray(path_v, dtype=float))) > 1e-9
+    return tuple(float(value) for value in np.unique(np.asarray(path_u)[:-1][changed]))
 
 
 def continuing_levels(
@@ -511,20 +592,36 @@ def split_region(region: Polygon, line: LineString, axis: int) -> tuple[list[Pol
     return low, high
 
 
-def plan_cut_count(length_ft: float, limit_ft: float, deviation_ft: float) -> int:
-    """Pieces needed along one axis, leaving room for the wiggle budget.
+def shortest_contact(polygons: Sequence[Polygon]) -> float:
+    """Length of the shortest boundary any two pieces share, or infinity."""
+    shortest = math.inf
+    tree = shapely.STRtree(list(polygons))
+    for index, polygon in enumerate(polygons):
+        for other in tree.query(polygon):
+            other = int(other)
+            if other <= index:
+                continue
+            shared = polygon.intersection(polygons[other]).length
+            if shared > 1e-6:
+                shortest = min(shortest, shared)
+    return shortest
 
-    A cut may wander ``deviation_ft`` either side of its nominal position, so
-    each interior piece can grow by twice that.  Sizing against the reduced
-    limit guarantees every finished piece still fits the printer envelope.
+
+def plan_cut_count(length_ft: float, limit_ft: float) -> int:
+    """Pieces needed along one axis, against the plate limit itself.
+
+    The wiggle budget is deliberately *not* reserved here. Charging it to
+    every piece at once asks for pieces the geometry does not need: Lower
+    Manhattan is nowhere wider than 371 mm, and a 35 mm budget against a
+    250 mm plate had it planned in three columns rather than two. What the
+    budget must not do is leave a *finished* piece over the limit, and that
+    is enforced where it belongs -- on the cut, which is only allowed to
+    wander into the room its own two sides actually have, and by the
+    recursion, which cuts again any piece that is still too big.
     """
-    usable = limit_ft - 2 * deviation_ft
-    if usable <= 0:
-        raise PlanGeometryError(
-            "The cut deviation budget leaves no usable plate width; "
-            "lower --cut-deviation-mm or raise --max-chunk-size-mm"
-        )
-    return max(1, int(math.ceil(length_ft / usable - 1e-9)))
+    if limit_ft <= 0:
+        raise PlanGeometryError("A plate limit must be positive")
+    return max(1, int(math.ceil(length_ft / limit_ft - 1e-9)))
 
 
 def partition(
@@ -536,6 +633,8 @@ def partition(
     snap_ft: float = 0.0,
     min_run_ft: float = 0.0,
     min_jog_ft: float = 0.0,
+    min_side_ft: float = 0.0,
+    slack_ft: float | None = None,
     sample_step_ft: float = 20.0,
     max_regions: int = 4096,
 ) -> PartitionResult:
@@ -546,9 +645,20 @@ def partition(
     structural rather than something checked afterwards.  Disconnected pieces
     become separate chunks because ``generate_3mf --bounding-polygon`` accepts
     only a single Polygon.
+
+    ``slack_ft`` is the plate width held back from every piece when deciding
+    how many there are. It defaults to the whole wiggle budget, which is the
+    safe choice: no cut can then come to rest on the plate limit itself.
+    Zero packs the pieces as tightly as the plate allows, which on a target
+    narrower than two plates is the difference between two columns and
+    three, but a cut may then stop a fraction of a step from one crossing it
+    and leave two plates sharing a stub of an edge instead of a corner. That
+    is invisible from inside a single cut and survives into the finished
+    plates only sometimes, so a caller asking for it has to check them.
     """
     chooser = chooser or StraightCuts()
     snap_ft = snap_ft or sample_step_ft
+    slack_ft = deviation_ft if slack_ft is None else slack_ft
     result = PartitionResult(polygons=[])
     placed: list[PlacedCut] = []
     queue: list[Polygon] = _components(target)
@@ -571,7 +681,8 @@ def partition(
         low, high, record, cut = _apply_cut(
             region, axis, limits_ft, deviation_ft, chooser,
             snap_ft=snap_ft, min_run_ft=min_run_ft, min_jog_ft=min_jog_ft,
-            sample_step_ft=sample_step_ft, placed=placed,
+            min_side_ft=min_side_ft, sample_step_ft=sample_step_ft, placed=placed,
+            slack_ft=slack_ft,
         )
         result.cuts.append(record)
         placed.append(cut)
@@ -591,14 +702,18 @@ def _apply_cut(
     min_run_ft: float,
     min_jog_ft: float,
     sample_step_ft: float,
+    min_side_ft: float = 0.0,
     placed: Sequence[PlacedCut] = (),
+    slack_ft: float = 0.0,
 ) -> tuple[list[Polygon], list[Polygon], dict, PlacedCut]:
     minx, miny, maxx, maxy = region.bounds
     v_lo, v_hi = (minx, maxx) if axis == AXIS_X else (miny, maxy)
     u_lo, u_hi = (miny, maxy) if axis == AXIS_X else (minx, maxx)
     length = v_hi - v_lo
     limit = limits_ft[axis]
-    planned = plan_cut_count(length, limit, deviation_ft)
+    planned = plan_cut_count(length, max(limit - 2 * slack_ft, 1e-9))
+
+    turns = perpendicular_turns(placed, axis, u_lo, u_hi)
 
     def attempt(pieces: int, index: int) -> tuple[CutRequest, np.ndarray, np.ndarray, int]:
         # The requested budget is a ceiling, not a target. Handing a cut all
@@ -606,23 +721,48 @@ def _apply_cut(
         # negligible savings, and roaming is what turns a straight seam into a
         # staircase. Spare width is only ever used to stay inside the envelope.
         v_nominal = v_lo + length * index / pieces
-        allowance = min(
-            deviation_ft,
-            (limit - length / pieces) / 2,
-            (v_nominal - v_lo) * 0.45,
-            (v_hi - v_nominal) * 0.45,
-        )
+        # A side of this cut that already fits the plate is finished, and
+        # must still fit after the cut moves. A side that does not fit yet
+        # will be cut again, so it constrains nothing here. Only one cut is
+        # placed per call, between two boundaries that are already fixed, so
+        # this is the whole of the envelope constraint on it.
+        low_span, high_span = v_nominal - v_lo, v_hi - v_nominal
+        room = [deviation_ft, low_span * 0.45, high_span * 0.45]
+        if low_span <= limit:
+            room.append(limit - low_span)
+        if high_span <= limit:
+            room.append(limit - high_span)
+        allowance = min(room)
         continues_from, continues_into = continuing_levels(
             placed, axis, u_lo, u_hi, v_nominal, deviation_ft
         )
+        allowance = max(allowance, 0.0)
         request = CutRequest(
-            axis, u_lo, u_hi, v_nominal, max(allowance, 0.0), sample_step_ft,
+            axis, u_lo, u_hi, v_nominal, allowance, sample_step_ft,
             snap_ft=snap_ft, min_run_ft=min_run_ft, min_jog_ft=min_jog_ft, region=region,
             continues_from=continues_from, continues_into=continues_into,
+            crossing_turns=tuple(float(value) for value in turns),
         )
+        # The chooser aligns and straightens its own path. Doing either out
+        # here would leave the other working on geometry that no longer
+        # exists: alignment after straightening moves a level the straight
+        # segments were fitted to, and a corner it reopens is never looked
+        # at again.
         path_u, path_v = _validated_path(chooser.choose(request), request)
         trial = LineString(to_points(axis, path_u, path_v)).intersection(region)
-        return request, path_u, path_v, chooser.blocked(trial)
+        overshoot = max(limits_ft) * 0.5 + sample_step_ft
+        line = cut_line(axis, path_u, path_v, overshoot_ft=overshoot)
+        low, high = split_region(region, line, axis)
+        # A guillotine is placed on a bounding box but lands on the region
+        # itself, and a non-convex region can present a thin leg where the
+        # box says there is room. Slicing one leaves a piece too small to
+        # print, so a split that does one is scored below a split that does
+        # not, and the search moves on to the next position or buys a piece.
+        slivers = sum(
+            1 for piece in (*low, *high)
+            if min(_extent(piece, AXIS_X), _extent(piece, AXIS_Y)) < min_side_ft
+        )
+        return request, path_u, path_v, (slivers, chooser.blocked(trial)), line, low, high
 
     # A band with no clear street corridor would otherwise force the cut
     # through a building. Try a different split position first, since that is
@@ -637,15 +777,12 @@ def _apply_cut(
             candidate = attempt(pieces, index)
             if best is None or candidate[3] < best[3]:
                 best = candidate
-            if candidate[3] == 0:
+            if candidate[3] == (0, 0):
                 break
-        if best[3] == 0:
+        if best[3] == (0, 0):
             break
-    request, path_u, path_v, _ = best
+    request, path_u, path_v, _, line, low, high = best
     v_nominal = request.v_nominal
-    overshoot = max(limits_ft) * 0.5 + sample_step_ft
-    line = cut_line(axis, path_u, path_v, overshoot_ft=overshoot)
-    low, high = split_region(region, line, axis)
     if not low or not high:
         raise PlanGeometryError(
             f"A cut at {v_nominal:.1f} ft on axis {axis} did not divide its region; "
@@ -666,7 +803,8 @@ def _apply_cut(
         **chooser.describe(seam),
     }
     cut = PlacedCut(axis, float(u_lo), float(u_hi),
-                    float(path_v[0]), float(path_v[-1]))
+                    float(path_v[0]), float(path_v[-1]),
+                    turning_along(path_u, path_v))
     return low, high, record, cut
 
 
@@ -1004,12 +1142,121 @@ def validate_plates(
     return plates
 
 
+# Two mating plate walls butt along a joint's straight sides. Every corner in
+# between is a tab on one plate and a notch on the other at zero clearance,
+# and an extruded wall is laid a fraction of a bead proud of the mesh it came
+# from, so a tab never seats to the bottom of its notch: the plates stand off
+# by whatever the tightest one leaves, which reads as a gap along the rest of
+# the joint. A bend this small is below what the process resolves and is not
+# counted as a corner.
+COLLINEAR_TOLERANCE_DEG = 0.5
+
+
+def printable_seam(seam, left: Polygon, right: Polygon, width_ft: float):
+    """The part of a shared boundary that has both plates beside it.
+
+    Two plates can share a boundary neither of them has any width along. A
+    cut that runs down part of a region's own outline leaves one piece with
+    a sliver of that line, and the sliver counts as shared boundary by every
+    geometric test while being nothing at all to print: it is thinner than
+    the manufacturing raster, so no cell centre falls in it and no material
+    is laid either side.
+
+    A stretch counts only where a point one cell to each side lands in a
+    different one of the two plates -- the same question the raster asks.
+    Measured on samples a cell apart rather than per side, because a side
+    can be part real and part sliver.
+    """
+    if width_ft <= 0 or seam.is_empty:
+        return seam
+    kept = []
+    merged = shapely.line_merge(seam)
+    for part in (merged.geoms if hasattr(merged, "geoms") else [merged]):
+        if part.geom_type != "LineString" or part.length <= 0:
+            continue
+        dense = np.asarray(shapely.get_coordinates(part.segmentize(width_ft)))
+        if len(dense) < 2:
+            continue
+        step = np.diff(dense, axis=0)
+        length = np.hypot(step[:, 0], step[:, 1])
+        usable = length > 0
+        middle = (dense[:-1] + dense[1:]) / 2
+        normal = np.column_stack([-step[:, 1], step[:, 0]])
+        normal[usable] /= length[usable, None]
+        near, far = middle + normal * width_ft, middle - normal * width_ft
+        beside = (
+            (shapely.contains_xy(left, near[:, 0], near[:, 1])
+             & shapely.contains_xy(right, far[:, 0], far[:, 1]))
+            | (shapely.contains_xy(right, near[:, 0], near[:, 1])
+               & shapely.contains_xy(left, far[:, 0], far[:, 1]))
+        ) & usable
+        start = None
+        for index, ok in enumerate([*beside, False]):
+            if ok and start is None:
+                start = index
+            elif not ok and start is not None:
+                kept.append(LineString(dense[start:index + 1]))
+                start = None
+    return shapely.line_merge(shapely.union_all(kept)) if kept else LineString()
+
+
+def joint_shape(seam) -> dict:
+    """Count the straight sides and corners a finished plate joint has.
+
+    This measures fit rather than what the seam runs over, and the two are
+    independent: a joint of one long side over a building still butts flat,
+    while a staircase over open pavement is a row of tabs and notches. The
+    shortest side comes with the count because a stubby tab is the one that
+    binds first.
+    """
+    sides = 0
+    corners = 0
+    shortest = math.inf
+    merged = shapely.line_merge(seam)
+    parts = merged.geoms if hasattr(merged, "geoms") else [merged]
+    for part in parts:
+        if part.geom_type != "LineString" or part.is_empty:
+            continue
+        lengths = np.linalg.norm(
+            np.diff(_turning_points(np.asarray(part.coords, dtype=float)), axis=0), axis=1
+        )
+        if not len(lengths):
+            continue
+        sides += len(lengths)
+        corners += len(lengths) - 1
+        shortest = min(shortest, float(lengths.min()))
+    return {
+        "sides": sides,
+        "corners": corners,
+        "shortest_side_ft": 0.0 if math.isinf(shortest) else shortest,
+    }
+
+
+def _turning_points(vertices: np.ndarray) -> np.ndarray:
+    """Keep only the vertices where a polyline actually turns."""
+    if len(vertices) < 3:
+        return vertices
+    kept = [vertices[0]]
+    for vertex, following in zip(vertices[1:-1], vertices[2:]):
+        first, second = vertex - kept[-1], following - vertex
+        if not (np.any(first) and np.any(second)):
+            continue
+        turn = abs(math.degrees(math.atan2(
+            float(first[0] * second[1] - first[1] * second[0]), float(first @ second)
+        )))
+        if turn > COLLINEAR_TOLERANCE_DEG:
+            kept.append(vertex)
+    kept.append(vertices[-1])
+    return np.asarray(kept)
+
+
 def shared_edges(
     polygons: Sequence[Polygon],
     *,
     minimum_length_ft: float = 1e-6,
     tolerance_ft: float = 1e-6,
     area_tolerance_ft2: float = 1e-6,
+    width_ft: float = 0.0,
 ) -> list[dict]:
     """Report neighbors and measure how far each seam sits off both boundaries.
 
@@ -1050,13 +1297,20 @@ def shared_edges(
                     f"the seam between chunks {index} and {other} sits up to "
                     f"{offset:.3g} ft off a boundary"
                 )
+            # What the plates actually mate along, which is not always all
+            # of what they share; see :func:`printable_seam`.
+            printable = printable_seam(seam, polygon, neighbor, width_ft)
+            if printable.is_empty or printable.length <= minimum_length_ft:
+                continue
             records.append({
                 "chunks": [index, other],
-                "length_ft": float(seam.length),
+                "length_ft": float(printable.length),
+                "shared_length_ft": float(seam.length),
                 "boundary_offset_ft": offset,
+                **joint_shape(printable),
                 # The seam geometry itself, so quality is measured on what the
                 # plates will actually be cut along.
-                "geometry": seam,
+                "geometry": printable,
             })
     if problems:
         raise PlanGeometryError("Seams are not exact: " + "; ".join(problems))

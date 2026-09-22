@@ -98,11 +98,12 @@ class LimitTests(unittest.TestCase):
             geometry.MAX_ELEVATION_CELLS,
         )
 
-    def test_cut_count_reserves_room_for_the_deviation_budget(self):
-        self.assertEqual(geometry.plan_cut_count(100.0, 100.0, 0.0), 1)
-        self.assertEqual(geometry.plan_cut_count(100.0, 100.0, 25.0), 2)
+    def test_cut_count_is_sized_against_the_plate_not_the_wiggle_budget(self):
+        """The budget is enforced on the cut, not charged to every piece."""
+        self.assertEqual(geometry.plan_cut_count(100.0, 100.0), 1)
+        self.assertEqual(geometry.plan_cut_count(260.0, 100.0), 3)
         with self.assertRaises(PlanGeometryError):
-            geometry.plan_cut_count(100.0, 40.0, 20.0)
+            geometry.plan_cut_count(100.0, 0.0)
 
 
 class RectilinearPathTests(unittest.TestCase):
@@ -188,15 +189,24 @@ class PartitionTests(unittest.TestCase):
             snap_ft=self.frame.feet(1.0),
             min_run_ft=self.frame.feet(8.0),
             min_jog_ft=self.frame.feet(2.0),
+            min_side_ft=self.frame.feet(geometry.MIN_PRINT_MM),
             sample_step_ft=40.0,
         )
 
     def test_union_equals_the_target_with_no_overlaps(self):
         result = self.partition()
         report = geometry.validate_partition(self.target, result.polygons, tolerance_ft2=1e-6)
-        self.assertEqual(report["uncovered_area_ft2"], 0.0)
+        self.assertLess(report["uncovered_area_ft2"], 1e-6)
         self.assertLess(report["excess_area_ft2"], 1e-6)
         self.assertLess(report["maximum_pairwise_overlap_ft2"], 1e-6)
+
+    def test_a_split_that_would_shave_an_unprintable_sliver_is_avoided(self):
+        result = self.partition()
+        for polygon in result.polygons:
+            width = self.frame.mm(geometry._extent(polygon, geometry.AXIS_X))
+            height = self.frame.mm(geometry._extent(polygon, geometry.AXIS_Y))
+            self.assertGreaterEqual(min(width, height), geometry.MIN_PRINT_MM,
+                                    f"a {width:.2f} x {height:.2f} mm sliver survived")
 
     def test_every_chunk_is_a_single_polygon(self):
         for polygon in self.partition().polygons:
@@ -228,6 +238,105 @@ class PartitionTests(unittest.TestCase):
         self.assertTrue(seams)
         for seam in seams:
             self.assertLess(seam["boundary_offset_ft"], 1e-6)
+
+    def test_a_cut_is_pulled_onto_a_crossing_seam_turn_one_step_away(self):
+        request = geometry.CutRequest(
+            geometry.AXIS_X, 0.0, 100.0, 50.0, 10.0, 5.0,
+            snap_ft=1.0, min_run_ft=10.0, min_jog_ft=2.0,
+        )
+        turns = np.asarray([49.0])
+        moved = geometry.align_to_turns(
+            np.asarray([50.0, 50.0]), request, turns, lambda path: 0
+        )
+        self.assertTrue(np.allclose(moved, 49.0))
+
+    def test_a_turn_out_of_reach_or_out_of_allowance_does_not_move_a_cut(self):
+        request = geometry.CutRequest(
+            geometry.AXIS_X, 0.0, 100.0, 50.0, 10.0, 5.0,
+            snap_ft=1.0, min_run_ft=10.0, min_jog_ft=2.0,
+        )
+        for turn in (45.0, 65.0):   # further than two snap steps; past the allowance
+            moved = geometry.align_to_turns(
+                np.asarray([50.0, 50.0]), request, np.asarray([turn]), lambda path: 0
+            )
+            self.assertTrue(np.allclose(moved, 50.0), f"moved onto {turn}")
+
+    def test_a_cut_is_not_pulled_through_a_keep_out_to_tidy_a_corner(self):
+        request = geometry.CutRequest(
+            geometry.AXIS_X, 0.0, 100.0, 50.0, 10.0, 5.0,
+            snap_ft=1.0, min_run_ft=10.0, min_jog_ft=2.0,
+        )
+        blocked = lambda path: 0 if abs(path[0] - 50.0) < 1e-9 else 3
+        moved = geometry.align_to_turns(
+            np.asarray([50.0, 50.0]), request, np.asarray([49.0]), blocked
+        )
+        self.assertTrue(np.allclose(moved, 50.0))
+
+    def test_a_cut_records_where_it_turns_for_later_crossing_cuts(self):
+        self.assertEqual(
+            geometry.turning_along(np.asarray([0.0, 10.0, 10.0, 30.0]),
+                                   np.asarray([5.0, 5.0, 8.0, 8.0])),
+            (10.0,),
+        )
+        turns = geometry.perpendicular_turns(
+            [geometry.PlacedCut(geometry.AXIS_Y, 0.0, 30.0, 5.0, 8.0, (10.0,))],
+            geometry.AXIS_X, 0.0, 30.0,
+        )
+        self.assertEqual(turns.tolist(), [10.0])
+        # A cut on the same axis is a continuation, not a crossing.
+        self.assertEqual(len(geometry.perpendicular_turns(
+            [geometry.PlacedCut(geometry.AXIS_X, 0.0, 30.0, 5.0, 8.0, (10.0,))],
+            geometry.AXIS_X, 0.0, 30.0)), 0)
+
+    def test_a_straight_joint_is_one_side_however_it_is_noded(self):
+        seam = shapely.LineString([(0.0, 0.0), (0.0, 40.0), (0.0, 100.0)])
+        self.assertEqual(geometry.joint_shape(seam),
+                         {"sides": 1, "corners": 0, "shortest_side_ft": 100.0})
+
+    def test_a_staircase_joint_counts_every_tab_and_the_stubbiest_one(self):
+        seam = shapely.LineString([
+            (0.0, 0.0), (0.0, 50.0), (6.0, 50.0), (6.0, 90.0), (20.0, 90.0),
+        ])
+        shape = geometry.joint_shape(seam)
+        self.assertEqual((shape["sides"], shape["corners"]), (4, 3))
+        self.assertAlmostEqual(shape["shortest_side_ft"], 6.0)
+
+    def test_a_joint_in_two_pieces_is_counted_across_both(self):
+        seam = shapely.MultiLineString([
+            [(0.0, 0.0), (0.0, 50.0)], [(0.0, 80.0), (10.0, 80.0), (10.0, 120.0)],
+        ])
+        shape = geometry.joint_shape(seam)
+        self.assertEqual((shape["sides"], shape["corners"]), (3, 1))
+
+    def test_seams_report_the_shape_the_plates_have_to_mate_along(self):
+        seams = geometry.shared_edges([box(0.0, 0.0, 50.0, 100.0), box(50.0, 0.0, 120.0, 100.0)])
+        self.assertEqual(len(seams), 1)
+        self.assertEqual(seams[0]["sides"], 1)
+        self.assertEqual(seams[0]["corners"], 0)
+        self.assertAlmostEqual(seams[0]["shortest_side_ft"], 100.0)
+
+    def test_boundary_with_no_plate_beside_it_is_not_counted_as_a_joint(self):
+        """A cut down a region's own outline leaves a sliver of shared edge.
+
+        It is real boundary and the ground it encloses belongs to a plate,
+        but it is thinner than a manufacturing cell, so nothing prints
+        either side of it and it is not a joint the plates mate along.
+        """
+        left = box(0.0, 0.0, 50.0, 100.0)
+        # A plate whose boundary runs 40 units up the same line at a
+        # ten-thousandth of a unit's width: a sliver, not a mating surface.
+        right = Polygon([(50.0, 0.0), (100.0, 0.0), (100.0, 60.0), (50.0, 60.0),
+                         (50.0001, 100.0), (50.0, 60.0)])
+        shared = left.intersection(right)
+        self.assertGreater(shared.length, 95.0)          # 60 real + ~40 sliver
+        printable = geometry.printable_seam(shared, left, right, 1.0)
+        self.assertAlmostEqual(printable.length, 60.0, delta=2.0)
+
+    def test_a_joint_with_both_plates_beside_it_is_kept_whole(self):
+        left, right = box(0.0, 0.0, 50.0, 100.0), box(50.0, 0.0, 100.0, 100.0)
+        shared = left.intersection(right)
+        printable = geometry.printable_seam(shared, left, right, 1.0)
+        self.assertAlmostEqual(printable.length, shared.length, delta=2.0)
 
     def test_a_deliberate_overlap_is_detected(self):
         square = box(0.0, 0.0, 100.0, 100.0)

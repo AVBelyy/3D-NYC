@@ -21,12 +21,13 @@ import sys
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Sequence
 
 import geopandas as gpd
 import numpy as np
 import shapely
 import structlog
-from shapely.geometry import Polygon
+from shapely.geometry import Polygon, shape
 
 import _chunk_geometry as geometry
 from _chunk_cost import (
@@ -228,8 +229,18 @@ def _aligned_extent(target: Polygon, bearing: float) -> tuple[float, float]:
 # --------------------------------------------------------------------------
 
 
-def build_frame(target: Polygon, bearing: float, scale: float, grid_step_mm: float) -> Frame:
-    """Anchor the shared manufacturing lattice just outside the target."""
+def build_frame(target: Polygon, bearing: float, scale: float, grid_step_mm: float,
+                *, anchor: Frame | None = None) -> Frame:
+    """Anchor the shared manufacturing lattice just outside the target.
+
+    With ``anchor`` the lattice is not derived from this target at all. A plan
+    that continues another has to keep that plan's origin and axes verbatim:
+    the origin sits at the *first* target's corner, which a sub-target does
+    not reproduce, and half a manufacturing cell of difference is enough to
+    stop the new plates registering with the ones already printed.
+    """
+    if anchor is not None:
+        return Frame(anchor.origin_ft, anchor.x_axis, anchor.y_axis, scale, grid_step_mm)
     provisional = Frame.from_bearing(bearing, (0.0, 0.0), scale, grid_step_mm)
     coordinates = shapely.get_coordinates(target)
     x_axis, y_axis = np.asarray(provisional.x_axis), np.asarray(provisional.y_axis)
@@ -238,6 +249,219 @@ def build_frame(target: Polygon, bearing: float, scale: float, grid_step_mm: flo
         + y_axis * float((coordinates @ y_axis).min())
     )
     return Frame.from_bearing(bearing, origin.tolist(), scale, grid_step_mm)
+
+
+# Values every plate in an assembly has to agree on. Foundation filament is
+# deliberately absent: the substrate is hidden, so plates may be founded on
+# different material and still fit together.
+CONTINUED_SETTINGS = (
+    ("scale", "--scale", "{:g}"),
+    ("grid_step_mm", "--grid-step-mm", "{:g}"),
+    ("layer_height", "--layer-height", "{:g}"),
+    ("vertical_exaggeration", "--vertical-exaggeration", "{:g}"),
+    ("source_padding_m", "--source-padding-m", "{:g}"),
+    ("land_cover_dataset", "--land-cover-dataset", "{}"),
+)
+
+
+def load_continued_plan(path: Path, args) -> dict:
+    """Read the plan a new one joins, and check the two can share an assembly.
+
+    Plates butt only when they were generated against one lattice, one datum
+    and one relief factor. Of those the frame and the datum cannot be
+    re-derived from a smaller target -- the frame origin is anchored to the
+    first target's corner and the datum to its lowest ground -- so they are
+    inherited here. The rest are stated on both command lines, and a
+    disagreement is an error naming the value to pass rather than a plan that
+    silently will not fit.
+    """
+    try:
+        plan = json.loads(Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise PlanError(f"--continue-plan could not be read: {error}") from error
+    if "frame" not in plan or "shared_generation" not in plan:
+        raise PlanError(
+            f"--continue-plan {path} is not a plan manifest; pass the plan.json "
+            "written by an earlier run"
+        )
+    shared = plan["shared_generation"]
+    mismatched = [
+        f"{flag} {template.format(shared[key])}"
+        for key, flag, template in CONTINUED_SETTINGS
+        if key in shared and shared[key] != getattr(args, _option_name(flag))
+    ]
+    if mismatched:
+        raise PlanError(
+            f"Plan {shared.get('plan_id', path)} was built with "
+            + ", ".join(mismatched)
+            + ". Plates only butt together when every plate in the assembly shares "
+            "those, so pass the same values or drop --continue-plan."
+        )
+    if args.fit_scale:
+        raise PlanError(
+            "--fit-scale would change the scale away from the plan being continued; "
+            "the plates would no longer be the same map"
+        )
+    return plan
+
+
+def _option_name(flag: str) -> str:
+    return flag.lstrip("-").replace("-", "_")
+
+
+def plate_labels(text: str) -> list[str]:
+    """Parse ``A8,B8 B9`` into plate labels, in the order given."""
+    labels = [label for label in re.split(r"[,\s]+", text.strip()) if label]
+    if not labels:
+        raise argparse.ArgumentTypeError("--replace-plates needs at least one plate label")
+    return labels
+
+
+def wider_than(region, width_ft: float) -> bool:
+    """Whether any part of ``region`` is more than ``width_ft`` across.
+
+    Adjacent plate outlines agree exactly in the print frame, but a plan
+    stores them in WGS84 and that projection is not linear: where one plate
+    carries a vertex on a long seam and its neighbour does not, the two
+    render the same straight edge as curves a hundredth of a foot apart. Over
+    a few thousand feet of seam that is tens of square feet of difference and
+    no width at all, so area is the wrong measure of it and this is the right
+    one.
+    """
+    return not region.is_empty and not region.buffer(-width_ft / 2).is_empty
+
+
+# How far a reused outline's coordinate may be moved to put it back on the
+# lattice it was cut on. The error being undone is the projection's, and on
+# Manhattan's longest plate edges it reaches about 0.01 ft; anything further
+# off than this was never a cut position.
+LATTICE_SNAP_FT = 0.1
+
+
+def plates_target(plan: dict, labels: Sequence[str], *, frame: Frame,
+                  sliver_ft: float) -> Polygon:
+    """The WGS84 outline of named plates of a plan, as one polygon.
+
+    Built from the plan's own chunk outlines, so the new plan's boundary is
+    the boundary those plates were printed to rather than something
+    reconciled with it.
+
+    Two things have to be undone first. Unioning the plates leaves rings
+    along the joins; a ring no wider than one manufacturing cell cannot hold
+    a printed cell and is dropped, while holes the target really has are
+    kept. And the outline has been through WGS84, which does not keep a
+    straight line straight: an edge cut dead straight down one lattice
+    position comes back with its ends a hundredth of a foot apart. Left
+    alone, a new cut drawn to that same position runs straight while the
+    outline slants away from it, and the wedge between them is a sliver
+    thinner than the raster -- invisible on the plate, a spike once the
+    solid modelling gets hold of it. Coordinates within
+    ``LATTICE_SNAP_FT`` of the lattice the earlier plan cut on are put back
+    on it, which restores the straight line rather than approximating it.
+    """
+    available = {chunk["label"]: chunk for chunk in plan.get("chunks", [])}
+    missing = [label for label in labels if label not in available]
+    if missing:
+        raise PlanError(
+            f"--replace-plates names {', '.join(missing)}, which "
+            f"{'is' if len(missing) == 1 else 'are'} not in plan "
+            f"{plan['shared_generation'].get('plan_id')}. It has "
+            + ", ".join(sorted(available)) + "."
+        )
+    union = shapely.union_all([
+        shapely.make_valid(shape(available[label]["polygon_wgs84"])) for label in labels
+    ])
+    if union.geom_type != "Polygon":
+        raise PlanError(
+            "--replace-plates must name plates that together form one connected area; "
+            f"{', '.join(labels)} fall into {len(shapely.get_parts(union))} pieces. "
+            "Plan each piece as its own continued plan."
+        )
+    rings = list(union.interiors)
+    if rings:
+        holes = gpd.GeoSeries([Polygon(ring) for ring in rings], crs=4326).to_crs(CRS)
+        rings = [ring for ring, hole in zip(rings, holes) if wider_than(hole, sliver_ft)]
+    outline = Polygon(union.exterior, rings)
+    snapped = on_lattice(frame.to_frame(
+        gpd.GeoSeries([outline], crs=4326).to_crs(CRS).iloc[0]), plan, frame)
+    return gpd.GeoSeries([frame.to_world(snapped)], crs=CRS).to_crs(4326).iloc[0]
+
+
+def on_lattice(outline: Polygon, plan: dict, frame: Frame) -> Polygon:
+    """Put a reused outline's coordinates back on the lattice they were cut on.
+
+    A plan that does not record the lattice it used is left alone: guessing
+    one would move the outline rather than restore it.
+    """
+    snap_mm = plan.get("cut_settings", {}).get("snap_mm")
+    if not snap_mm:
+        return outline
+    step = round(snap_mm / frame.grid_step_mm) * frame.cell_ft
+    if step <= 0:
+        return outline
+
+    def fixed(ring):
+        points = np.asarray(ring.coords)
+        nearest = np.round(points / step) * step
+        return np.where(np.abs(points - nearest) <= LATTICE_SNAP_FT, nearest, points)
+
+    # Collapsing a wedge to nothing is the point of this, and it leaves the
+    # line it collapsed to behind as a separate part; the polygon is what we
+    # came for.
+    repaired = shapely.make_valid(Polygon(
+        fixed(outline.exterior), [fixed(hole) for hole in outline.interiors]
+    ))
+    faces = [part for part in shapely.get_parts(repaired)
+             if part.geom_type == "Polygon" and part.area > 0]
+    if not faces:
+        raise PlanError("Putting the reused outline back on its lattice left no area")
+    return max(faces, key=lambda part: part.area)
+
+
+def continued_contact(plan: dict, target: Polygon, *, sliver_ft: float) -> dict:
+    """Which plates of a continued plan this target replaces, and which it meets.
+
+    Every plate of that plan is either outside this target and stays printed,
+    or inside it and is replanned. A plate the target only partly covers is
+    neither: part of it would be reprinted against a boundary that is not its
+    own, so that is an error rather than a note. What remains is the boundary
+    the target shares with the plates it leaves alone, which is the join the
+    two plans will be assembled along.
+
+    Judged on how *wide* a difference is rather than how much area it covers,
+    because the differences that are not real are projection slivers running
+    the length of a seam: see :func:`wider_than`.
+    """
+    labels = [chunk["label"] for chunk in plan.get("chunks", [])]
+    if not labels:
+        return {"replaces": [], "meets": []}
+    projected = gpd.GeoSeries(
+        [shapely.make_valid(shape(chunk["polygon_wgs84"])) for chunk in plan["chunks"]]
+        + [target], crs=4326,
+    ).to_crs(CRS)
+    plates, area = list(projected)[:-1], list(projected)[-1]
+    replaced: list[str] = []
+    partial: list[str] = []
+    boundary: list[str] = []
+    for label, plate in zip(labels, plates):
+        if plate.is_empty or plate.area <= 0:
+            continue
+        covered, left_out = plate.intersection(area), plate.difference(area)
+        if not wider_than(left_out, sliver_ft):
+            replaced.append(label)
+        elif wider_than(covered, sliver_ft):
+            partial.append(f"{label} ({covered.area / plate.area:.1%} of it)")
+        elif plate.boundary.intersection(area.boundary).length > 0:
+            boundary.append(label)
+    if partial:
+        raise PlanError(
+            "This target covers part of, but not all of, plate(s) "
+            + ", ".join(partial)
+            + f" in plan {plan['shared_generation'].get('plan_id')}. Those plates "
+            "would have to be reprinted against a boundary that is not their own. "
+            "Build the target from whole plates of that plan."
+        )
+    return {"replaces": sorted(replaced), "meets": sorted(boundary)}
 
 
 def plan_partition(target_ft: Polygon, frame: Frame, chooser, options) -> dict:
@@ -249,29 +473,51 @@ def plan_partition(target_ft: Polygon, frame: Frame, chooser, options) -> dict:
     """
     limits = (frame.feet(options.envelope_mm[0]), frame.feet(options.envelope_mm[1]))
     snap_ft = round(options.cut_snap_mm / frame.grid_step_mm) * frame.cell_ft
-    result = geometry.partition(
-        target_ft,
-        limits_ft=limits,
-        deviation_ft=frame.feet(options.cut_deviation_mm),
-        chooser=chooser,
-        snap_ft=snap_ft,
-        min_run_ft=frame.feet(options.min_edge_mm),
-        min_jog_ft=frame.feet(options.min_jog_mm),
-        sample_step_ft=options.sample_step_ft,
-    )
     thresholds = dict(
         min_side_ft=frame.feet(geometry.MIN_PRINT_MM),
         min_area_ft2=limits[0] * limits[1] * options.min_chunk_fill,
         min_fill=options.min_chunk_fill,
     )
-    polygons, notes = geometry.compact_chunks(
-        result.polygons, limits_ft=limits,
-        # A contact narrower than a readable jog pinches whatever it joins.
-        min_contact_ft=frame.feet(options.min_jog_mm),
-    )
-    polygons, sliver_notes = geometry.merge_small_chunks(
-        polygons, limits_ft=limits, **thresholds
-    )
+
+    def attempt(slack_ft):
+        result = geometry.partition(
+            target_ft,
+            limits_ft=limits,
+            deviation_ft=frame.feet(options.cut_deviation_mm),
+            chooser=chooser,
+            snap_ft=snap_ft,
+            min_run_ft=frame.feet(options.min_edge_mm),
+            min_jog_ft=frame.feet(options.min_jog_mm),
+            min_side_ft=frame.feet(geometry.MIN_PRINT_MM),
+            slack_ft=slack_ft,
+            sample_step_ft=options.sample_step_ft,
+        )
+        polygons, notes = geometry.compact_chunks(
+            result.polygons, limits_ft=limits,
+            # A contact narrower than a readable jog pinches whatever it joins.
+            min_contact_ft=frame.feet(options.min_jog_mm),
+        )
+        polygons, sliver_notes = geometry.merge_small_chunks(
+            polygons, limits_ft=limits, **thresholds
+        )
+        return result, polygons, notes + sliver_notes
+
+    # Packing the pieces against the plate itself rather than against the
+    # plate less the wiggle budget is what lets a target narrower than two
+    # plates be planned in two columns instead of three, and it is worth
+    # several plates. What it risks is a cut resting on the limit a fraction
+    # of a step from one crossing it, leaving two plates sharing a stub of
+    # an edge. Only the finished plates show whether that happened -- the
+    # compaction pass absorbs most of them -- so they are what is judged,
+    # and the whole plan is redone the safe way if one survives.
+    result, polygons, notes = attempt(0.0)
+    shortest = geometry.shortest_contact(polygons)
+    if shortest < frame.feet(options.min_edge_mm) - 1e-6:
+        result, polygons, notes = attempt(None)
+        notes = notes + [
+            f"planned with the wiggle budget reserved up front: packing the plates "
+            f"tight left two of them sharing {frame.mm(shortest):.0f} mm of edge"
+        ]
     unmergeable = [
         reason for reason in
         (geometry.undersized_reason(polygon, **thresholds) for polygon in polygons)
@@ -285,7 +531,7 @@ def plan_partition(target_ft: Polygon, frame: Frame, chooser, options) -> dict:
             "or a target polygon without that spur."
         )
     return {"polygons": polygons, "cuts": result.cuts,
-            "merge_notes": notes + sliver_notes,
+            "merge_notes": notes,
             "limits_ft": limits, "snap_ft": snap_ft, "soft_warnings": unmergeable}
 
 
@@ -481,6 +727,36 @@ def measure_seams(surface, seams: list[dict], labels: list[str]) -> list[dict]:
     return seams
 
 
+def joint_summary(seams: list[dict], scale: float) -> dict:
+    """How well the finished plates can butt, independent of what they cut.
+
+    Two plates meet along the straight sides of their joint and bind on the
+    corners between them, so a plan of few long sides assembles tight where
+    one of the same seam length broken into staircases stands itself apart.
+    Corners per printed metre is the comparable figure: it does not move just
+    because a target is larger or a scale finer.
+    """
+    millimetres = FT * 1000 / scale
+    length_mm = sum(seam.get("length_ft", 0.0) for seam in seams) * millimetres
+    sides = sum(seam.get("sides", 0) for seam in seams)
+    corners = sum(seam.get("corners", 0) for seam in seams)
+    shortest_side = [seam["shortest_side_ft"] * millimetres
+                     for seam in seams if seam.get("shortest_side_ft")]
+    return {
+        "sides": sides,
+        "corners": corners,
+        "corners_per_metre": corners / (length_mm / 1000) if length_mm > 0 else None,
+        "shortest_side_mm": min(shortest_side, default=None),
+        "shortest_joint_mm": min(
+            (seam.get("length_ft", 0.0) * millimetres for seam in seams), default=None
+        ),
+        "worst_joint": max(
+            (seam for seam in seams if seam.get("corners")),
+            key=lambda seam: seam["corners"], default={},
+        ).get("between"),
+    }
+
+
 def summarise(chunks: list[dict], seams: list[dict], scale: float) -> dict:
     """Aggregate seam quality, weighted by the length that is actually printed."""
     total = sum(seam.get("length_ft", 0.0) for seam in seams)
@@ -507,6 +783,7 @@ def summarise(chunks: list[dict], seams: list[dict], scale: float) -> dict:
         "mean_above_ground_m": weighted("mean_above_ground_m"),
         "nodata_fraction": weighted("nodata_fraction"),
         "blocked_samples": sum(seam.get("blocked_samples", 0) for seam in seams),
+        "joints": joint_summary(seams, scale),
         "keep_out_crossings": crossings,
         "keep_out_length_ft": sum(item["length_ft"] for item in crossings),
         "longest_crossing_mm": max((item["length_mm"] for item in crossings), default=0.0),
@@ -532,9 +809,14 @@ def parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     result.add_argument(
-        "--bounding-polygon", required=True, type=parse_bounding_polygon,
+        "--bounding-polygon", type=parse_bounding_polygon,
         metavar="WKT|GEOJSON|PATH",
         help="Target WGS84 Polygon, supplied as WKT, GeoJSON, a file path, or @file",
+    )
+    result.add_argument(
+        "--replace-plates", type=plate_labels, metavar="LABELS",
+        help=("Instead of --bounding-polygon, target exactly these plates of "
+              "--continue-plan, so the new outline is the printed plates' own"),
     )
     result.add_argument(
         "--max-chunk-size-mm", type=parse_size, default=(235.0, 235.0), metavar="WIDTHxHEIGHT",
@@ -642,6 +924,11 @@ def parser() -> argparse.ArgumentParser:
                         help="Extra source context each generated chunk reads")
     result.add_argument("--prime-tower", choices=["auto", "on", "off"], default="auto",
                         help="Prime-tower mode passed to every chunk")
+    result.add_argument(
+        "--continue-plan", type=Path, metavar="PLAN_JSON",
+        help=("Plan whose lattice, vertical datum and relief factor this plan joins, "
+              "so its plates butt against ones already printed"),
+    )
     result.add_argument("--plan-id", help="Plan directory name; derived from the request when omitted")
     result.add_argument("--data-dir", type=Path, default=ROOT / "data", help="Shared input-data root")
     result.add_argument("--cache-dir", type=Path, help="Dataset cache root (defaults to <data-dir>/cache)")
@@ -708,8 +995,12 @@ def resolve(args) -> dict:
                 f"--max-chunk-size-mm side {value:g} is not a multiple of "
                 f"--grid-step-mm {args.grid_step_mm:g}"
             )
-    if not shapely.box(*NYC_BOUNDS).covers(args.bounding_polygon):
-        raise PlanError("The target polygon extends outside the supported NYC bounding box")
+    if (args.bounding_polygon is None) == (args.replace_plates is None):
+        raise PlanError("Pass exactly one of --bounding-polygon and --replace-plates")
+    if args.replace_plates and not args.continue_plan:
+        raise PlanError("--replace-plates names plates of a plan; pass --continue-plan too")
+    if args.bounding_polygon is not None:
+        check_inside_nyc(args.bounding_polygon)
     ceiling = geometry.max_scale_for_envelope(envelope, args.source_padding_m)
     if args.scale > ceiling:
         raise PlanError(
@@ -726,7 +1017,12 @@ def resolve(args) -> dict:
     }
 
 
-def search_scale(target, target_ft, bearing, surface, args, resolved, log):
+def check_inside_nyc(target: Polygon) -> None:
+    if not shapely.box(*NYC_BOUNDS).covers(target):
+        raise PlanError("The target polygon extends outside the supported NYC bounding box")
+
+
+def search_scale(target, target_ft, bearing, surface, args, resolved, log, anchor=None):
     """Return the scale actually used, its frame, and the finished partition.
 
     Without ``--fit-scale`` the requested scale is honoured and a plan over
@@ -737,7 +1033,7 @@ def search_scale(target, target_ft, bearing, surface, args, resolved, log):
     attempts: list[tuple[float, int]] = []
     for _ in range(30):
         options = Options(args, resolved, scale)
-        frame = build_frame(target, bearing, scale, args.grid_step_mm)
+        frame = build_frame(target, bearing, scale, args.grid_step_mm, anchor=anchor)
         partition = plan_partition(target_ft, frame, surface, options)
         count = len(partition["polygons"])
         if count <= args.max_chunks:
@@ -799,9 +1095,34 @@ def main() -> None:
 
 def run(args, log) -> dict:
     resolved = resolve(args)
+    continued = load_continued_plan(args.continue_plan, args) if args.continue_plan else None
+    anchor, contact = None, {}
+    if continued is not None:
+        anchor = Frame(
+            tuple(continued["frame"]["origin_ft"]),
+            tuple(continued["frame"]["x_axis"]), tuple(continued["frame"]["y_axis"]),
+            args.scale, args.grid_step_mm,
+        )
     target_wgs = args.bounding_polygon
+    if target_wgs is None:
+        target_wgs = plates_target(continued, args.replace_plates,
+                                   frame=anchor, sliver_ft=anchor.cell_ft)
+        check_inside_nyc(target_wgs)
     target = gpd.GeoSeries([target_wgs], crs=4326).to_crs(CRS).iloc[0]
-    orientation = choose_bearing(resolved["cache_dir"], target, args.orientation)
+    if continued is not None:
+        contact = continued_contact(continued, target_wgs, sliver_ft=anchor.cell_ft)
+        log.info("continuing_plan",
+                 plan=continued["shared_generation"].get("plan_id"),
+                 replaces=contact["replaces"], meets=contact["meets"])
+    # An inherited frame settles the rotation, so --orientation is neither
+    # read nor re-derived: reading the street grid of a sub-target would only
+    # produce an angle the plan is not allowed to use.
+    orientation = (
+        {"bearing_rad": math.radians(anchor.bearing_deg), "source": "continued_plan",
+         "coherence": None, "envelope_bearing_deg": math.degrees(envelope_bearing(target))}
+        if anchor is not None
+        else choose_bearing(resolved["cache_dir"], target, args.orientation)
+    )
     log.info("orientation_selected", **{
         key: (round(value, 4) if isinstance(value, float) else value)
         for key, value in orientation.items() if value is not None
@@ -810,7 +1131,7 @@ def run(args, log) -> dict:
     scale = args.scale
     options = Options(args, resolved, scale)
     bearing = orientation["bearing_rad"]
-    frame = build_frame(target, bearing, scale, args.grid_step_mm)
+    frame = build_frame(target, bearing, scale, args.grid_step_mm, anchor=anchor)
     target_ft = frame.to_frame(target)
 
     estimate = estimate_chunks(target_ft, frame, options)
@@ -845,29 +1166,40 @@ def run(args, log) -> dict:
     surface.style = args.cut_style
 
     scale, frame, partition = search_scale(
-        target, target_ft, bearing, surface, args, resolved, log
+        target, target_ft, bearing, surface, args, resolved, log, anchor=anchor
     )
     options = Options(args, resolved, scale)
 
     terrain = surface.terrain_statistics(
         target_ft, origin_margin_m=args.terrain_origin_margin_m
     )
+    # A continued plan's datum and relief factor are statistics of its own,
+    # larger target. Re-deriving them here would map the same real elevation
+    # to a different printed height on either side of the join, so they are
+    # inherited unless the request overrides them explicitly.
+    inherited = continued["shared_generation"] if continued is not None else {}
+    requested_factor = args.terrain_relief_factor
+    if requested_factor is None:
+        requested_factor = inherited.get("terrain_relief_factor")
     relief = choose_terrain_relief(
         np.asarray([terrain["relief_p5_m"], terrain["relief_p95_m"]]),
         scale_denominator=scale,
         vertical_exaggeration=args.vertical_exaggeration,
         layer_height_mm=args.layer_height,
-        requested_factor=args.terrain_relief_factor,
+        requested_factor=requested_factor,
     )
+    pinned_origin, pinned_source = args.terrain_origin_m, "--terrain-origin-m"
+    if pinned_origin is None and "terrain_origin_m" in inherited:
+        pinned_origin = inherited["terrain_origin_m"]
+        pinned_source = f"plan {inherited.get('plan_id')}"
     terrain_origin = (
-        args.terrain_origin_m if args.terrain_origin_m is not None
-        else terrain["terrain_origin_m"]
+        pinned_origin if pinned_origin is not None else terrain["terrain_origin_m"]
     )
-    if args.terrain_origin_m is not None and args.terrain_origin_m > terrain["observed_minimum_m"]:
+    if pinned_origin is not None and pinned_origin > terrain["observed_minimum_m"]:
         raise PlanError(
-            f"--terrain-origin-m {args.terrain_origin_m:g} is above the measured minimum "
-            f"ground elevation {terrain['observed_minimum_m']:.2f} m in this area; a chunk "
-            "containing that low point would fail its base-height check."
+            f"The datum {pinned_origin:g} m from {pinned_source} is above the measured "
+            f"minimum ground elevation {terrain['observed_minimum_m']:.2f} m in this area; "
+            "a chunk containing that low point would fail its base-height check."
         )
     log.info("shared_terrain", terrain_origin_m=round(terrain_origin, 3),
              relief_factor=round(relief.factor, 4), relief_span_m=round(terrain["relief_span_m"], 2))
@@ -883,7 +1215,8 @@ def run(args, log) -> dict:
     labels = geometry.grid_labels(frame, polygons, partition["limits_ft"])
     seams = measure_seams(
         surface,
-        geometry.shared_edges(polygons, area_tolerance_ft2=tolerance),
+        geometry.shared_edges(polygons, area_tolerance_ft2=tolerance,
+                              width_ft=frame.cell_ft),
         labels,
     )
 
@@ -940,6 +1273,11 @@ def run(args, log) -> dict:
         "target_wgs84": json.loads(shapely.to_geojson(target_wgs)),
         "target_area_km2": float(target.area * FT * FT / 1e6),
         "orientation": orientation,
+        "continues": None if continued is None else {
+            "plan_id": continued["shared_generation"].get("plan_id"),
+            "plan": str(args.continue_plan),
+            **contact,
+        },
         "frame": {
             "origin_ft": list(frame.origin_ft), "x_axis": list(frame.x_axis),
             "y_axis": list(frame.y_axis), "bearing_deg": frame.bearing_deg,
@@ -990,7 +1328,7 @@ def run(args, log) -> dict:
         log.info("previews_written", files=[path.name for path in written])
 
     report(directory, chunks, quality, shared, scale,
-           assembled_size_mm(frame, target_ft))
+           assembled_size_mm(frame, target_ft), plan["continues"])
     log.info("plan_written", directory=str(directory), chunks=len(chunks))
     return manifest
 
@@ -1009,7 +1347,7 @@ def assembled_size_mm(frame: Frame, target_ft: Polygon) -> tuple[float, float]:
 
 
 def report(directory: Path, chunks, quality: dict, shared: dict, scale: float,
-           assembled: tuple[float, float]) -> None:
+           assembled: tuple[float, float], continues: dict | None = None) -> None:
     """Human summary on stdout; plan.json holds the full record."""
     print(f"Plan {shared['plan_id']}: {len(chunks)} plates at 1:{scale:.0f}")
     print(f"  assembled      {assembled[0]:.0f} x {assembled[1]:.0f} mm "
@@ -1024,6 +1362,16 @@ def report(directory: Path, chunks, quality: dict, shared: dict, scale: float,
             print(f"  {label:<14} {value:6.2%}")
     if quality["mean_above_ground_m"] is not None:
         print(f"  mean height    {quality['mean_above_ground_m']:.1f} m above ground")
+    joints = quality["joints"]
+    if joints["corners_per_metre"] is not None:
+        print(f"  joint fit      {joints['sides']} sides, {joints['corners']} corners "
+              f"({joints['corners_per_metre']:.1f} per printed metre of seam)")
+        shortest = joints["shortest_side_mm"]
+        print("                 "
+              + (f"shortest side {shortest:.1f} mm, " if shortest is not None else "")
+              + f"shortest joint {joints['shortest_joint_mm']:.0f} mm"
+              + (f", most corners on {'/'.join(joints['worst_joint'])}"
+                 if joints["worst_joint"] else ""))
     if quality["keep_out_crossings"]:
         crossings = quality["keep_out_crossings"]
         print(f"  keep-outs      {len(crossings)} crossings, "
@@ -1033,6 +1381,10 @@ def report(directory: Path, chunks, quality: dict, shared: dict, scale: float,
                   f"on the {'/'.join(item['between'])} seam)")
     print(f"  shared datum   {shared['terrain_origin_m']:.2f} m NAVD88, "
           f"relief factor {shared['terrain_relief_factor']:.3f}")
+    if continues:
+        print(f"  continues      {continues['plan_id']}: replaces "
+              f"{', '.join(continues['replaces']) or 'nothing'}; butts against "
+              f"{', '.join(continues['meets']) or 'nothing'}")
     print(f"  wrote          {directory}")
     print(f"  run            {directory / 'commands.sh'}")
 

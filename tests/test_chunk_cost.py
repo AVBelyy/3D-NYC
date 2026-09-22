@@ -197,6 +197,88 @@ class StraightenTests(unittest.TestCase):
         self.assertEqual(len(surface.straighten(geometry.AXIS_Y, points, min_side_ft=0.0)), 2)
 
 
+class StraighteningTests(unittest.TestCase):
+    """`angled` must straighten what it can, not give up on the whole cut."""
+
+    def a_staircase_crossing_one_keep_out(self):
+        """A staircase over open ground whose last step crosses a keep-out."""
+        cost = np.ones((40, 40), dtype=np.float32)
+        surface = a_surface(cost, resolution_m=10.0 * geometry.FT, style="angled")
+        path = np.asarray([
+            [200.0, 300.0], [200.0, 250.0], [250.0, 250.0],
+            [250.0, 200.0], [300.0, 200.0], [300.0, 30.0], [340.0, 30.0],
+        ])
+        # Put the keep-out exactly on the cells of the final step, so the
+        # staircase itself is not clear and no shortcut can span it either.
+        last = shapely.LineString([
+            [path[-2][1], path[-2][0]], [path[-1][1], path[-1][0]],
+        ])
+        rows, columns = surface._seam_samples(last)
+        surface.keep_out[rows, columns] = True
+        return surface, path
+
+    def test_a_keep_out_on_one_step_does_not_abandon_the_whole_cut(self):
+        surface, path = self.a_staircase_crossing_one_keep_out()
+        blocked = [
+            not surface._segment_quality(
+                np.asarray([path[i][1], path[i][0]]),
+                np.asarray([path[i + 1][1], path[i + 1][0]]),
+            )[0]
+            for i in range(len(path) - 1)
+        ]
+        self.assertTrue(any(blocked), "the fixture must have a blocked step")
+        straightened = surface.straighten(geometry.AXIS_X, path, min_side_ft=20.0)
+        self.assertLess(len(straightened), len(path),
+                        "straightening gave up instead of shortening what it could")
+
+    def test_straightening_never_lengthens_a_path(self):
+        surface, path = self.a_staircase_crossing_one_keep_out()
+        straightened = surface.straighten(geometry.AXIS_X, path, min_side_ft=20.0)
+        self.assertLessEqual(len(straightened), len(path))
+        # The ends are the cut's own, and are never moved.
+        self.assertTrue(np.allclose(straightened[0], path[0]))
+        self.assertTrue(np.allclose(straightened[-1], path[-1]))
+
+
+class AlignThenStraightenTests(unittest.TestCase):
+    """Alignment has to happen before straightening, not after.
+
+    Pulling a level onto a crossing seam moves geometry the straight
+    segments were fitted to. Done afterwards it can reopen a corner that
+    straightening had already removed, and nothing looks at that corner
+    again.
+    """
+
+    def a_request(self, turns=()):
+        return geometry.CutRequest(
+            geometry.AXIS_X, 0.0, 400.0, 100.0, 40.0, 10.0,
+            snap_ft=10.0, min_run_ft=60.0, min_jog_ft=20.0,
+            crossing_turns=tuple(turns),
+        )
+
+    def a_stepped_surface(self):
+        """Two cheap lanes a couple of levels apart, with a keep-out on the
+        first so the search has to step across to the second."""
+        cost = np.full((60, 60), 80.0, dtype=np.float32)
+        cost[:, 10] = 1.0
+        cost[:, 12] = 1.0
+        keep_out = np.zeros((60, 60), dtype=bool)
+        keep_out[:28, 10] = True
+        return a_surface(cost, keep_out=keep_out,
+                         resolution_m=10.0 * geometry.FT, style="angled")
+
+    def test_the_chosen_path_has_nothing_left_to_straighten(self):
+        surface = self.a_stepped_surface()
+        for turns in ((), (90.0,), (110.0,), (90.0, 130.0)):
+            path = surface.choose(self.a_request(turns))
+            again = surface.straighten(
+                geometry.AXIS_X, path, min_side_ft=self.a_request().min_run_ft)
+            self.assertEqual(
+                len(again), len(path),
+                f"crossing turns {turns}: choose() returned a path with "
+                f"{len(path) - len(again)} corner(s) a shortcut could still remove")
+
+
 class CutContinuityTests(unittest.TestCase):
     """Two cuts down one street have to meet where they touch.
 

@@ -45,8 +45,18 @@ KEEP_OUT = "#E74C3C"
 # Seams do cross elevated roads square; only lengthwise runs are defects.
 CROSSING_SQUARE = "#F39C12"
 CROSSING_ALONG = "#D81B60"
-# Canvas size the annotation sizes below were chosen against.
-REFERENCE_PIXELS = 3000
+# The page is drawn at a fixed fraction of the printed map's own size, so a
+# plan of a smaller area gets a smaller page rather than a closer view of
+# less map, and two plans of one map open at the same scale and can be
+# compared by flipping between them.
+PAGE_MAGNIFICATION = 0.75
+# No plan opens smaller than this on its long side, however little it covers.
+MINIMUM_PAGE_INCHES = 6.0
+MILLIMETRES_PER_INCH = 25.4
+# Annotation sizes are physical, and the page scale is fixed, so they hold
+# the same size relative to a plate on every plan. This is the multiplier
+# they were chosen against.
+ANNOTATION_SCALE = 1.4
 DEFAULT_PIXELS = 6000
 
 
@@ -91,30 +101,68 @@ def _extent(surface: CostSurface) -> tuple[float, float, float, float]:
 
 
 def _figure(surface: CostSurface, image: np.ndarray, title: str, pixels: int):
-    """Canvas sized so the basemap is never squeezed below one pixel per cell.
+    """A page the size of the map it shows, at the resolution asked for.
 
-    Annotation sizes grow more slowly than the canvas, so a larger render shows
-    proportionally more map rather than just a bigger picture of the same thing.
+    Those are two different things and the canvas must not conflate them. A
+    vector page has an intrinsic size, and sizing it by a pixel budget gave
+    every plan the same 60-inch page whatever it covered: a two-metre island
+    and a half-metre corner of it opened at the same size, so the corner was
+    drawn three times closer and its labels read three times smaller. The
+    page therefore follows the ground the grid covers, and ``pixels`` sets
+    the density of the basemap inside it instead.
     """
     grid = surface.grid
-    longest = max(grid.width, grid.height)
-    dpi = 100.0
-    scale = max(pixels, longest) / longest
-    figure, axes = plt.subplots(
-        figsize=(grid.width * scale / dpi, grid.height * scale / dpi), dpi=dpi
+    printed_mm = (
+        grid.frame.mm(grid.width * grid.resolution_ft),
+        grid.frame.mm(grid.height * grid.resolution_ft),
     )
+    inches = tuple(
+        millimetres / MILLIMETRES_PER_INCH * PAGE_MAGNIFICATION for millimetres in printed_mm
+    )
+    longest = max(inches)
+    if longest < MINIMUM_PAGE_INCHES:
+        inches = tuple(side * MINIMUM_PAGE_INCHES / longest for side in inches)
+        longest = MINIMUM_PAGE_INCHES
+    # One pixel per cost cell is the floor the basemap must not go below;
+    # above it the request decides, and the page size is not involved.
+    across = max(pixels, grid.width, grid.height)
+    figure, axes = plt.subplots(figsize=inches, dpi=across / longest)
     axes.imshow(image, extent=_extent(surface), origin="upper", interpolation="nearest")
     axes.set_xlim(_extent(surface)[:2])
     axes.set_ylim(_extent(surface)[2:])
     axes.set_axis_off()
-    zoom = math.sqrt(longest * scale / REFERENCE_PIXELS)
+    zoom = ANNOTATION_SCALE
     axes.set_title(title, fontsize=9 * zoom, loc="left", pad=6 * zoom)
     return figure, axes, zoom
 
 
 def _outline(axes, polygon: Polygon, **style) -> None:
     for ring in [polygon.exterior, *polygon.interiors]:
-        axes.add_patch(PolygonPatch(np.asarray(ring.coords), closed=True, **style))
+        axes.add_patch(PolygonPatch(_drawable(np.asarray(ring.coords)), closed=True, **style))
+
+
+def _drawable(vertices: np.ndarray) -> np.ndarray:
+    """Drop apexes where a ring doubles straight back on itself.
+
+    A cut running down part of a region's own outline leaves a sliver of
+    that line in one piece: real boundary, but thinner than the
+    manufacturing raster, so nothing is printed either side of it. Drawn, it
+    reads as a seam striking out into open ground, which is the one thing it
+    is not. This is for the picture only -- the geometry keeps it, because
+    the ground it encloses has to belong to some plate.
+    """
+    kept = vertices[:-1]
+    while len(kept) >= 3:
+        incoming = kept - np.roll(kept, 1, axis=0)
+        outgoing = np.roll(kept, -1, axis=0) - kept
+        scale = np.hypot(*incoming.T) * np.hypot(*outgoing.T)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cosine = np.where(scale > 0, np.sum(incoming * outgoing, axis=1) / scale, 0.0)
+        spikes = cosine < -1 + 1e-6
+        if not spikes.any():
+            break
+        kept = np.delete(kept, int(np.argmax(spikes)), axis=0)
+    return np.vstack([kept, kept[:1]])
 
 
 def _save(figure, paths: Sequence[Path]) -> list[Path]:
