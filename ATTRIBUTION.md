@@ -26,6 +26,9 @@ and any dataset-specific terms:
 
 - [NYC 2014 3D Building Model](https://www.nyc.gov/content/oti/pages/tools)
 - [NYC Building Footprints](https://data.cityofnewyork.us/d/5zhs-2jue)
+- [NYC Borough Boundaries](https://data.cityofnewyork.us/d/gthc-hcne),
+  clipped to the shoreline. Tracked target polygons under `data/polygons/`
+  are clipped from it.
 - [NYC 2022 Planimetric Database](https://www.arcgis.com/home/item.html?id=4b01b78d9eda44819f6c757ec00d0669)
 - [NYC Parks Trails](https://data.cityofnewyork.us/d/vjbm-hsyr)
 - [NYC Parks Structures](https://data.cityofnewyork.us/d/n8q6-i44s)

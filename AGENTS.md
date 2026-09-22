@@ -55,6 +55,10 @@ there is not evidence that `.venv` accepts it.
 - `data/raw/`, `data/cache/`, and `output/` are ignored, potentially large, and
   may contain expensive user-generated state. Do not delete or rebuild them
   unless the task explicitly requires it.
+- `output/` is ignored; the chunk plans under `output/plans/` are the exception
+  and are tracked by force-add (`plan.json`, `commands.sh`, `chunks.geojson`,
+  `chunks/`). A plan records how a multi-plate map was cut and cannot be
+  reproduced from a rebuilt cache. Previews are not tracked.
 - Do not use ignored generated models, plans, logs, or local cache inventories
   as the sole evidence for a tracked documentation claim.
 - `output/` holds artifacts a script produces for a named job, plan, or model,
