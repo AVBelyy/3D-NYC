@@ -345,22 +345,35 @@ class CutContinuityTests(unittest.TestCase):
             self.level_chosen(surface, 300.0, continues_from=self.CORRIDOR), 300.0
         )
 
-    def test_a_jog_clear_of_the_anchor_stays_available(self):
-        # Only steps too small to read as deliberate are refused; this corridor
-        # is a full min_jog_ft away and remains reachable.
+    def test_a_step_clear_of_the_anchor_stays_available(self):
+        # Only steps too short to be a plate edge are refused; this corridor is
+        # a full min_run_ft away and remains reachable.
+        surface = self.a_corridor(cheap=23, dearer=None)
+        self.assertEqual(
+            self.level_chosen(surface, 230.0, continues_from=self.CORRIDOR), 230.0
+        )
+
+    def test_a_step_too_short_for_a_plate_edge_is_refused(self):
+        """The offset from an anchor is the edge two plates share there.
+
+        A step this size is a legal jog mid-cut and an illegal edge here, and
+        the finished plates are checked against the edge. A cheap corridor
+        that close is not worth the stub it would leave.
+        """
         surface = self.a_corridor(cheap=21, dearer=None)
         self.assertEqual(
-            self.level_chosen(surface, 196.0, continues_from=self.CORRIDOR), 210.0
+            self.level_chosen(surface, 196.0, continues_from=self.CORRIDOR),
+            self.CORRIDOR,
         )
 
     def test_a_blocked_anchor_is_left_rather_than_cut_through(self):
         # Meeting a cut must never be worth driving a seam through a keep-out.
         cost = np.full((40, 40), 50.0)
         cost[:, 18] = np.inf
-        cost[:, 22] = 1.0
+        cost[:, 23] = 1.0
         surface = a_surface(cost, resolution_m=10.0 * geometry.FT)
         self.assertEqual(
-            self.level_chosen(surface, 196.0, continues_from=self.CORRIDOR), 220.0
+            self.level_chosen(surface, 196.0, continues_from=self.CORRIDOR), 230.0
         )
 
     def test_an_axis_cut_meets_the_same_anchor(self):
@@ -522,6 +535,124 @@ class CrossingClassificationTests(unittest.TestCase):
             geometry=[surface.grid.frame.to_world(box(0.0, 0.0, 400.0, 40.0))], crs=2263,
         )
         self.assertEqual(surface.crossings(shapely.LineString([(200.0, 39.9), (200.0, 45.0)])), [])
+
+
+class CutPositionChoiceTests(unittest.TestCase):
+    """Which division a cut takes, once it has to look past the balanced one.
+
+    The shape reproduced here is the one Northern Central Park had. The
+    balanced division cannot come back clear, so the search divides the region
+    finer and finds two positions that both can: one over parkland, which is
+    expensive to cut but holds no keep-out at all, and one down an avenue.
+    Judged on whether it is blocked they are identical, and the park is
+    reached first; judged on the seam it drew, the avenue wins. Neither costs
+    a plate, because both pieces still print on one.
+    """
+
+    CELL_FT = 10.0
+    WIDTH, HEIGHT = 600, 200          # 6000 x 2000 ft
+    LIMIT_FT = 4000.0                 # two plates across, balanced at 3000 ft
+    DEVIATION_FT = 300.0
+    PARK_COST = 20.0
+    AVENUE_FT = (4000.0, 4060.0)      # the paved corridor, kerb to kerb
+    PARKLAND_FT = (1700.0, 2300.0)    # the band the finer division reaches first
+
+    def a_city(self, avenue_ft=4000.0, avenue_cells=6, blocked=False, cost=1.0,
+               wall=True):
+        """Parkland, a wall across the balanced band, and one paved corridor."""
+        surface = np.full((self.HEIGHT, self.WIDTH), self.PARK_COST)
+        keep_out = np.zeros(surface.shape, dtype=bool)
+        if wall:
+            # Every level the balanced division can reach is built on for part
+            # of its length, so no cut there comes back clear.
+            band = slice(int(2700 / self.CELL_FT), int(3300 / self.CELL_FT) + 1)
+            keep_out[:20, band] = True
+            surface[:20, band] = np.inf
+        if avenue_ft is not None:
+            start = int(avenue_ft / self.CELL_FT)
+            columns = slice(start, start + avenue_cells)
+            surface[:, columns] = cost
+            if blocked:
+                keep_out[:, columns] = True
+                surface[:, columns] = np.inf
+        return a_surface(
+            surface, keep_out=keep_out,
+            resolution_m=self.CELL_FT * geometry.FT, style="angled",
+        )
+
+    def a_cut(self, chooser, slack_ft=0.0):
+        """One cut, packed against the plate the way a plan first tries it."""
+        result = geometry.partition(
+            box(0.0, 0.0, self.WIDTH * self.CELL_FT, self.HEIGHT * self.CELL_FT),
+            limits_ft=(self.LIMIT_FT, self.HEIGHT * self.CELL_FT),
+            deviation_ft=self.DEVIATION_FT, chooser=chooser, slack_ft=slack_ft,
+            snap_ft=self.CELL_FT, min_run_ft=200.0, min_jog_ft=20.0,
+            sample_step_ft=self.CELL_FT,
+        )
+        self.assertEqual(len(result.cuts), 1)
+        return result
+
+    def position(self, result):
+        """Where the finished cut rests, as the plate boundary it made."""
+        return round(min(polygon.bounds[2] for polygon in result.polygons), 1)
+
+    def test_the_cheapest_clear_division_wins_not_the_first_one(self):
+        position = self.position(self.a_cut(self.a_city()))
+        self.assertGreaterEqual(position, self.AVENUE_FT[0])
+        self.assertLessEqual(position, self.AVENUE_FT[1])
+
+    def test_the_seam_it_takes_is_the_cheap_one(self):
+        cut = self.a_cut(self.a_city()).cuts[0]
+        self.assertLess(cut["mean_cost"], self.PARK_COST / 2)
+        self.assertEqual(cut["blocked_samples"], 0)
+
+    def test_the_parkland_division_is_clear_too_and_still_loses(self):
+        """Both reachable divisions are clear; only the seam tells them apart."""
+        surface = self.a_city(avenue_ft=None)
+        position = self.position(self.a_cut(surface))
+        self.assertGreaterEqual(position, self.PARKLAND_FT[0])
+        self.assertLessEqual(position, self.PARKLAND_FT[1])
+
+    def test_the_plate_count_does_not_pay_for_it(self):
+        self.assertEqual(len(self.a_cut(self.a_city()).polygons),
+                         len(self.a_cut(self.a_city(avenue_ft=None)).polygons))
+
+    def test_a_clear_balanced_division_is_not_looked_past(self):
+        """Buying a finer division stays the last resort it was.
+
+        A cut that comes back clear where it was put is kept, however much
+        cheaper ground lies a division away: moving the band that far unpicks
+        the packing for more plates than the seam is worth.
+        """
+        position = self.position(self.a_cut(self.a_city(wall=False)))
+        self.assertAlmostEqual(position, 3000.0, delta=self.DEVIATION_FT)
+
+    def test_a_cheap_corridor_that_is_a_keep_out_is_still_refused(self):
+        """The symmetric case: cost never buys its way through a keep-out."""
+        position = self.position(self.a_cut(self.a_city(blocked=True, cost=0.0)))
+        self.assertTrue(
+            position < self.AVENUE_FT[0] - self.CELL_FT
+            or position > self.AVENUE_FT[1] + self.CELL_FT,
+            f"the cut took a keep-out corridor at {position} ft",
+        )
+
+
+class SeamCostTests(unittest.TestCase):
+    def test_a_keep_out_is_priced_finitely_so_positions_stay_comparable(self):
+        cost = np.full((40, 40), 2.0)
+        cost[:, 20] = np.inf
+        keep_out = np.zeros(cost.shape, dtype=bool)
+        keep_out[:, 20] = True
+        surface = a_surface(cost, keep_out=keep_out, resolution_m=10.0 * geometry.FT)
+        seam = shapely.LineString([(205.0, 0.0), (205.0, 390.0)])
+        self.assertTrue(math.isfinite(surface.seam_cost(seam)))
+        self.assertGreater(surface.seam_cost(seam), BLOCKED_COST / 2)
+
+    def test_an_empty_seam_costs_nothing(self):
+        self.assertEqual(a_surface(np.ones((10, 10))).seam_cost(shapely.LineString()), 0.0)
+
+    def test_the_default_chooser_prices_every_seam_alike(self):
+        self.assertEqual(geometry.CutChooser().seam_cost(None), 0.0)
 
 
 class CacheSignatureTests(unittest.TestCase):

@@ -258,6 +258,26 @@ class CutChooser:
         """Count samples of a frame-local seam that fall in a hard keep-out."""
         return 0
 
+    def lengthwise(self, seam) -> int:
+        """Keep-out features a seam runs *along* rather than crosses square.
+
+        The quantity the finished plan is failed on, asked of a cut while
+        there is still a choice about it. Blocked samples do not answer it: a
+        seam that clips ten buildings square and one that runs the length of
+        one building can carry the same count, and only the second is the
+        defect.
+        """
+        return 0
+
+    def seam_cost(self, seam) -> float:
+        """Mean cost per sample of a finished seam, keep-outs priced finitely.
+
+        This is what one candidate position for a cut is worth against
+        another, so it has to be a number rather than the infinity a keep-out
+        carries inside the search.
+        """
+        return 0.0
+
     def describe(self, seam) -> dict:
         """Quality metrics for a finished seam. Empty when no evidence exists."""
         return {}
@@ -711,16 +731,18 @@ def _apply_cut(
     u_lo, u_hi = (miny, maxy) if axis == AXIS_X else (minx, maxx)
     length = v_hi - v_lo
     limit = limits_ft[axis]
-    planned = plan_cut_count(length, max(limit - 2 * slack_ft, 1e-9))
+    effective = max(limit - 2 * slack_ft, 1e-9)
+    planned = plan_cut_count(length, effective)
 
     turns = perpendicular_turns(placed, axis, u_lo, u_hi)
 
-    def attempt(pieces: int, index: int) -> tuple[CutRequest, np.ndarray, np.ndarray, int]:
+    def attempt(v_nominal: float) -> tuple:
+        """Search one straight position and score the split it produced."""
         # The requested budget is a ceiling, not a target. Handing a cut all
         # the unused plate width instead lets it roam hundreds of metres for
         # negligible savings, and roaming is what turns a straight seam into a
         # staircase. Spare width is only ever used to stay inside the envelope.
-        v_nominal = v_lo + length * index / pieces
+        #
         # A side of this cut that already fits the plate is finished, and
         # must still fit after the cut moves. A side that does not fit yet
         # will be cut again, so it constrains nothing here. Only one cut is
@@ -762,24 +784,48 @@ def _apply_cut(
             1 for piece in (*low, *high)
             if min(_extent(piece, AXIS_X), _extent(piece, AXIS_Y)) < min_side_ft
         )
-        return request, path_u, path_v, (slivers, chooser.blocked(trial)), line, low, high
+        # What this split costs in plates, counted on the pieces it made and
+        # against the plate the recursion will size them by: a division into
+        # three that leaves two printable pieces has bought nothing.
+        plates = sum(plan_cut_count(_extent(piece, axis), limit)
+                     for piece in (*low, *high))
+        score = (slivers, chooser.lengthwise(trial), chooser.blocked(trial),
+                 plates, chooser.seam_cost(trial))
+        return request, path_u, path_v, score, line, low, high
 
-    # A band with no clear street corridor would otherwise force the cut
-    # through a building. Try a different split position first, since that is
-    # free, then more pieces, which widens the allowance at the price of one
-    # extra plate — spent only where the geometry demands it.
-    best = None
-    for extra in range(EXTRA_PIECE_ATTEMPTS + 1):
-        pieces = planned + extra
+    def divisions(pieces: int) -> list[float]:
+        """The even divisions, balanced first: the positions a guillotine takes."""
         balanced = max(1, pieces // 2)
         offsets = sorted(range(1, pieces), key=lambda index: (abs(index - balanced), index))
-        for index in offsets[:SPLIT_POSITION_ATTEMPTS]:
-            candidate = attempt(pieces, index)
+        return [v_lo + length * index / pieces for index in offsets[:SPLIT_POSITION_ATTEMPTS]]
+
+    # Which street a seam runs down is settled here rather than inside the cut.
+    # The search may only wander the wiggle budget, so a corridor further off
+    # than that is not something it can reach, however bad its own band is;
+    # what reaches it is dividing the region differently, which moves the
+    # nominal the band is hung on.
+    #
+    # Every division at a piece count is searched and the one that produced
+    # the best seam is kept. The exit is what changed: it used to come as soon
+    # as a division was merely clear, which is no test at all in a park --
+    # parkland holds no keep-out, so a seam through the Central Park reservoir
+    # and the North Woods scored exactly as well as the avenue one division
+    # away and was never looked past. A clear cut now has to beat the others
+    # on the seam it drew, not just arrive first.
+    #
+    # Buying a piece is still the last resort it was, and still only for a cut
+    # that cannot come back clear: a finer division moves the band a long way,
+    # and taking one for a cheaper seam rather than a clear one unpicks the
+    # packing far more plates' worth than it saves. The plates a division
+    # commits to are counted anyway, ranked ahead of what its seam costs, so
+    # that path cannot buy one it does not need either.
+    best = None
+    for extra in range(EXTRA_PIECE_ATTEMPTS + 1):
+        for position in divisions(planned + extra):
+            candidate = attempt(float(position))
             if best is None or candidate[3] < best[3]:
                 best = candidate
-            if candidate[3] == (0, 0):
-                break
-        if best[3] == (0, 0):
+        if best[3][:3] == (0, 0, 0):
             break
     request, path_u, path_v, _, line, low, high = best
     v_nominal = request.v_nominal

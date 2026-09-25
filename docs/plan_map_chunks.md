@@ -123,10 +123,82 @@ crossing seam's straight is put on it, in both cases only when the move stays
 inside the deviation allowance, keeps every jog full size, and crosses no
 more keep-out than staying put did.
 
-Where a band offers no clear corridor at all, the planner first tries a
-different split position, then splits the region one piece further to widen the
-search. An extra plate is spent only where the geometry demands it, rather than
-cutting through a building.
+They have to agree with the cuts they *continue* as well, and by a different
+bound. A guillotine hands one avenue to two sibling regions, and the second
+cut either picks the first one's line up exactly or steps off it. That step
+is not a jog: a jog puts a short side on one seam, while this lands on the
+seam the two cuts run into and is the whole of the edge two plates share
+there. The bound is therefore `--min-edge-mm`, the shortest edge a plate may
+have, not `--min-jog-mm` -- the same quantity the finished plates are checked
+against, so the check cannot fail on a step the search thought legal. Held to
+the smaller bound it did: two Manhattan plates met on 7 mm of edge, which
+condemned the whole plan to be replanned with the wiggle budget reserved and
+cost four plates.
+
+### Choosing which street a cut runs down
+
+A cut may wander `--cut-deviation-mm` either side of the straight position it
+is hung on, and no further. What street it ends up in is therefore settled
+before the search starts, by where that straight position is -- and a corridor
+further off than the budget is not something the search can reach, however bad
+its own band is.
+
+Those positions are the even divisions of the region: in halves, then in
+thirds, quarters and fifths, each tried in turn until one yields a clear cut.
+The rule that used to pick between them was whether a cut came back blocked,
+and in parkland that is no test at all. Nothing in a park is a keep-out, so a
+seam through the North Woods and across the reservoir came back perfectly
+clear, was accepted at the first division tried, and was never looked past --
+while an avenue one division away would have given a straight, fully paved
+seam. That is what put the `manhattan_2m_240` A5/B5 joint through Northern
+Central Park: 6,470 ft of it, a quarter of it on pavement, a fifth of it over
+open water.
+
+A division is now kept on the seam it produced. The order between candidates
+is: pieces too small to print, then keep-out features the seam runs *along*,
+then keep-out samples it crosses, then the plates the split commits to, then
+what the seam costs. Judging a cut on what it runs along as well as what it
+crosses matters because those are different defects -- a seam that clips ten
+buildings square and one that runs the length of a single building carry the
+same blocked count, and only the second is the defect the finished plan is
+failed on.
+
+Buying a finer division is still the last resort it always was, and still only
+for a cut that cannot come back clear where it was put: moving a band that far
+unpicks the packing for more plates than a cheaper seam is worth. Where it
+does happen, the plates each division commits to are counted on the pieces it
+actually made -- a division into thirds that leaves two printable pieces has
+bought nothing -- so the search cannot spend a plate to buy a seam.
+
+Over the whole island this is worth, against one cache snapshot:
+
+| | before | after |
+| --- | --- | --- |
+| plates | 22 | 21 |
+| seam | 51.3 km | 50.7 km |
+| on paved surface | 79.3 % | 84.1 % |
+| corners per printed metre | 14.0 | 13.7 |
+| joints under 60 % paved | 10, over 11.7 km | 3, over 3.4 km |
+
+Seam inside a building and inside a structure are unchanged, at 0.14 % and
+0.24 %, and the longest keep-out crossing stays 3.7 mm.
+
+Note what this does *not* do: it does not let a cut go looking for a better
+street when the position it was given already works. Letting every cut take
+the best position the plates allow was tried and measured, and it is worse: it
+gives individually cheaper seams and a worse plan, because a lopsided cut
+leaves pieces the compaction pass cannot combine and cuts that come to rest a
+few millimetres from the ones crossing them. On Manhattan it cost two plates
+and 3 km of extra seam.
+
+Nor does it score a corridor for being wide. Prefer a wide street by all means
+-- the planner does, because a wide street is where a long, straight, low,
+clear seam exists -- but prefer it through the seam the cut actually drew.
+Pricing a corridor over the strip it sits in, which is the obvious way to say
+"wide", buries exactly the corridors a dense grid depends on: a side street is
+a clear lane between two rows of buildings, so a strip one lattice step across
+is mostly keep-out and the lane ranks below open ground no cut should go near.
+That experiment quadrupled the seam inside a keep-out.
 
 ## Reading the report
 
