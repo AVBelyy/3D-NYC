@@ -1,13 +1,15 @@
 """The puzzle cut's geometry contract, independent of any map or cache.
 
-Three things here are worth more than the rest.  ``--pieces`` is exact, so a
+Four things here are worth more than the rest.  ``--pieces`` is exact, so a
 count that cannot be divided into acceptable pieces has to fail loudly rather
 than quietly produce ribbons.  The undercut is a physical fit allowance -- the
 interference two printed pieces must flex past -- so the finished curve has to
 have that interference and no more, whatever the control points behind it are
-doing.  And because both halves of a joint are eroded by half the clearance,
-the lock that survives is ``undercut - clearance``: an undercut sized on its own
-leaves a puzzle that falls apart in the hand.
+doing.  Because both halves of a joint are eroded by half the clearance, the
+lock that survives is ``undercut - clearance``: an undercut sized on its own
+leaves a puzzle that falls apart in the hand.  And that clearance is a fit, not
+the plate gap: interlocking pieces never share a plate, and a joint cut to the
+plate gap rattles.
 """
 
 import json
@@ -40,15 +42,16 @@ P2S = PrintProfile(0.4, 0.24, 0.2, 0.34, 2, 0.45, 0.42, (256.0, 256.0), 3.0, 0.1
 
 def square_cut(pieces=25, size=235.0, clearance=P2S.clearance_mm, seed=0,
                tab=generate_puzzle.DEFAULT_TAB_SIZE, neck=generate_puzzle.DEFAULT_TAB_NECK,
-               undercut=None, footprint=None):
+               undercut=None, footprint=None, samples=generate_puzzle.MINIMUM_BEZIER_SAMPLES):
     outline = box(0.0, 0.0, size, size) if footprint is None else footprint
     layout = choose_layout(outline, size, size, pieces, 1.6, 0.35)
+    neck_mm = neck * min(layout.grid.cell_width, layout.grid.cell_height)
     if undercut is None:
-        undercut = derive_undercut(
-            neck * min(layout.grid.cell_width, layout.grid.cell_height),
-            clearance, P2S.interference_mm)
+        undercut = derive_undercut(neck_mm, clearance, P2S.interference_mm)
+    if samples is None:                 # as finely as the run itself samples the knob
+        samples = P2S.knob_samples(neck_mm)
     curves = cut_curves(layout.grid, np.random.default_rng(seed), size=tab, neck=neck,
-                        undercut=undercut)
+                        undercut=undercut, samples=samples)
     return layout, curves, floor_polygons(layout, curves, clearance, outline)
 
 
@@ -199,22 +202,23 @@ class KnobTests(unittest.TestCase):
         """Both halves of a joint lose half the gap, so the same lock on a
         smaller neck prints a fatter head. That is reported, not prevented --
         until it is genuinely a lump on a stalk."""
-        clearance = P2S.clearance_mm
-        ratios = [printed_head_ratio(neck, clearance,
-                                     derive_undercut(neck, clearance, P2S.interference_mm))
-                  for neck in (11.28, 7.05, 5.64)]
-        self.assertEqual(ratios, sorted(ratios), "a smaller neck must print a fatter head")
-        self.assertLess(ratios[0], generate_puzzle.TAB_TARGET_HEAD_RATIO)   # 25 pieces: slim
-        self.assertLess(ratios[-1], generate_puzzle.TAB_MAX_HEAD_RATIO)     # 100 pieces: allowed
-        # ... but a neck small enough makes a head the run should refuse.
-        tiny = 4.03
-        self.assertGreater(
-            printed_head_ratio(tiny, clearance,
-                               derive_undercut(tiny, clearance, P2S.interference_mm)),
-            generate_puzzle.TAB_MAX_HEAD_RATIO)
+        def ratio(neck, clearance):
+            return printed_head_ratio(neck, clearance,
+                                      derive_undercut(neck, clearance, P2S.interference_mm))
 
-    def test_the_gap_clears_a_bead_laid_on_a_sub_bead_feature(self):
-        """Why the gap is two line widths and not one nozzle.
+        necks = (11.28, 7.05, 5.64, 4.03)             # 25, 64, 100 and 196 pieces
+        ratios = [ratio(neck, P2S.clearance_mm) for neck in necks]
+        self.assertEqual(ratios, sorted(ratios), "a smaller neck must print a fatter head")
+        # At the fit even 196 pieces keep a knob slimmer than a cardboard one.
+        self.assertLess(ratios[-1], generate_puzzle.TAB_TARGET_HEAD_RATIO)
+        # Widened to the plate gap, which is what the first two-plate cut did,
+        # 100 pieces already print chunky and 196 print a lump the run refuses.
+        self.assertGreater(ratio(5.64, P2S.plate_gap_mm), generate_puzzle.TAB_TARGET_HEAD_RATIO)
+        self.assertLess(ratio(5.64, P2S.plate_gap_mm), generate_puzzle.TAB_MAX_HEAD_RATIO)
+        self.assertGreater(ratio(4.03, P2S.plate_gap_mm), generate_puzzle.TAB_MAX_HEAD_RATIO)
+
+    def test_the_plate_gap_clears_a_bead_laid_on_a_sub_bead_feature(self):
+        """Why the plate gap is two line widths and not one nozzle.
 
         A city at this scale carries thousands of details finer than one bead --
         the uncut example model has 133 sub-bead islands at the layer that first
@@ -225,9 +229,9 @@ class KnobTests(unittest.TestCase):
 
         Measured against the real slicer on a hundred-piece cut: 0.40 mm and
         0.50 mm are refused, 0.84 mm slices clean."""
-        self.assertAlmostEqual(P2S.clearance_mm, 2 * P2S.outer_wall_line_width_mm)
-        self.assertGreater(P2S.clearance_mm, P2S.nozzle_mm)
-        self.assertGreaterEqual(P2S.clearance_mm, 2 * 0.42 - 1e-9)
+        self.assertAlmostEqual(P2S.plate_gap_mm, 2 * P2S.outer_wall_line_width_mm)
+        self.assertGreater(P2S.plate_gap_mm, P2S.nozzle_mm)
+        self.assertGreaterEqual(P2S.plate_gap_mm, 2 * 0.42 - 1e-9)
 
     def test_a_knob_too_big_for_its_edge_is_refused(self):
         with self.assertRaises(PuzzleError):
@@ -253,12 +257,13 @@ class ProfileTests(unittest.TestCase):
         self.assertTrue(profile.complete())
         self.assertEqual(profile.plate_mm, (256.0, 256.0))
         self.assertAlmostEqual(profile.brim_margin_mm, 3.1)
-        self.assertAlmostEqual(profile.clearance_mm, 0.84)      # two outer wall lines
+        self.assertAlmostEqual(profile.plate_gap_mm, 0.84)      # two outer wall lines
+        self.assertAlmostEqual(profile.clearance_mm, 0.2)       # half a nozzle: a fit
         self.assertAlmostEqual(profile.interference_mm, 0.2)    # half a nozzle
         # Both halves of a joint are eroded by half the gap, so the undercut has
         # to cover the whole gap before any lock is left.
         self.assertAlmostEqual(
-            derive_undercut(11.28, profile.clearance_mm, profile.interference_mm), 0.84 + 0.2)
+            derive_undercut(11.28, profile.clearance_mm, profile.interference_mm), 0.2 + 0.2)
         self.assertAlmostEqual(profile.narrowest_knob_neck_mm, 1.8)   # 2 * 2 walls * 0.45
         self.assertAlmostEqual(profile.crumb_mm3, 0.4 ** 2 * 0.24)
         self.assertAlmostEqual(profile.vertical_clearance_mm, 0.48)   # two layers
@@ -295,7 +300,7 @@ class ProfileTests(unittest.TestCase):
         the first layer of the print welds the whole puzzle into a tile."""
         profile = print_profile(self.SETTINGS)
         # 0.84 - 2*0.1 = 0.64 mm free, and a 0.42 mm line fits, so it is dropped.
-        self.assertTrue(profile.brim_bridges_gap(profile.clearance_mm))
+        self.assertTrue(profile.brim_bridges_gap(profile.plate_gap_mm))
         # 0.4 - 2*0.1 = 0.2 mm free, and it does not.
         self.assertFalse(profile.brim_bridges_gap(0.4))
 
@@ -405,23 +410,41 @@ class PlateTests(unittest.TestCase):
                 if other is not None and other != piece:
                     self.assertNotEqual(plates[piece], plates[other])
 
-    def test_the_step_parts_two_diagonal_corners_by_the_clearance(self):
+    def test_the_step_parts_two_diagonal_corners_by_the_plate_gap(self):
         """Neighbours are on other plates, so the closest pair left on a plate
         is two pieces meeting at a corner. Stepping every piece out by one
         `spacing` per cell parts that corner along the diagonal, so the step
-        only has to be the clearance over root two."""
+        only has to be the plate gap over root two."""
         layout = choose_layout(self.square(), 235.0, 235.0, 100, 1.6, 0.35)
-        clearance = P2S.clearance_mm
-        spacing = clearance / math.sqrt(2)
+        gap = P2S.plate_gap_mm
+        spacing = gap / math.sqrt(2)
         offsets = plate_offsets(layout, spacing)
         owner = layout.owner()
         a, b = owner[(4, 4)], owner[(5, 5)]
         (ax, ay), (bx, by) = offsets[a], offsets[b]
-        self.assertAlmostEqual(math.hypot(bx - ax, by - ay), clearance, places=9)
+        self.assertAlmostEqual(math.hypot(bx - ax, by - ay), gap, places=9)
+
+    def test_the_fit_never_reaches_the_plate(self):
+        """The symmetric case of cutting the joint to the fit rather than to the
+        plate gap: a knob cut that close to its notch must not bring two pieces
+        that *share* a plate any closer than the plate gap. Measured on the
+        plan-view footprint each piece really prints -- its own surface and the
+        knobs it reaches under its neighbours -- at the plate position it is
+        set down at."""
+        layout, _, floors = square_cut(100, samples=None)
+        seats = seat_polygons(layout, (0.0, 0.0), 0.0)
+        offsets = plate_offsets(layout, P2S.plate_gap_mm / math.sqrt(2))
+        placed = [shapely.affinity.translate(floor.union(seat), *offset)
+                  for floor, seat, offset in zip(floors, seats, offsets)]
+        plates = plate_colouring(layout)
+        closest = min(placed[a].distance(placed[b])
+                      for a in range(layout.pieces) for b in range(a + 1, layout.pieces)
+                      if plates[a] == plates[b])
+        self.assertAlmostEqual(closest, P2S.plate_gap_mm, delta=1e-6)
 
     def test_the_plate_grows_by_one_step_a_seam_and_the_map_does_not(self):
         layout = choose_layout(self.square(), 235.0, 235.0, 100, 1.6, 0.35)
-        spacing = P2S.clearance_mm / math.sqrt(2)
+        spacing = P2S.plate_gap_mm / math.sqrt(2)
         width, height = plate_extent(layout, 235.0, 235.0, spacing)
         self.assertAlmostEqual(width, 235.0 + 9 * spacing)
         self.assertAlmostEqual(height, 235.0 + 9 * spacing)
@@ -430,7 +453,7 @@ class PlateTests(unittest.TestCase):
         seats = seat_polygons(layout, (0.0, 0.0), 0.0)
         self.assertAlmostEqual(shapely.union_all(seats).area, 235.0 * 235.0, places=6)
         # And at a kerf they are not: that is the map the old cut deleted.
-        eaten = seat_polygons(layout, (0.0, 0.0), P2S.clearance_mm)
+        eaten = seat_polygons(layout, (0.0, 0.0), P2S.plate_gap_mm)
         self.assertLess(shapely.union_all(eaten).area, 235.0 * 235.0 - 3000.0)
 
     def test_placing_a_piece_moves_it_and_nothing_else(self):
@@ -521,25 +544,25 @@ class CutTests(unittest.TestCase):
     def test_a_joint_locks_only_when_the_undercut_outreaches_the_gap(self):
         """The reported trap: both halves of a joint are eroded by half the
         clearance, so an undercut sized on its own -- half a nozzle, say --
-        vanishes entirely once a gap wide enough to separate the pieces is
-        subtracted, and the puzzle falls apart in the hand.
+        vanishes entirely once the gap is subtracted, and the puzzle falls
+        apart in the hand. That holds at the fit and at the plate gap alike.
 
         Measured the way the hand does it: pull one piece straight away from its
         neighbour and see whether the knob's head is caught on the way out."""
-        clearance = P2S.clearance_mm
+        for clearance in (P2S.clearance_mm, P2S.plate_gap_mm):
+            def lock_area(undercut):
+                _, _, polygons = square_cut(4, size=200.0, clearance=clearance,
+                                            undercut=undercut, seed=3)
+                pulls = np.linspace(0.05, 6.0, 60)
+                return max(
+                    max(shapely.affinity.translate(polygons[0], -d * dx, -d * dy)
+                        .intersection(polygons[n]).area for d in pulls)
+                    for n, (dx, dy) in ((1, (1, 0)), (2, (0, 1))))
 
-        def lock_area(undercut):
-            _, _, polygons = square_cut(4, size=200.0, clearance=clearance,
-                                        undercut=undercut, seed=3)
-            pulls = np.linspace(0.05, 6.0, 60)
-            return max(
-                max(shapely.affinity.translate(polygons[0], -d * dx, -d * dy)
-                    .intersection(polygons[n]).area for d in pulls)
-                for n, (dx, dy) in ((1, (1, 0)), (2, (0, 1))))
-
-        self.assertGreater(lock_area(clearance + P2S.interference_mm), 0.05)
-        self.assertEqual(lock_area(clearance), 0.0)            # exactly the boundary
-        self.assertEqual(lock_area(clearance / 2), 0.0)        # the trap
+            with self.subTest(clearance=clearance):
+                self.assertGreater(lock_area(clearance + P2S.interference_mm), 0.05)
+                self.assertEqual(lock_area(clearance), 0.0)        # exactly the boundary
+                self.assertEqual(lock_area(clearance / 2), 0.0)    # the trap
 
     def test_a_pieces_own_cell_separates_its_seat_from_its_knobs(self):
         """The floor is extruded to two heights -- full under the piece's own
@@ -567,6 +590,65 @@ class CutTests(unittest.TestCase):
         _, _, other = square_cut(16, seed=8)
         self.assertTrue(all(a.equals(b) for a, b in zip(first, same)))
         self.assertFalse(all(a.equals(b) for a, b in zip(first, other)))
+
+
+def travel(moving, fixed, direction, limit=3.0, step=0.01):
+    """How far ``moving`` goes along ``direction`` before it overlaps ``fixed``."""
+    dx, dy = direction
+    for distance in np.arange(0.0, limit, step):
+        moved = shapely.affinity.translate(moving, distance * dx, distance * dy)
+        if moved.intersection(fixed).area > 1e-6:
+            return float(distance)
+    return math.inf
+
+
+class FitTests(unittest.TestCase):
+    """A knob has to sit in its notch, not rattle in it.
+
+    The reported print: a hundred-piece cut of the tracked example came off the
+    printer with every joint loose. Interlocking pieces are printed on different
+    plates, yet each joint had been cut to the plate gap -- the room two pieces
+    printed side by side need -- so a piece slid 0.84 mm along its seam and
+    pulled 1.2 mm away from its neighbour before a knob caught. The joint
+    answers to the hand and the plate gap to the slicer, and they are not the
+    same number.
+    """
+
+    @staticmethod
+    def play(clearance):
+        """The worst slide along a seam and the worst pull away from it, over
+        one row of a hundred-piece cut of the reported 235 mm map."""
+        layout, _, polygons = square_cut(100, clearance=clearance, samples=None)
+        cols = layout.grid.cols
+        slides, pulls = [], []
+        for col in range(cols - 1):
+            left, right = polygons[4 * cols + col], polygons[4 * cols + col + 1]
+            slides.append(min(travel(left, right, (0, 1)), travel(left, right, (0, -1))))
+            pulls.append(travel(left, right, (-1, 0)))
+        return max(slides), max(pulls)
+
+    def test_a_joint_is_cut_to_the_fit_and_not_to_the_plate_gap(self):
+        layout, _, polygons = square_cut(100, samples=None)
+        grid = layout.grid
+        for row in range(grid.rows):
+            for col in range(grid.cols):
+                here = polygons[row * grid.cols + col]
+                for other_row, other_col in ((row, col + 1), (row + 1, col)):
+                    if other_row < grid.rows and other_col < grid.cols:
+                        other = polygons[other_row * grid.cols + other_col]
+                        self.assertAlmostEqual(here.distance(other), P2S.clearance_mm,
+                                               delta=0.01)
+        slide, pull = self.play(P2S.clearance_mm)
+        self.assertLessEqual(slide, P2S.clearance_mm + 0.02)
+        # The knob still catches, and it catches before a piece has pulled as
+        # far as the plate gap -- less than the old joint let it slide sideways.
+        self.assertLess(pull, P2S.plate_gap_mm)
+
+    def test_a_joint_cut_to_the_plate_gap_is_measured_as_the_rattle_it_was(self):
+        """The symmetric case: the same measurement has to see the defect."""
+        slide, pull = self.play(P2S.plate_gap_mm)
+        self.assertGreater(slide, P2S.plate_gap_mm - 0.02)
+        self.assertGreater(pull, 1.0)
 
 
 if __name__ == "__main__":

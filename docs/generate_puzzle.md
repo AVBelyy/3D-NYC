@@ -5,7 +5,9 @@
 N interlocking pieces, split across two plates so that **no piece is printed
 beside one it interlocks with**. That is what lets the cut take nothing at all
 out of the map: the surface is divided on a plane of no width, and the two
-plates reassemble into the original chunk to the micron.
+plates reassemble into the original chunk to the micron. It is also what lets
+a knob sit closely in its notch, instead of across the wider gap two pieces
+printed side by side need.
 
 It is a 3MF-to-3MF transform. It reads no source caches, needs no Bambu Studio
 profiles and creates no job directory: the input project already carries the
@@ -20,17 +22,18 @@ script defends is derived from that rather than assumed.
 
 ```text
 Profile: 0.4 mm nozzle, 0.24 mm layers, 2 walls of 0.45 mm, 256 x 256 mm plate
+Brim: disabled because a brim loop fits the 0.64 mm left between two pieces
+      after the 0.1 mm object gap, so it would weld the first layer of the plate together.
 Model 235.000 x 235.000 mm, 4 filaments, 4,434,194 triangles
 Outline: 55,225 mm2, 100.0% of its bounding box, 1 part(s)
-Brim: disabled because a brim loop fits the 0.64 mm left between two pieces
-      after the 0.1 mm object gap, so it would weld the first layer together.
-Grid 5 x 5 = 25 pieces, 47.00 x 47.00 mm cells (1.00:1), smallest piece 1,787 mm2 (81% of a cell)
-Joint: 1.64 mm floor (7 layers), 11.28 mm narrowest knob neck, 0.84 mm gap,
-       1.04 mm undercut leaving 0.2 mm of lock
+Grid 5 x 5 = 25 pieces, 47.00 x 47.00 mm cells (1.00:1), smallest piece 1,865 mm2 (84% of a cell)
+Joint: 1.64 mm floor (7 layers), 11.28 mm narrowest knob neck, 0.2 mm gap,
+       0.4 mm undercut leaving 0.2 mm of lock
 Knob: 1.16 mm thick (5 layers), recessed 0.48 mm under its neighbour's surface,
-      head 1.20 x its own neck
+      head 1.07 x its own neck
 ...
-Validation passed: 25 pieces, closest neighbours 0.480 mm apart
+Plate 1 validation passed: 13 pieces, closest 0.840 mm apart
+Plate 2 validation passed: 12 pieces, closest 0.840 mm apart
 ```
 
 That writes `output/puzzles/34_w_76_235_25/`:
@@ -88,13 +91,14 @@ profile, and the cut reads its bounds back out of it:
 
 | Bound | Derived from | Why that quantity |
 | --- | --- | --- |
-| Gap between pieces | two outer-wall line widths | Not the width the slicer can resolve — that is one nozzle — but the width the *toolpaths* need. See below. |
-| Plate step | `clearance / √2` | Neighbours are on other plates, so the closest same-plate pair meets at a diagonal corner; a step of this size parts that corner by exactly the clearance. |
+| Plate gap | two outer-wall line widths | The least distance between two pieces printed side by side. Not the width the slicer can resolve — that is one nozzle — but the width the *toolpaths* need. See below. |
+| Joint clearance | half a nozzle | The gap between a knob and its notch. They are never on one plate, so it is a fit for the hand, not a bound for the slicer. See below. |
+| Plate step | `plate gap / √2` | Neighbours are on other plates, so the closest same-plate pair meets at a diagonal corner; a step of this size parts that corner by exactly the plate gap. |
 | Surface kerf | zero | Nothing of the map is thrown away; the gap is found on the plate instead. |
-| Knob undercut | the gap plus half a nozzle | The gap is subtracted from the joint before any of it is left to lock with, so the undercut has to cover it first and then add the lock. See below. |
+| Knob undercut | the joint clearance plus half a nozzle | The clearance is subtracted from the joint before any of it is left to lock with, so the undercut has to cover it first and then add the lock. See below. |
 | Narrowest printable section | `2 x min_bead_width` | Below it the slicer lays no extrusion at all, and the layer becomes an empty layer *of that piece*. See below. |
 | Knob recess | two layer heights | A knob lies *under* its neighbour's surface tier. Without a gap in Z the printer lays that surface straight onto the knob. Two layers: one of air, one for the sag of the layer bridged across it. |
-| Brim | kept only when a loop cannot fit the gap | A brim is laid outward from every object and clipped back from the others by `brim_object_gap`. Where an extrusion still fits in what is left, the first layer welds the puzzle into a tile. At a two-line-width gap it does fit, so the brim is normally dropped and the run says so. |
+| Brim | kept only when a loop cannot fit the plate gap | A brim is laid outward from every object and clipped back from the others by `brim_object_gap`. Where an extrusion still fits in what is left, the first layer welds the plate into a tile. At a two-line-width gap it does fit, so the brim is normally dropped and the run says so. |
 | Floor plane | one layer below the lowest non-foundation geometry | The mesh states where the map's colour begins. One layer under it is the same shape of bound the generator sets itself, and keeps the cut off a colour skin's underside rather than grazing it. Measured across twenty-one generated models it lands anywhere from 1.64 to 3.08 mm, because it follows the map's own lowest ground rather than a constant. |
 | Outline | the cross section of the floor slab | Whatever polygon the map was cropped to, holes included, together with a check that it does not change with depth. |
 | Narrowest knob neck | `2 x wall_loops x wall line width` | Below it a knob is two walls touching rather than a solid section, so it has no strength to give. |
@@ -105,9 +109,10 @@ profile, and the cut reads its bounds back out of it:
 | Foundation filament | the material that reaches z = 0 | Which index carries the substrate depends on `--foundation-color` at generation time, so it is read off the geometry rather than assumed. |
 
 Every one of those has an override flag for a project whose settings are
-incomplete or a fit you have measured yourself: `--clearance-mm`, `--floor-mm`,
-`--knob-recess-mm`, `--tab-undercut-mm`, `--tab-neck`, `--plate-mm`,
-`--plate-margin-mm`, `--brim`/`--no-brim`, `--foundation-material`. A project that cannot supply the profile fails with the
+incomplete or a fit you have measured yourself: `--clearance-mm`,
+`--plate-gap-mm`, `--floor-mm`, `--knob-recess-mm`, `--tab-undercut-mm`,
+`--tab-neck`, `--plate-mm`, `--plate-margin-mm`, `--brim`/`--no-brim`,
+`--foundation-material`. A project that cannot supply the profile fails with the
 list of flags to pass instead, rather than silently substituting numbers.
 
 What is *not* derived is the knob's shape — its reach, its neck as a fraction of
@@ -116,7 +121,7 @@ cartographic-style design choices, in the same class as
 `_material_layers.PAVEMENT_PAD_RELIEF_MM`: they are the proportions of a
 cardboard puzzle, held as module constants and scaled with the edge they sit on.
 
-## The gap: where it comes from, and why not out of the map
+## The plate gap: where it comes from, and why not out of the map
 
 Two pieces printed side by side need a gap between them. One nozzle diameter is
 the obvious width, and on this map it does not slice — Bambu refuses a
@@ -161,7 +166,7 @@ bipartite, so two plates suffice, and then there is nothing to hold apart:
 Plates: 2 x 240.3 x 240.3 mm holding 50, 50 pieces. No two pieces on a plate
 interlock, so the map surface is cut on a plane of no width and keeps all
 55,225 mm2 of itself; the pieces are set down 0.59 mm further apart per cell to
-part their diagonal corners.
+part their diagonal corners by the 0.84 mm plate gap.
 ```
 
 The colouring runs on the real adjacency graph rather than on cell parity,
@@ -169,8 +174,8 @@ because a piece that absorbed a clipped neighbour spans cells of both colours
 and can force a third plate.
 
 The only same-plate contact left is the corner where two diagonal pieces meet,
-which a step of `clearance / √2` parts along the diagonal by exactly the
-clearance. The step also grows the plate — one step per seam — which is checked
+which a step of `plate gap / √2` parts along the diagonal by exactly the plate
+gap. The step also grows the plate — one step per seam — which is checked
 against the printable area and flagged past `--warn-plate-mm` (default 250):
 
 ```text
@@ -191,6 +196,30 @@ The meshes stay in map coordinates and only the build item's transform moves,
 so the archive still holds the chunk exactly as it was cut. `--surface-kerf-mm`
 trades back the other way if you would rather have one plate than a whole map.
 
+## The joint clearance: a fit, not the plate gap
+
+The colouring frees the joint as well as the map. A knob and the notch it locks
+into are never printed together, so the gap between them does not answer to the
+slicer at all, only to the hand: small enough that the knob does not rattle,
+wide enough that it still goes in once the two outer walls facing each other
+across it have each come out a little proud of their contours. The default is
+half a nozzle, the same allowance the lock is built from.
+
+The first two-plate cut kept the joint at the plate gap, and it came off the
+printer loose. Measured on the cut polygons of a hundred-piece puzzle of the
+tracked example, worst over the joints between its columns:
+
+| joint clearance | slide along a seam | pull away before the knob catches |
+| --- | --- | --- |
+| 0.84 mm, the plate gap | 0.85 mm | 1.20 mm |
+| 0.2 mm, half a nozzle | 0.21 mm | 0.42 mm |
+
+Those are drawn figures; printed walls come out slightly proud and take up part
+of each. Pushing two pieces together is stopped by the map itself, whose surface
+is cut on a plane of no width, so sliding and pulling apart are all the joint
+has to hold. `--clearance-mm` moves the fit in either direction, and a test pair
+is the only way to choose it; see the end of the next section.
+
 ## The joint: the lock wins, the knob's proportion gives
 
 Both halves of a joint are cut from one curve and then each eroded by half the
@@ -201,35 +230,37 @@ half the gap, and the interference the two pieces actually feel is
 lock = undercut - clearance
 ```
 
-An undercut sized on its own -- half a nozzle, say -- vanishes completely once a
-gap wide enough to separate the pieces is subtracted, and the puzzle falls apart
-in the hand. So the undercut covers the gap first and adds the lock on top:
-`undercut = clearance + nozzle/2`.
+An undercut sized on its own -- half a nozzle, say -- vanishes completely once
+the gap is subtracted, and the puzzle falls apart in the hand. So the undercut
+covers the gap first and adds the lock on top: `undercut = clearance +
+nozzle/2`.
 
 The same erosion slims the neck as well as the head, so a fixed undercut on a
 smaller knob makes a proportionally fatter knob. Measured over a 235 mm map,
 with the lock held at half a nozzle:
 
-| pieces | knob neck | head/neck at a 0.4 mm gap | at 0.84 mm |
+| pieces | knob neck | head/neck at the 0.2 mm fit | at the 0.84 mm plate gap |
 | --- | --- | --- | --- |
-| 25 | 11.28 mm | 1.11 | 1.20 |
-| 100 | 5.64 mm | 1.23 | 1.43 |
-| 144 | 4.70 mm | 1.27 | 1.54 |
-| 196 | 4.03 mm | 1.33 | 1.65 |
+| 25 | 11.28 mm | 1.07 | 1.20 |
+| 100 | 5.64 mm | 1.15 | 1.43 |
+| 144 | 4.70 mm | 1.18 | 1.54 |
+| 196 | 4.03 mm | 1.21 | 1.65 |
 
 A cardboard jigsaw sits near 1.2; by 1.4 the head is a lump on a stalk. So the
-gap is not free -- it is paid for in the knob, and at the gap this map needs, a
-100-piece puzzle has chunky knobs.
+gap is not free -- it is paid for in the knob. At the fit it costs little; cut
+to the plate gap, a 100-piece puzzle has chunky knobs.
 
 Which of the two gives is the one real design decision here, and it is the lock:
 a puzzle that will not hold together is a worse object than one with fat knobs.
 `derive_undercut` therefore always returns `clearance + nozzle/2`, the run
-reports the printed proportion, notes it past `TAB_TARGET_HEAD_RATIO` (1.25)
+reports the printed proportion, notes it past `TAB_TARGET_HEAD_RATIO` (1.25) —
+at `--clearance-mm 0.84` and 100 pieces, for instance —
 
 ```text
 note: a 5.64 mm knob neck across a 0.84 mm gap prints a head 1.43 times its own
 neck, past the 1.25 a cardboard puzzle sits at. It keeps the lock, which is the
-point, but the knobs are chunky; fewer, larger pieces slim them.
+point, but the knobs are chunky; fewer, larger pieces or a narrower
+--clearance-mm slim them.
 ```
 
 and refuses only past `TAB_MAX_HEAD_RATIO` (1.6), where the knob has stopped
@@ -239,12 +270,13 @@ being a knob:
 error: At 196 pieces a 4.03 mm knob neck across a 0.84 mm gap prints a head 1.65
 times its own neck, past 1.6. Both halves of the joint lose half the gap, so on
 a piece this small the head that would still lock is a lump on a stalk. Ask for
-fewer, larger pieces, or accept a free fit with --tab-undercut-mm 0.
+fewer, larger pieces, narrow the fit with --clearance-mm, or accept a free fit
+with --tab-undercut-mm 0.
 ```
 
-That ceiling is a real limit of the map's density, not a tuning failure: below a
-certain piece size, a gap wide enough for this map to slice is already most of
-what the joint had to give.
+That ceiling binds only on a widened fit. At the default clearance the knob
+neck's minimum width, the profile's walls laid in from both sides of the throat,
+refuses a piece count long before its head could become a lump.
 
 `tests/test_generate_puzzle.py` checks the lock the way a hand does: it pulls
 one piece straight away from its neighbour and asserts the knob is caught on the
@@ -272,10 +304,12 @@ polyline.
 
 A printed piece is far stiffer than cardboard, and a knob has to enter its notch
 sideways because the map above the notch roofs it over. **Print one pair of
-neighbouring pieces and try the fit before committing a full plate.** If they
-will not go together, raise `--clearance-mm` or lower `--tab-undercut-mm`; if
-they fall apart, do the reverse. Nothing in mesh or slicer validation can settle
-this for you.
+neighbouring pieces and try the fit before committing both plates** — one piece
+from each, since neighbours never share a plate; delete the other objects in
+Bambu Studio. If they will not go together, raise `--clearance-mm`; if the knob
+rattles, lower it. If the head will not snap past the neck, lower
+`--tab-undercut-mm`; if the pieces pull apart, raise it. Nothing in mesh or
+slicer validation can settle this for you.
 
 ## Spires: what a piece may not contain
 
@@ -427,20 +461,20 @@ The per-piece rules are `validate_3mf`'s own, applied one piece at a time:
   an extrusion into, re-measured against the profile written into the archive;
 - `print_sequence` still `by layer`, because a multi-object plate printed piece
   by piece would drive the toolhead through pieces already standing;
-- no brim wide enough to reach across a seam.
+- no brim wide enough to reach across the plate gap.
 
 It adds the two rules only a puzzle has, applied to each plate in turn:
 **no two pieces on a plate may overlap**, and none may come closer than the
-seam clearance. Every pair is measured, not just the ones adjacent in the map —
+plate gap. Every pair is measured, not just the ones adjacent in the map —
 on a coloured plate the closest pair is usually two pieces meeting at a diagonal
 corner, which is not an adjacency at all. A bounding-box bound skips the pairs
 that are obviously far apart, so only the close ones cost a Boolean.
 
-A knob lying under a neighbour's surface is the one place two pieces come
-closer than the seam clearance, and on a coloured plate that never happens —
-the neighbour it reaches under is on the other plate. So what every pair on a
-plate has to keep is the full seam clearance, and the closest pair measured is
-the diagonal corner the plate step was sized for:
+Interlocking neighbours come far closer than the plate gap — the joint's fit
+across the floor, nothing at all where their surfaces meet — and on a coloured
+plate that never matters, because they are on different plates. So what every
+pair on a plate has to keep is the full plate gap, and the closest pair measured
+is the diagonal corner the plate step was sized for:
 
 ```text
 Plate 1 validation passed: 50 pieces, closest 0.840 mm apart
@@ -498,6 +532,10 @@ test.
 same seed gives the same puzzle; a different seed gives a different one from the
 same map. `puzzle.json` records the seed together with every derived bound, so a
 cut can be reproduced from the manifest alone.
+
+A manifest older than `schema_version` 2 records a single `clearance_mm`, to
+which that cut sized both the joint and the plate gap. Pass it as both
+`--clearance-mm` and `--plate-gap-mm` to cut the same puzzle again.
 
 The input's `Metadata/generation_command.json` is carried through into the
 output 3MF unchanged, so a puzzle still records the command that generated the

@@ -38,8 +38,8 @@ profiles and no job directory: the input project already carries the print
 profile it was resolved against, and every clearance defended here is derived
 from that rather than assumed.  What it writes it then reads back and audits the
 way ``validate_3mf`` audits a map, piece by piece, plus the two rules only a
-puzzle has: neighbouring pieces must not touch, and none may come closer than
-the joint is built to.
+puzzle has: no two pieces on a plate may touch, and none may come closer than
+two pieces printed side by side need.
 """
 
 from __future__ import annotations
@@ -453,9 +453,9 @@ def derive_undercut(neck_mm: float, clearance_mm: float, interference_mm: float)
     The lock wins over the knob's looks, and that is a deliberate reversal of
     what this function used to do.  Capping the undercut to keep the printed
     head within ``target_ratio`` of its own neck is the prettier rule, but on a
-    small piece at a gap wide enough to slice it drives the lock to nothing, and
-    a puzzle that will not hold together is a worse object than one with chunky
-    knobs.  So the proportion is what gives; the caller measures it with
+    small piece at a wide gap it drives the lock to nothing, and a puzzle that
+    will not hold together is a worse object than one with chunky knobs.  So
+    the proportion is what gives; the caller measures it with
     `printed_head_ratio`, notes it past ``TAB_TARGET_HEAD_RATIO`` and refuses
     only past ``TAB_MAX_HEAD_RATIO``.
     """
@@ -758,15 +758,16 @@ class PrintProfile:
     and plate, and every bound this script defends follows from those rather
     than from a constant written here:
 
-    ``clearance``      two outer-wall line widths, and the reason is the map,
+    ``plate gap``      two outer-wall line widths, and the reason is the map,
                        not the joint. A city at 1:5670 carries thousands of
                        details finer than one bead -- parapets, roof fixtures,
                        narrow setbacks. The slicer still lays a full bead down
                        the middle of each, and Arachne widens a lone bead up to
                        about twice the nominal width, so a bead can spill a
                        whole line width past the feature it is drawing. Two such
-                       features facing each other across a seam therefore need
-                       two line widths between them or their paths overlap.
+                       features facing each other across a seam on one plate
+                       therefore need two line widths between them or their
+                       paths overlap.
 
                        Measured on a hundred-piece cut of the tracked example:
                        0.40 mm and 0.50 mm are both refused by Bambu's
@@ -776,8 +777,26 @@ class PrintProfile:
                        pieces blamed -- and slices only because a single object
                        has nothing to be compared against.
 
-                       Widening is not free: both halves of a joint are eroded
-                       by half the gap, so a wider gap costs knob slenderness.
+                       It binds only between pieces printed side by side, and
+                       interlocking pieces never are: the plate step pays for
+                       it, and no joint does.
+    ``clearance``      half a nozzle, and it is a fit rather than a slicing
+                       bound. The two halves of a joint are printed on
+                       different plates, so the only thing the gap between a
+                       knob and its notch answers to is the hand: small enough
+                       that the knob does not rattle, wide enough that it still
+                       goes in once the two outer walls facing each other
+                       across it have each come out a little proud of their
+                       contours. Half a nozzle is the allowance the lock is
+                       built from as well.
+
+                       Cut to the plate gap instead, which is what the first
+                       two-plate cut did, the joint rattled in the hand: a
+                       piece slid 0.84 mm along its seam and pulled 1.2 mm away
+                       before its knob caught.
+
+                       Both halves of a joint are eroded by half the gap, so a
+                       wider gap also costs knob slenderness;
                        `printed_head_ratio` reports what that comes to.
     ``vertical``       two layers. A knob lies under its neighbour's surface
                        tier, so the joint needs clearance in Z as well: one
@@ -796,7 +815,7 @@ class PrintProfile:
                        `derive_undercut`, because the two halves of a joint are
                        each eroded by half the gap: a head has to out-reach its
                        neck by the whole gap before any overhang is left to lock
-                       with, and on a small neck that would make a lump.
+                       with, and on a small neck at a wide gap that makes a lump.
     ``printable width`` two minimum bead widths.  Below it Arachne lays no
                        extrusion at all and the layer slices away to nothing,
                        which is fatal on a puzzle: the empty layer belongs to
@@ -807,9 +826,9 @@ class PrintProfile:
                        was 0.677 mm or wider -- ``2 x min_bead_width`` is
                        0.68 mm.
     ``plate``          the printable area, less what the configured brim needs.
-    ``brim``           kept only where a brim loop cannot fit between two
-                       pieces; a brim that reaches across the seam welds the
-                       first layer of the whole puzzle together.
+    ``brim``           kept only where a brim loop cannot fit the plate gap; a
+                       brim that reaches across it welds the first layer of the
+                       whole plate together.
     ``knob facets``    chords no coarser than half a nozzle, so the only curved
                        surface in the model is not the thing that shows.
     """
@@ -827,8 +846,12 @@ class PrintProfile:
     print_sequence: str
 
     @property
-    def clearance_mm(self) -> float:
+    def plate_gap_mm(self) -> float:
         return 2 * self.outer_wall_line_width_mm
+
+    @property
+    def clearance_mm(self) -> float:
+        return self.nozzle_mm / 2
 
     @property
     def interference_mm(self) -> float:
@@ -863,8 +886,8 @@ class PrintProfile:
     def brim_margin_mm(self) -> float:
         return self.brim_width_mm + self.brim_object_gap_mm if self.brim_width_mm else 0.0
 
-    def brim_bridges_gap(self, clearance_mm: float) -> bool:
-        """Whether a brim loop fits in the gap between two neighbouring pieces.
+    def brim_bridges_gap(self, plate_gap_mm: float) -> bool:
+        """Whether a brim loop fits in the gap between two pieces on a plate.
 
         A brim is laid outward from each object's first layer and clipped back
         from every other object by ``brim_object_gap``.  Where what is left
@@ -873,7 +896,7 @@ class PrintProfile:
         """
         if not self.brim_width_mm:
             return False
-        return (clearance_mm - 2 * self.brim_object_gap_mm) >= self.outer_wall_line_width_mm
+        return (plate_gap_mm - 2 * self.brim_object_gap_mm) >= self.outer_wall_line_width_mm
 
     @property
     def crumb_mm3(self) -> float:
@@ -1241,11 +1264,14 @@ def plate_colouring(layout: Layout) -> list[int]:
 
     But the constraint only binds between *neighbours*.  Print a piece with
     nobody it interlocks with and there is nothing to hold apart, so the cut can
-    be a plane of no width and the map loses nothing at all.  A grid is
-    bipartite, so two plates in a checkerboard almost always suffice; the
-    colouring is done on the real adjacency graph rather than on cell parity
-    because a piece that absorbed a clipped neighbour spans cells of both
-    colours, and that can make the graph need a third.
+    be a plane of no width and the map loses nothing at all.  It frees the joint
+    the same way: a knob and its notch are never on one plate, so the gap
+    between them is a fit sized for the hand (``PrintProfile.clearance_mm``)
+    rather than the plate gap sized for the slicer.  A grid is bipartite, so two
+    plates in a checkerboard almost always suffice; the colouring is done on the
+    real adjacency graph rather than on cell parity because a piece that
+    absorbed a clipped neighbour spans cells of both colours, and that can make
+    the graph need a third.
     """
     owner = layout.owner()
     neighbours = {index: set() for index in range(layout.pieces)}
@@ -1307,12 +1333,14 @@ def offset_transform(base: str, dx: float, dy: float) -> str:
     return " ".join(numbers)
 
 
-def seat_polygons(layout: Layout, low, clearance: float) -> list[Polygon]:
-    """Each piece's own cells, inset by half the clearance where a neighbour meets it.
+def seat_polygons(layout: Layout, low, kerf: float) -> list[Polygon]:
+    """Each piece's own cells, inset by half the surface kerf where a neighbour meets it.
 
     This is the footprint of the piece above the floor plane, and the part of
     its floor that has its own surface tier standing on it.  Everything of a
     piece outside its seat is knob, and lies under a *neighbour's* surface.
+    The kerf is zero unless the map surface is traded for plate area, so a seat
+    is normally exactly its cells.
 
     Like the floor's gap, the inset is subtracted as a band over the grid lines
     that are actually cut, so the map's outer edge keeps its dimensions and a
@@ -1333,8 +1361,8 @@ def seat_polygons(layout: Layout, low, clearance: float) -> list[Polygon]:
             if owner.get((row - 1, col)) != owner.get((row, col)):
                 segments.append(LineString([(low[0] + col * grid.cell_width, y),
                                             (low[0] + (col + 1) * grid.cell_width, y)]))
-    band = (unary_union(segments).buffer(clearance / 2, cap_style="square", join_style="mitre")
-            if segments and clearance > 0 else None)
+    band = (unary_union(segments).buffer(kerf / 2, cap_style="square", join_style="mitre")
+            if segments and kerf > 0 else None)
     seats = []
     for group in layout.groups:
         cells = unary_union([cell_box(grid, cell, low) for cell in group])
@@ -1697,7 +1725,7 @@ def matches_cavity(cavity, known, tolerance: float = 0.02) -> bool:
 
 
 def validate_puzzle(output: Path, source: SourceProject, expected, footprint, *,
-                    clearance_mm: float, vertical_clearance_mm: float,
+                    plate_gap_mm: float, vertical_clearance_mm: float,
                     layout: Layout, labels, solids=None, offsets=None):
     """Re-read the written 3MF and audit it the way `validate_3mf` audits a map.
 
@@ -1712,8 +1740,9 @@ def validate_puzzle(output: Path, source: SourceProject, expected, footprint, *,
     of degenerate triangles; the piece's four filaments unioning to exactly one
     printable component with no sealed printable chamber; nothing outside the
     map's own footprint or below the plate.  The rule it adds is the one that
-    only a puzzle has -- that neighbouring pieces are genuinely separate, held
-    apart by the full clearance, so the plate comes off in pieces.
+    only a puzzle has -- that the pieces printed together are genuinely
+    separate, held apart by the full plate gap, so the plate comes off in
+    pieces.
     """
     import manifold3d as md
 
@@ -1722,12 +1751,12 @@ def validate_puzzle(output: Path, source: SourceProject, expected, footprint, *,
     # which pieces those are is what the caller passed in.
     indices = sorted(expected["indices"])
     count = len(indices)
-    # A knob lying under a neighbour's surface is the one place two pieces come
-    # closer than the seam clearance, and on a coloured plate that never
-    # happens: the neighbour it reaches under is on the other plate. So what
-    # every pair here has to keep is the full seam clearance.
-    separation_mm = clearance_mm
-    report = {"model": str(output), "pieces": {}, "clearance_mm": clearance_mm,
+    # Interlocking neighbours come far closer than the plate gap -- the joint's
+    # fit across the floor, nothing at all where their surfaces meet -- and on
+    # a coloured plate that never matters: they are on different plates. So
+    # what every pair here has to keep is the full plate gap.
+    separation_mm = plate_gap_mm
+    report = {"model": str(output), "pieces": {}, "plate_gap_mm": plate_gap_mm,
               "knob_recess_mm": vertical_clearance_mm, "required_separation_mm": separation_mm}
     crumb = expected["crumb_mm3"]
     with zipfile.ZipFile(output) as archive:
@@ -1787,10 +1816,10 @@ def validate_puzzle(output: Path, source: SourceProject, expected, footprint, *,
                 f"A {count} object plate must print by layer, not {sequence!r}: printing "
                 "piece by piece would drive the toolhead through pieces already standing")
         written = print_profile(archive.read("Metadata/project_settings.config"))
-        if written.brim_bridges_gap(clearance_mm):
+        if written.brim_bridges_gap(plate_gap_mm):
             raise PuzzleError(
-                f"The project keeps a {written.brim_width_mm:g} mm brim, which fits the gap "
-                f"between two pieces and would weld the puzzle's first layer into one tile")
+                f"The project keeps a {written.brim_width_mm:g} mm brim, which fits the plate "
+                f"gap between two pieces and would weld the plate's first layer into one tile")
 
         with archive.open(member) as handle:
             meshes, colors = read_meshes(handle)
@@ -1981,7 +2010,7 @@ def build_parser():
                              "own printable_area when omitted")
     parser.add_argument("--brim", action=argparse.BooleanOptionalAction, default=None,
                         help="Keep the project's brim; by default it is kept only when a brim "
-                             "loop cannot fit in the gap between two pieces")
+                             "loop cannot fit in the plate gap between two pieces")
     parser.add_argument("--plate-margin-mm", type=float,
                         help="Margin kept clear inside the plate; the project's brim width plus "
                              "its object gap when omitted")
@@ -1992,9 +2021,15 @@ def build_parser():
                         help="Vertical gap between a knob and the neighbour's surface above it; "
                              "two layer heights when omitted")
     parser.add_argument("--clearance-mm", type=float,
-                        help="Total gap between neighbouring pieces; two outer-wall line widths "
-                             "when omitted, the room a bead laid on a sub-bead map detail needs "
-                             "on each side of the seam before the slicer calls it a collision")
+                        help="Gap between a knob and the notch it locks into; half a nozzle "
+                             "when omitted. Interlocking pieces never share a plate, so this is "
+                             "a fit rather than a slicing bound: raise it if a test pair will not "
+                             "go together, lower it if the knob rattles")
+    parser.add_argument("--plate-gap-mm", type=float,
+                        help="Least distance between two pieces printed side by side on one "
+                             "plate; two outer-wall line widths when omitted, the room a bead "
+                             "laid on a sub-bead map detail needs on each side of the seam "
+                             "before the slicer calls it a collision")
     parser.add_argument("--surface-kerf-mm", type=float, default=0.0,
                         help="How much of the map surface a seam eats. Zero by default, which "
                              "keeps the map whole and opens the gap on the plate instead; raise "
@@ -2044,12 +2079,22 @@ def main(argv=None):
         raise PuzzleError(
             f"{args.input} does not carry a complete print profile ({profile}), so the cut's "
             "clearances cannot be derived from the machine it was resolved for. Pass "
-            "--clearance-mm, --floor-mm, --tab-undercut-mm and --plate-mm explicitly.")
+            "--clearance-mm, --plate-gap-mm, --floor-mm, --tab-undercut-mm and --plate-mm "
+            "explicitly.")
     print(f"Profile: {profile.nozzle_mm:g} mm nozzle, {profile.layer_height_mm:g} mm layers, "
           f"{profile.wall_loops} walls of {profile.wall_line_width_mm:g} mm, "
           f"{profile.plate_mm[0]:g} x {profile.plate_mm[1]:g} mm plate", flush=True)
 
+    # Two gaps that answer to different things. The plate gap is what two pieces
+    # printed side by side need for the slicer to keep their paths apart. The
+    # clearance is the fit between a knob and its notch, which are never on one
+    # plate, so it answers only to the hand.
     clearance = profile.clearance_mm if args.clearance_mm is None else args.clearance_mm
+    plate_gap = profile.plate_gap_mm if args.plate_gap_mm is None else args.plate_gap_mm
+    if not 0 <= clearance < 2:
+        raise PuzzleError("The joint clearance must be at least 0 and under 2 mm")
+    if not 0 < plate_gap < 2:
+        raise PuzzleError("The plate gap must be between 0 and 2 mm")
     # What the map gives up at a seam. Zero by default: the surface is cut on a
     # plane of no width, so every piece keeps every millimetre of map it was
     # cut with, and the gap the slicer needs is found on the plate instead.
@@ -2057,26 +2102,26 @@ def main(argv=None):
     # Pieces that interlock never share a plate, so the only same-plate contact
     # left is the corner where two diagonal pieces meet. Moving every piece out
     # by one step per cell parts those corners along the diagonal, so a step of
-    # clearance/sqrt(2) puts exactly the clearance between them.
-    spacing = max(0.0, clearance - surface_kerf) / math.sqrt(2)
+    # plate_gap/sqrt(2) puts exactly the plate gap between them.
+    spacing = max(0.0, plate_gap - surface_kerf) / math.sqrt(2)
     # The undercut is derived once the knob's size is known, further down.
     undercut = args.tab_undercut_mm
     plate_w, plate_h = args.plate_mm or profile.plate_mm
     project = source.project
     brim = profile.brim_width_mm
-    if args.brim and profile.brim_bridges_gap(clearance):
+    if args.brim and profile.brim_bridges_gap(plate_gap):
         raise PuzzleError(
-            f"A {profile.brim_width_mm:g} mm brim cannot be kept at a {clearance:g} mm gap: "
-            f"{clearance - 2 * profile.brim_object_gap_mm:.2f} mm is left between two pieces "
+            f"A {profile.brim_width_mm:g} mm brim cannot be kept at a {plate_gap:g} mm plate gap: "
+            f"{plate_gap - 2 * profile.brim_object_gap_mm:.2f} mm is left between two pieces "
             f"after the {profile.brim_object_gap_mm:g} mm object gap, which fits a "
             f"{profile.outer_wall_line_width_mm:g} mm extrusion, and the first layer would weld "
-            "the puzzle into one tile. Drop --brim, or narrow the gap with --clearance-mm.")
-    if args.brim is False or (args.brim is None and profile.brim_bridges_gap(clearance)):
+            "the plate into one tile. Drop --brim, or narrow the gap with --plate-gap-mm.")
+    if args.brim is False or (args.brim is None and profile.brim_bridges_gap(plate_gap)):
         if profile.brim_width_mm:
             reason = ("a brim loop fits the "
-                      f"{clearance - 2 * profile.brim_object_gap_mm:.2f} mm left between two "
+                      f"{plate_gap - 2 * profile.brim_object_gap_mm:.2f} mm left between two "
                       f"pieces after the {profile.brim_object_gap_mm:g} mm object gap, so it "
-                      "would weld the first layer of the puzzle together"
+                      "would weld the first layer of the plate together"
                       if args.brim is None else "it was turned off")
             print(f"Brim: disabled because {reason}.", flush=True)
         brim = 0.0
@@ -2085,12 +2130,10 @@ def main(argv=None):
         project = json.dumps(settings, indent=2).encode()
     margin = (brim + profile.brim_object_gap_mm if brim else 0.0) \
         if args.plate_margin_mm is None else args.plate_margin_mm
-    if not 0 < clearance < 2:
-        raise PuzzleError("Clearance must be between 0 and 2 mm")
-    if clearance < profile.nozzle_mm - 1e-9:
-        print(f"warning: a {clearance:g} mm gap is narrower than the {profile.nozzle_mm:g} mm "
-              "nozzle, so the slicer cannot resolve a void between two pieces. They will print "
-              "fused and the puzzle will come off the plate as one tile.", flush=True)
+    if plate_gap < profile.nozzle_mm - 1e-9:
+        print(f"warning: a {plate_gap:g} mm plate gap is narrower than the "
+              f"{profile.nozzle_mm:g} mm nozzle, so the slicer cannot resolve a void between two "
+              "pieces. They will print fused and the plate will come off as one tile.", flush=True)
 
     solids = [to_manifold(vertices, triangles) for _, vertices, triangles in source.meshes]
     foundation = (derive_foundation(solids) if args.foundation_material is None
@@ -2123,10 +2166,16 @@ def main(argv=None):
     print(f"Outline: {footprint.area:,.0f} mm2, {fill:.1%} of its bounding box, "
           f"{len(shapely.get_parts(footprint))} part(s)", flush=True)
 
+    # A crumb joins its host only across an edge long enough to survive the band
+    # cut beside it. That is judged against the widest gap in play rather than
+    # the joint's fit alone: it only ever refuses a merge the fit would allow,
+    # and it keeps the grid an irregular outline gets for a given count where it
+    # was before the fit and the plate gap were told apart.
+    join = max(clearance, plate_gap, surface_kerf) + profile.nozzle_mm
     if args.grid:
         rows, cols = args.grid
         layout, slivers = layout_for(Grid(rows, cols, width, height), local,
-                                     args.min_piece_fill, clearance + profile.nozzle_mm)
+                                     args.min_piece_fill, join)
         if slivers:
             raise PuzzleError(
                 f"--grid {rows}x{cols} catches {slivers} slivers of the map too small to be "
@@ -2136,7 +2185,7 @@ def main(argv=None):
                   f"cutting {layout.pieces} pieces", flush=True)
     else:
         layout = choose_layout(local, width, height, args.pieces, args.max_piece_aspect,
-                               args.min_piece_fill, clearance + profile.nozzle_mm)
+                               args.min_piece_fill, join)
     grid = layout.grid
     if layout.pieces > MAX_PIECES:
         raise PuzzleError(f"At most {MAX_PIECES} pieces fit this 3MF's object numbering")
@@ -2158,13 +2207,14 @@ def main(argv=None):
             f"At {layout.pieces} pieces a {neck_mm:.2f} mm knob neck across a {clearance:g} mm gap "
             f"prints a head {head_ratio:.2f} times its own neck, past {TAB_MAX_HEAD_RATIO:g}. "
             "Both halves of the joint lose half the gap, so on a piece this small the head that "
-            "would still lock is a lump on a stalk. Ask for fewer, larger pieces, or accept a "
-            "free fit with --tab-undercut-mm 0.")
+            "would still lock is a lump on a stalk. Ask for fewer, larger pieces, narrow the fit "
+            "with --clearance-mm, or accept a free fit with --tab-undercut-mm 0.")
     if head_ratio > TAB_TARGET_HEAD_RATIO:
         print(f"note: a {neck_mm:.2f} mm knob neck across a {clearance:g} mm gap prints a head "
               f"{head_ratio:.2f} times its own neck, past the {TAB_TARGET_HEAD_RATIO:g} a "
               "cardboard puzzle sits at. It keeps the lock, which is the point, but the knobs "
-              "are chunky; fewer, larger pieces slim them.", flush=True)
+              "are chunky; fewer, larger pieces or a narrower --clearance-mm slim them.",
+              flush=True)
     if interference <= 0:
         print(f"warning: a {undercut:g} mm undercut across a {clearance:g} mm gap leaves "
               f"{interference:g} mm of lock, so the pieces will locate each other but not hold "
@@ -2223,13 +2273,14 @@ def main(argv=None):
           f"{', '.join(str(n) for n in tally)} pieces. No two pieces on a plate interlock, so "
           f"the map surface is cut on a plane of no width and keeps all "
           f"{footprint.area:,.0f} mm2 of itself; the pieces are set down {spacing:.2f} mm "
-          "further apart per cell to part their diagonal corners.", flush=True)
+          f"further apart per cell to part their diagonal corners by the {plate_gap:g} mm "
+          "plate gap.", flush=True)
 
     puzzle_id = args.puzzle_id or f"{args.input.stem}_{layout.pieces}"
     directory = args.output_dir / puzzle_id
     plan = {
         "puzzle_id": puzzle_id,
-        "schema_version": 1,
+        "schema_version": 2,
         "source_model": str(args.input),
         "command": shlex.join(sys.argv),
         "rows": grid.rows, "cols": grid.cols, "pieces": layout.pieces,
@@ -2243,6 +2294,8 @@ def main(argv=None):
         "piece_aspect": grid.aspect,
         "floor_mm": floor,
         "clearance_mm": clearance,
+        "plate_gap_mm": plate_gap,
+        "surface_kerf_mm": surface_kerf,
         "knob_recess_mm": recess,
         "knob_thickness_mm": knob_thickness,
         "nozzle_mm": profile.nozzle_mm,
@@ -2426,7 +2479,7 @@ def main(argv=None):
                 "floor_mm": floor,
             }
             validation = validate_puzzle(output, source, expected, footprint, offsets=offsets,
-                                         clearance_mm=clearance, vertical_clearance_mm=recess,
+                                         plate_gap_mm=plate_gap, vertical_clearance_mm=recess,
                                          layout=layout, labels=labels, solids=solids)
             write_manifest(directory / f"validation_plate{plate + 1}.json", validation)
             print(f"Plate {plate + 1} validation passed: {len(on_plate)} pieces, closest "
