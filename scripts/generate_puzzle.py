@@ -1101,24 +1101,37 @@ def section_polygon(section, allow_empty: bool = False) -> Polygon:
     cut around a park or a basin is an ordinary polygon for this purpose and
     must not come back as a solid blob.
 
+    Rings also nest.  A building stands inside its city block, and a layer
+    above the ground but below the kerb lines holds the road network as an
+    outline, each block as a hole in it, and each building as an island in the
+    hole.  Every outline unioned and every hole subtracted erases the islands
+    along with the holes they stand in -- measured on the tracked example, a
+    whole block of buildings -- so the section is first split into Manifold's
+    own connected parts, each one outline and its holes, and assembled from
+    those.
+
     An empty section is an error for the callers that measure the footprint --
     a map with no cross section is a broken input -- but an ordinary answer for
     the layer scan, which asks about heights the piece may not reach at all.
     """
-    shells, holes = [], []
-    for ring in section.to_polygons():
-        ring = np.asarray(ring, dtype=float)
-        if len(ring) < 3:
-            continue
-        x, y = ring[:, 0], ring[:, 1]
-        area = 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
-        (shells if area > 0 else holes).append(Polygon(ring))
-    if not shells:
+    parts = []
+    for part in section.decompose():
+        shells, holes = [], []
+        for ring in part.to_polygons():
+            ring = np.asarray(ring, dtype=float)
+            if len(ring) < 3:
+                continue
+            x, y = ring[:, 0], ring[:, 1]
+            area = 0.5 * float(np.sum(x * np.roll(y, -1) - np.roll(x, -1) * y))
+            (shells if area > 0 else holes).append(Polygon(ring))
+        if shells:
+            outline = unary_union(shells)
+            parts.append(outline.difference(unary_union(holes)) if holes else outline)
+    if not parts:
         if allow_empty:
             return Polygon()
         raise PuzzleError("A cross section of the model enclosed no area")
-    outline = unary_union(shells)
-    return outline.difference(unary_union(holes)) if holes else outline
+    return unary_union(parts)
 
 
 def measure_footprint(solid, floor_mm: float, samples: int = 5):
@@ -1388,11 +1401,18 @@ def plate_offsets(layout: Layout, spacing_mm: float) -> list[tuple]:
     corners, and the caller sizes it to leave the plate gap between them.  The
     plate grows by one step per seam; the map loses nothing.
 
+    The spread is centred on the map's own centre, half a step per seam either
+    way.  Grown from one corner instead, a map that sits centred on the plate
+    loses the whole spread from a single margin, and a plate the spread fits
+    can still leave its far pieces over the edge.
+
     A piece that absorbed a clipped neighbour is placed by its top-left cell,
     which leaves the seams around it wider than asked rather than narrower.
     """
-    return [(min(col for _, col in group) * spacing_mm,
-             min(row for row, _ in group) * spacing_mm)
+    grid = layout.grid
+    middle = ((grid.cols - 1) * spacing_mm / 2, (grid.rows - 1) * spacing_mm / 2)
+    return [(min(col for _, col in group) * spacing_mm - middle[0],
+             min(row for row, _ in group) * spacing_mm - middle[1])
             for group in layout.groups]
 
 

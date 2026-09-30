@@ -424,6 +424,30 @@ class PlateTests(unittest.TestCase):
         (ax, ay), (bx, by) = offsets[a], offsets[b]
         self.assertAlmostEqual(math.hypot(bx - ax, by - ay), gap, places=9)
 
+    def test_the_spread_stays_on_a_plate_it_fits(self):
+        """The reported shape: a map centred on the plate with a margin narrower
+        than the spread. Grown from one corner, 250 mm of map plus a 5.35 mm
+        spread passed the fit check on a 256 mm plate and still put its last
+        column 2.35 mm over the edge. Centred, every piece lands on the plate."""
+        size, plate = 250.0, 256.0
+        layout = choose_layout(self.square(size), size, size, 100, 1.6, 0.35)
+        spacing = P2S.plate_gap_mm / math.sqrt(2)
+        width, _ = plate_extent(layout, size, size, spacing)
+        self.assertLessEqual(width, plate)                     # the check passes
+        margin = (plate - size) / 2                            # the map is centred
+        offsets = plate_offsets(layout, spacing)
+        grid = layout.grid
+        for group, (dx, dy) in zip(layout.groups, offsets):
+            low_x, low_y, high_x, high_y = shapely.union_all(
+                [cell_box(grid, cell) for cell in group]).bounds
+            self.assertGreaterEqual(margin + low_x + dx, -1e-9)
+            self.assertLessEqual(margin + high_x + dx, plate + 1e-9)
+            self.assertGreaterEqual(margin + low_y + dy, -1e-9)
+            self.assertLessEqual(margin + high_y + dy, plate + 1e-9)
+        # The symmetric case: the same spread grown from one corner falls off.
+        corner = max(offset[0] for offset in offsets) - min(offset[0] for offset in offsets)
+        self.assertGreater(margin + size + corner, plate)
+
     def test_the_fit_never_reaches_the_plate(self):
         """The symmetric case of cutting the joint to the fit rather than to the
         plate gap: a knob cut that close to its notch must not bring two pieces
@@ -776,6 +800,21 @@ class FloorTests(unittest.TestCase):
         than below it, even where the roof rule could not be met there."""
         floor, _, _ = self.lift(self.tile(cavity=(19.5, 8.0, 2.12, 20.5, 12.0, 2.36)))
         self.assertAlmostEqual(floor, 1.64)
+
+    def test_a_building_standing_in_a_block_is_part_of_the_section(self):
+        """The reported shape: above the ground but below the kerb lines a layer
+        holds the road network as an outline, each block as a hole in it and
+        each building as an island in the hole. Unioning outlines and then
+        subtracting holes erased every building with its block."""
+        roads = self.block(0, 0, 0, 10, 10, 1) - self.block(1, 1, -1, 9, 9, 2)
+        building = self.block(4, 4, 0, 6, 6, 1)
+        section = generate_puzzle.section_polygon((roads + building).slice(0.5))
+        self.assertAlmostEqual(section.area, 36.0 + 4.0)
+        self.assertTrue(section.contains(shapely.Point(5, 5)))
+        # The symmetric case: a block with nothing in it is still a hole.
+        empty = generate_puzzle.section_polygon(roads.slice(0.5))
+        self.assertAlmostEqual(empty.area, 36.0)
+        self.assertFalse(empty.contains(shapely.Point(5, 5)))
 
     def test_a_fit_test_keeps_the_substrate_and_nothing_above_it(self):
         """Everything below the trim height becomes one solid of one filament --
