@@ -47,8 +47,10 @@ Studio opens ready to print without reslicing. That file carries the toolpaths
 and the plate but no mesh: a 3MF that still holds its objects opens as a project
 to edit, and Studio then discards the G-code and reslices. The mesh stays in the
 `<model>.3mf` beside it. That project is also the cache:
-a rerun reuses it while it still matches the model's SHA-256, and no loose
-G-code is left behind. A project that already carries slice metadata is read
+a rerun reuses a project this script wrote while it still matches the model's
+SHA-256, and no loose G-code is left behind. One written by
+`slice_3mf.py --export-project` or by Bambu Studio carries no such record, so it
+is sliced again and replaced. A project that already carries slice metadata is read
 directly. A batch resolves its cached models first and shows a progress bar
 only for the models it still has to slice, so the time remaining counts real
 work and a fully cached batch prints no bar at all.

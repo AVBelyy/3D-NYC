@@ -19,8 +19,9 @@ That split is free because the generator already guarantees the lower level is
 a solid slab.  ``crossings.minimum_crossing_floor_mm`` keeps every tunnel floor
 and colour skin at least one layer *above* ``base_mm``, and only the foundation
 material reaches below it, so ``z < base_mm`` is a flat prism of one filament
-across the whole footprint.  The knobs are carved out of that prism, and the
-map above it is never consulted.
+across the whole footprint.  The knobs are carved out of that prism, which is
+lifted wherever the ground the joint actually crosses allows (`raise_floor`);
+the map above it is read only to find out how far.
 
 The two levels are cut by different means for the same reason they look
 different.  The rectangular level is separated with plane splits, which are
@@ -29,9 +30,9 @@ against a prism, which is cheap only because the slab it cuts is a box.
 
 There is a second clearance a flat jigsaw does not need.  A knob reaches *under*
 the neighbour it locks into, and that neighbour's surface tier starts at the
-floor plane, so a knob extruded to full height would present its top face flat
-against the underside of the neighbour's surface and be printed onto.  Every
-knob is therefore recessed, and the neighbour bridges the gap.
+floor plane, bridged across the notch, so a knob extruded to full height would
+press against a bridge that sags and hold the neighbour off its seat.  Every
+knob is therefore recessed.
 
 This script reads and writes 3MF.  It needs no source caches, no Bambu Studio
 profiles and no job directory: the input project already carries the print
@@ -334,9 +335,10 @@ def choose_layout(footprint, width: float, height: float, pieces: int,
     tied to the count at all: a 12 x 11 grid on a chunk the model half fills may
     be the one that yields exactly sixty pieces.
 
-    A grid is rejected outright if any cell catches a sliver of the model --
-    coverage above nothing but below ``min_fill``.  Those become pieces too
-    small to print a knob on or to pick up, and there is always another grid.
+    A cell the outline clips below ``min_fill`` is too small to be a piece, and
+    joins a neighbouring one instead (`layout_for`).  A grid is rejected only
+    when such a crumb has nothing it can join, or when joining it would make a
+    piece in two halves.
     """
     if not math.isfinite(width) or not math.isfinite(height) or width <= 0 or height <= 0:
         raise PuzzleError("Model footprint must be finite and positive")
@@ -801,8 +803,10 @@ class PrintProfile:
                        `printed_head_ratio` reports what that comes to.
     ``vertical``       two layers. A knob lies under its neighbour's surface
                        tier, so the joint needs clearance in Z as well: one
-                       layer of air, and one for the sag of the layer the
-                       neighbour bridges across the gap.
+                       layer for the sag of the layer the neighbour bridges
+                       across the notch, and one of clearance. Like
+                       ``clearance`` it is a fit: the two pieces are never
+                       printed together.
     ``crumb``          one nozzle-width square at one layer height -- the
                        smallest thing the printer can put down, and so the line
                        between Boolean debris and a real loose fragment. Shared
@@ -1378,9 +1382,11 @@ def plate_offsets(layout: Layout, spacing_mm: float) -> list[tuple]:
 
     So it comes out of the plate instead.  Each piece keeps every scrap of map
     it was cut with -- its mesh is still in map coordinates, and the meshes
-    still assemble into the original chunk exactly -- and is *placed* one gap
-    further out for each cell between it and the map's origin.  The plate grows
-    by one gap per seam; the map loses nothing.
+    still assemble into the original chunk exactly -- and is *placed* one step
+    further out for each cell between it and the map's origin.  Interlocking
+    pieces print on different plates, so the step only has to part two diagonal
+    corners, and the caller sizes it to leave the plate gap between them.  The
+    plate grows by one step per seam; the map loses nothing.
 
     A piece that absorbed a clipped neighbour is placed by its top-left cell,
     which leaves the seams around it wider than asked rather than narrower.
@@ -1525,13 +1531,11 @@ def floor_prisms(slab, polygons, seats, floor_mm: float, recess_mm: float,
     """Carve the floor slab into knobbed pieces, recessing every knob.
 
     A knob reaches under the neighbour it locks into, and that neighbour's
-    surface tier starts at the floor plane.  Extruded to full floor height the
-    knob's top face would therefore lie flat against the underside of the
-    neighbour's surface, and the printer would lay that surface straight onto
-    it: two pieces welded across a joint designed to come apart.  So the knob
-    stops ``recess_mm`` short of the plane and the neighbour bridges the gap,
-    which is a short bridge anchored on three sides and the only overhang the
-    cut creates.
+    surface tier starts at the floor plane, bridged across the notch -- a short
+    bridge anchored on three sides, and the only overhang the cut creates.
+    Extruded to full floor height the knob's top face would press against that
+    bridge, which sags, and hold the neighbour off its seat.  So the knob stops
+    ``recess_mm`` short of the plane.
 
     Under its own seat the floor is carried ``overlap_mm`` *past* the plane, into
     material the surface tier also holds.  Meeting the surface exactly on the
@@ -2153,7 +2157,7 @@ def build_parser():
                         help="Longest acceptable piece aspect ratio (default 1.6)")
     parser.add_argument("--min-piece-fill", type=float, default=0.35,
                         help="Least of a grid cell a piece may be, where the map's outline cuts "
-                             "across one; a grid that catches anything smaller is rejected "
+                             "across one; a cell clipped smaller joins a neighbouring piece "
                              "(default 0.35)")
     parser.add_argument("--plate-mm", type=parse_size, metavar="WIDTHxHEIGHT",
                         help="Printable plate area the assembled cut must fit; the project's "

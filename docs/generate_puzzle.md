@@ -50,7 +50,9 @@ That writes `output/puzzles/34_w_76_235_25/`:
 | `puzzle.json` | the grid, the seed, the plates, and every derived bound |
 | `validation_plate1.json`, `…2.json` | the audit of each written 3MF, piece by piece |
 
-Print both plates; together they are the whole map.
+Print both plates; together they are the whole map. A small block of the same
+pieces in one filament, [`--fit-test 3x3`](#try-the-fit-before-the-puzzle), is
+the cheap way to try the fit first.
 
 `--puzzle-id` names the directory and `--output-dir` moves the root. Add
 `--dry-run` to plan the cut, write the preview and manifest, and cut no meshes —
@@ -101,7 +103,7 @@ profile, and the cut reads its bounds back out of it:
 | Surface kerf | zero | Nothing of the map is thrown away; the gap is found on the plate instead. |
 | Knob undercut | the joint clearance plus half a nozzle | The clearance is subtracted from the joint before any of it is left to lock with, so the undercut has to cover it first and then add the lock. See below. |
 | Narrowest printable section | `2 x min_bead_width` | Below it the slicer lays no extrusion at all, and the layer becomes an empty layer *of that piece*. See below. |
-| Knob recess | two layer heights | A knob lies *under* its neighbour's surface tier. Without a gap in Z the printer lays that surface straight onto the knob. Two layers: one of air, one for the sag of the layer bridged across it. |
+| Knob recess | two layer heights | A knob lies *under* its neighbour's surface, and that surface is bridged across the notch, so it sags into it. The two pieces are never printed together, so this is a fit in Z, as the joint clearance is across it: one layer for the sag, and one of clearance so the knob goes under without lifting its neighbour. |
 | Brim | kept only when a loop cannot fit the plate gap | A brim is laid outward from every object and clipped back from the others by `brim_object_gap`. Where an extrusion still fits in what is left, the first layer welds the plate into a tile. At a two-line-width gap it does fit, so the brim is normally dropped and the run says so. |
 | Floor plane | one layer below the lowest non-foundation geometry, then raised as far as the joint zone allows | The mesh states where the map's colour begins. One layer under it is the same shape of bound the generator sets itself, and keeps the cut off a colour skin's underside rather than grazing it. Measured across twenty-one generated models it lands anywhere from 1.64 to 3.08 mm, because it follows the map's own lowest ground rather than a constant. The joint only needs that bound where it is cut, so it is lifted there. See below. |
 | Notch roof | `crossings.structural_roof_thickness_mm` | The least map left standing over a notch once the floor is lifted: the same three-layer roof the generator holds a tunnel cover to. |
@@ -125,6 +127,7 @@ the edge, how much it is jittered from one edge to the next. Those are
 cartographic-style design choices, in the same class as
 `_material_layers.PAVEMENT_PAD_RELIEF_MM`: they are the proportions of a
 cardboard puzzle, held as module constants and scaled with the edge they sit on.
+`--tab-size` and `--tab-neck` override the reach and the neck.
 
 ## The plate gap: where it comes from, and why not out of the map
 
@@ -222,8 +225,8 @@ tracked example, worst over the joints between its columns:
 Those are drawn figures; printed walls come out slightly proud and take up part
 of each. Pushing two pieces together is stopped by the map itself, whose surface
 is cut on a plane of no width, so sliding and pulling apart are all the joint
-has to hold. `--clearance-mm` moves the fit in either direction, and a test pair
-is the only way to choose it; see the end of the next section.
+has to hold. `--clearance-mm` moves the fit in either direction, and a test print
+is the only way to choose it; see [try the fit](#try-the-fit-before-the-puzzle).
 
 ## The joint: the lock wins, the knob's proportion gives
 
@@ -289,17 +292,20 @@ way out, and that it is *not* caught when the undercut only matches the gap.
 
 The joint needs a second clearance that a flat jigsaw does not. A knob reaches
 *under* the neighbour it locks into, and that neighbour's surface tier starts at
-the floor plane — so a knob extruded to full floor height would present its top
-face flat against the underside of the neighbour's surface, and the printer
-would lay that surface straight onto it. Every knob is therefore recessed:
+the floor plane, bridged across the notch — a short bridge anchored on three
+sides, and the only overhang the cut creates. A knob extruded to full floor
+height would press its top face against that bridge, which sags, and hold the
+neighbour off its seat. Every knob is therefore recessed, one layer for the sag
+and one of clearance:
 
 ```text
 Knob: 1.88 mm thick (8 layers), recessed 0.48 mm under its neighbour's surface
 ```
 
-The neighbour bridges the gap, which is a short bridge anchored on three sides
-and the only overhang the cut creates. `--knob-recess-mm` overrides it, and the
-run refuses a recess that would leave the knob under two layers thick.
+The two pieces are never printed together, so, like the joint clearance, the
+recess is a fit rather than a gap the slicer needs. `--knob-recess-mm` overrides
+it, and the run refuses a recess that would leave the knob under two layers
+thick.
 
 The knob is also shaped so its neck really is the throat: below the neck it
 narrows monotonically from a root twice the neck's width, so there is exactly
@@ -307,13 +313,16 @@ one interference in the joint. The finished curve is measured back rather than
 assumed — `generate_puzzle.knob_interference` reads the number off the sampled
 polyline.
 
-A printed piece is far stiffer than cardboard, and a knob has to enter its notch
-sideways because the map above the notch roofs it over. **Try the fit before
-committing both plates**: [`--fit-test`](#try-the-fit-before-the-puzzle) prints
-a small block of the puzzle's own pieces on one plate. If they will not go
-together, raise `--clearance-mm`; if the knob rattles, lower it. If the head
-will not snap past the neck, lower `--tab-undercut-mm`; if the pieces pull
-apart, raise it. Nothing in mesh or slicer validation can settle this for you.
+A printed piece is far stiffer than cardboard. The map above a notch roofs it
+over, so a knob goes in from below, with the notched piece lowered over it; a
+piece whose own knobs must reach under neighbours already in place cannot be
+lowered, and goes in sideways, each head snapping past its neck. **Try the fit
+before committing both plates**:
+[`--fit-test`](#try-the-fit-before-the-puzzle) prints a small block of the
+puzzle's own pieces on one plate. If they will not go together, raise
+`--clearance-mm`; if the knob rattles, lower it. If the head will not snap past
+the neck, lower `--tab-undercut-mm`; if the pieces pull apart, raise it. Nothing
+in mesh or slicer validation can settle this for you.
 
 ## How deep the joint reaches
 
@@ -431,15 +440,16 @@ on the union of its filaments — and trimmed at the top of the layer below the
 lowest one that slices away:
 
 ```text
-Trimmed spire tips off 46 piece(s), at most 9.51 mm (piece E8): below 0.68 mm
+Trimmed spire tips off 52 piece(s), at most 2.88 mm (piece C6): below 0.68 mm
 across, the slicer lays no extrusion and the layer would be an empty one of that
 object.
 ```
 
 *Lowest*, not highest: a layer that prints nothing carries nothing above it
 either, so whatever sits over it is hanging in mid-air however wide its own
-section is. Piece E8's 9.51 mm is one such needle — a mast that tapers from
-0.684 mm to 0.014 mm over 40 layers, every one of them below the bound.
+section is. Piece C6's 2.88 mm, on the tracked example at 100 pieces, is one
+such needle: a spire that narrows from 1.73 mm to 0.67 mm in a single layer and
+tapers on to 0.14 mm over the eleven above it, every one of them below the bound.
 
 Nothing printable is lost. The material removed is material the slicer already
 declines to lay down, on the uncut map exactly as here; the puzzle only has to
@@ -477,12 +487,11 @@ A crumb is therefore attached only to a host it shares a real edge with, and a
 group whose covered area does not come out as one polygon disqualifies the grid.
 
 Rejecting the grid whenever it clips *anything* is the obvious first thing to
-try, and it does not survive contact with a real plate. Measured over the twenty tracked Manhattan
-plates, asking for a grid that clips nothing leaves between **zero and
-twenty-six** usable piece counts in the range 20–160, and none at all on the
-plates whose outlines carry thousands of vertices. Absorbing the crumb instead
-leaves **47 to 86** counts on every plate, never more than nine apart, with no
-piece under a third of a cell.
+try, and it does not survive contact with a real plate: on a street-following
+outline almost every grid clips something, and on a plate whose outline carries
+thousands of vertices essentially none escapes. Absorbing the crumb instead
+makes most piece counts reachable on most plates, with no piece under a third of
+a cell, though some outlines still offer only a handful.
 
 Not every count survives even so. The refusal names ones that do:
 
@@ -497,13 +506,21 @@ setting that most widens the reachable counts; `--grid ROWSxCOLS` overrides the
 search entirely.
 
 There is no minimum piece size in millimetres, because the real limit is the
-knob, not the piece. Asking for too many pieces fails on the neck instead, in
-the profile's own terms:
+knob, not the piece: its neck has to hold the profile's walls from both sides.
+At the default proportions that binds only on a small chunk or a narrowed
+`--tab-neck`, and the run refuses in the profile's own terms — here at
+`--tab-neck 0.07`:
 
 ```text
-error: 12 x 12 gives 19.6 x 19.6 mm pieces, whose knobs are only 4.70 mm across
+error: 10 x 10 gives 23.5 x 23.5 mm pieces, whose knobs are only 1.65 mm across
 the neck. This profile's 2 walls of 0.45 mm need 1.80 mm before a knob is solid
-rather than two walls touching.
+rather than two walls touching. Ask for fewer pieces, or raise --tab-neck.
+```
+
+On a full-size chunk the object numbering runs out first:
+
+```text
+error: At most 249 pieces fit this 3MF's object numbering
 ```
 
 At 235 mm square, 25 pieces are 47 mm across — chunky — and 100 pieces are
@@ -523,15 +540,19 @@ in every cell is noise over the only thing worth seeing.
 
 ## Plate limits
 
-The pieces stay where they were in the map, so the assembled cut occupies the
-same footprint as the input model and the whole puzzle prints on one plate.
-That only works if the model fits:
+Each plate holds its pieces where they were in the map, set one plate step
+further apart per seam, so a plate needs the model's footprint plus a step per
+seam. The model has to fit first:
 
 ```text
 error: A 300.0 x 235.0 mm map does not fit 256 x 256 mm with 3.1 mm of margin
 (249.8 x 249.8 mm usable). Regenerate the chunk smaller, or raise --plate-mm to
 your printer's real area.
 ```
+
+and then the spread, which is refused past the usable area and flagged past
+`--warn-plate-mm`, as [two plates](#two-plates-and-a-map-that-keeps-all-of-itself)
+describes.
 
 If you want a map larger than one plate, cut a
 [multi-plate plan](plan_map_chunks.md) first and generate a puzzle from each
@@ -542,7 +563,8 @@ plate.
 Every run re-opens the 3MF it just wrote and audits it independently — the
 meshes are parsed back out of the serialized XML rather than reused from memory,
 because a solid that did not survive serialization intact has not been checked
-at all. `--no-validate` skips it; `validation.json` records what passed.
+at all. `--no-validate` skips it; `validation_plate1.json` and
+`validation_plate2.json` record what passed, and a fit test writes its own.
 
 The per-piece rules are `validate_3mf`'s own, applied one piece at a time:
 
@@ -619,12 +641,13 @@ The hermetic geometry tests run separately:
 .venv/bin/python -m pytest tests/test_generate_puzzle.py
 ```
 
-They exercise the grid, the knob profile, the cut polygons and the profile
-derivation with no model, cache or 3MF, and they check that the loose-fragment
-bound agrees with the one `validate_3mf` applies to the whole map.
+They exercise the grid, the knob profile, the cut polygons, the joint's fit,
+the plate layout and the profile derivation with no model, cache or 3MF — the
+floor lift on a small synthetic tile rather than a map — and they check that the
+loose-fragment bound agrees with the one `validate_3mf` applies to the whole map.
 
-A passing run is still not a claim that the fit is right. Print the two-piece
-test.
+A passing run is still not a claim that the fit is right. Print a
+[fit test](#try-the-fit-before-the-puzzle).
 
 ## Reproducing a cut
 
