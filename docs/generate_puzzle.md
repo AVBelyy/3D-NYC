@@ -26,10 +26,13 @@ Brim: disabled because a brim loop fits the 0.64 mm left between two pieces
       after the 0.1 mm object gap, so it would weld the first layer of the plate together.
 Model 235.000 x 235.000 mm, 4 filaments, 4,434,194 triangles
 Outline: 55,225 mm2, 100.0% of its bounding box, 1 part(s)
+Floor: 2.36 mm under the joint, up from the 1.64 mm the whole map allows. Across
+       the joint the substrate is solid right up to the ground at 3.08 mm; the floor
+       keeps a layer of substrate above it and a 0.72 mm roof over every notch.
 Grid 5 x 5 = 25 pieces, 47.00 x 47.00 mm cells (1.00:1), smallest piece 1,865 mm2 (84% of a cell)
-Joint: 1.64 mm floor (7 layers), 11.28 mm narrowest knob neck, 0.2 mm gap,
+Joint: 2.36 mm floor (10 layers), 11.28 mm narrowest knob neck, 0.2 mm gap,
        0.4 mm undercut leaving 0.2 mm of lock
-Knob: 1.16 mm thick (5 layers), recessed 0.48 mm under its neighbour's surface,
+Knob: 1.88 mm thick (8 layers), recessed 0.48 mm under its neighbour's surface,
       head 1.07 x its own neck
 ...
 Plate 1 validation passed: 13 pieces, closest 0.840 mm apart
@@ -76,7 +79,8 @@ is a solid slab. Only the foundation filament reaches the plate, and
 `crossings.minimum_crossing_floor_mm` keeps every tunnel floor and colour skin
 above `base_mm`, so the bottom of the model is a flat prism of one material
 across the whole footprint. Every run re-checks that on the mesh it was given
-before it cuts anything.
+before it cuts anything. The joint itself then reaches higher wherever the ground
+it actually crosses allows; see [how deep the joint reaches](#how-deep-the-joint-reaches).
 
 The two levels are cut by different means for the same reason they look
 different. A surface mesh carries millions of triangles and a half-space split
@@ -99,7 +103,8 @@ profile, and the cut reads its bounds back out of it:
 | Narrowest printable section | `2 x min_bead_width` | Below it the slicer lays no extrusion at all, and the layer becomes an empty layer *of that piece*. See below. |
 | Knob recess | two layer heights | A knob lies *under* its neighbour's surface tier. Without a gap in Z the printer lays that surface straight onto the knob. Two layers: one of air, one for the sag of the layer bridged across it. |
 | Brim | kept only when a loop cannot fit the plate gap | A brim is laid outward from every object and clipped back from the others by `brim_object_gap`. Where an extrusion still fits in what is left, the first layer welds the plate into a tile. At a two-line-width gap it does fit, so the brim is normally dropped and the run says so. |
-| Floor plane | one layer below the lowest non-foundation geometry | The mesh states where the map's colour begins. One layer under it is the same shape of bound the generator sets itself, and keeps the cut off a colour skin's underside rather than grazing it. Measured across twenty-one generated models it lands anywhere from 1.64 to 3.08 mm, because it follows the map's own lowest ground rather than a constant. |
+| Floor plane | one layer below the lowest non-foundation geometry, then raised as far as the joint zone allows | The mesh states where the map's colour begins. One layer under it is the same shape of bound the generator sets itself, and keeps the cut off a colour skin's underside rather than grazing it. Measured across twenty-one generated models it lands anywhere from 1.64 to 3.08 mm, because it follows the map's own lowest ground rather than a constant. The joint only needs that bound where it is cut, so it is lifted there. See below. |
+| Notch roof | `crossings.structural_roof_thickness_mm` | The least map left standing over a notch once the floor is lifted: the same three-layer roof the generator holds a tunnel cover to. |
 | Outline | the cross section of the floor slab | Whatever polygon the map was cropped to, holes included, together with a check that it does not change with depth. |
 | Narrowest knob neck | `2 x wall_loops x wall line width` | Below it a knob is two walls touching rather than a solid section, so it has no strength to give. |
 | Loose-fragment threshold | `nozzle² x layer height` | One extrusion voxel — the same bound `validate_3mf` uses on the finished map, shared through `mesh_precision.minimum_printable_shell_volume_mm3`. |
@@ -289,7 +294,7 @@ face flat against the underside of the neighbour's surface, and the printer
 would lay that surface straight onto it. Every knob is therefore recessed:
 
 ```text
-Knob: 1.16 mm thick (5 layers), recessed 0.48 mm under its neighbour's surface
+Knob: 1.88 mm thick (8 layers), recessed 0.48 mm under its neighbour's surface
 ```
 
 The neighbour bridges the gap, which is a short bridge anchored on three sides
@@ -310,6 +315,48 @@ Bambu Studio. If they will not go together, raise `--clearance-mm`; if the knob
 rattles, lower it. If the head will not snap past the neck, lower
 `--tab-undercut-mm`; if the pieces pull apart, raise it. Nothing in mesh or
 slicer validation can settle this for you.
+
+## How deep the joint reaches
+
+The floor plane is first set for the whole map: one layer under its lowest
+colour, wherever that is. The joint needs that bound only where it is cut —
+the notches, the knobs lying in them and the gap around them, about a tenth of
+the map at 100 pieces — and on a real map the two can be far apart. On the
+tracked example the lowest colour is half a square millimetre of lawn in one
+corner, nowhere near a seam, while across the joint the substrate stands solid
+to 2.60 mm. Held down by that corner, a hundred-piece cut printed 1.16 mm knobs.
+
+So the run lifts the floor layer by layer, as far as two bounds judged across
+the joint zone alone allow:
+
+- a layer of substrate between the floor and the first layer that is not solid
+  substrate — a colour skin, or the void of a tunnel — which is the bound the
+  whole-map floor keeps;
+- a roof over every notch: the neighbour bridging it stays solid for
+  `crossings.structural_roof_thickness_mm` above the floor, the cover the
+  generator gives a tunnel (0.72 mm at a 0.4 mm nozzle and 0.24 mm layers).
+
+```text
+Floor: 2.36 mm under the joint, up from the 1.64 mm the whole map allows. Across
+the joint the substrate is solid to 2.6 mm and the map to 3.08 mm; the floor
+keeps a layer of substrate above it and a 0.72 mm roof over every notch.
+```
+
+On that cut both bounds land on the same layer. The knobs come out 1.88 mm
+thick instead of 1.16 mm and the notches 2.36 mm deep, for no plastic worth
+counting: a knob grows into substrate its neighbour gives up.
+
+Each layer is judged the way the slicer will print it, on the section through
+its middle. That matters on the same map: a spot on one seam, 0.7 by 0.1 mm,
+has its surface at about 3.065 mm, a hair under the 3.08 mm layer top. The
+slicer prints that layer solid, so the notch over it keeps three layers of
+roof; judged by its top edge instead, the layer would have cost the whole
+puzzle 0.24 mm of knob.
+
+The lift only ever raises the floor. Where the zone offers no room — colour just
+under a seam, low ground over a notch — the floor stays where the whole map put
+it. The outline is still measured against the whole-map floor, and
+`--floor-mm` takes a floor as it stands, with no lift.
 
 ## Spires: what a piece may not contain
 
@@ -534,8 +581,10 @@ same map. `puzzle.json` records the seed together with every derived bound, so a
 cut can be reproduced from the manifest alone.
 
 A manifest older than `schema_version` 2 records a single `clearance_mm`, to
-which that cut sized both the joint and the plate gap. Pass it as both
-`--clearance-mm` and `--plate-gap-mm` to cut the same puzzle again.
+which that cut sized both the joint and the plate gap, and a floor that was
+never lifted. Pass that `clearance_mm` as both `--clearance-mm` and
+`--plate-gap-mm`, and its `floor_mm` as `--floor-mm`, to cut the same puzzle
+again.
 
 The input's `Metadata/generation_command.json` is carried through into the
 output 3MF unchanged, so a puzzle still records the command that generated the

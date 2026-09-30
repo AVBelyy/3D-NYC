@@ -651,5 +651,106 @@ class FitTests(unittest.TestCase):
         self.assertGreater(pull, 1.0)
 
 
+class FloorTests(unittest.TestCase):
+    """The joint answers to the ground it crosses, not to the whole map.
+
+    The reported print had 1.16 mm knobs. The plane they hide below sat one
+    layer under the map's lowest colour -- half a square millimetre of lawn in
+    one corner, nowhere near a seam -- while across the joint the substrate
+    stood solid to 2.60 mm. A 40 mm tile reproduces that shape here: substrate
+    up to the ground, a lawn skin from 2.60 mm over its far half, and one speck
+    of colour reaching down to 1.88 mm. The joint zone is a strip across both
+    halves.
+    """
+
+    ZONE = box(19.0, 0.0, 21.0, 40.0)
+    ROOF = generate_puzzle.structural_roof_thickness_mm(P2S.nozzle_mm, P2S.layer_height_mm)
+
+    @staticmethod
+    def block(x0, y0, z0, x1, y1, z1):
+        import manifold3d as md
+        return md.Manifold.cube([x1 - x0, y1 - y0, z1 - z0]).translate([x0, y0, z0])
+
+    def tile(self, ground=3.08, speck=(5.0, 5.0), cavity=None):
+        x, y = speck
+        colour = self.block(0, 20, 2.60, 40, 40, ground) + self.block(x, y, 1.88, x + 1, y + 1,
+                                                                      ground)
+        substrate = self.block(0, 0, 0, 40, 40, ground) - colour
+        if cavity is not None:
+            substrate = substrate - self.block(*cavity)
+        return [substrate, colour]
+
+    def lift(self, solids):
+        floor = generate_puzzle.derive_floor(solids, 0, P2S.layer_height_mm)
+        self.assertAlmostEqual(floor, 1.64)            # one layer under the speck, as before
+        return generate_puzzle.raise_floor(solids, 0, self.ZONE, floor, P2S, self.ROOF)
+
+    def test_colour_away_from_the_joint_does_not_hold_the_floor_down(self):
+        floor, substrate, solid = self.lift(self.tile())
+        self.assertAlmostEqual(substrate, 2.60)
+        self.assertAlmostEqual(solid, 3.08)
+        # One layer of substrate under the skin, and the roof under the ground,
+        # both land on the same layer: the knob gains three layers.
+        self.assertAlmostEqual(floor, 2.36)
+
+    def test_colour_inside_the_joint_still_does(self):
+        """The symmetric case: the same speck under a seam keeps the floor
+        where the whole map put it."""
+        floor, substrate, _ = self.lift(self.tile(speck=(19.5, 5.0)))
+        self.assertAlmostEqual(substrate, 1.88)
+        self.assertAlmostEqual(floor, 1.64)
+
+    def test_low_ground_over_the_joint_keeps_every_notch_a_roof(self):
+        floor, _, solid = self.lift(self.tile(ground=2.84))
+        self.assertAlmostEqual(solid, 2.84)
+        self.assertAlmostEqual(floor, 2.12)
+        self.assertGreaterEqual(solid - floor, self.ROOF - 1e-9)
+
+    def test_a_tunnel_under_the_joint_keeps_its_roof_too(self):
+        """A void is not substrate either, and the ground a roof answers to
+        includes the floor of a tunnel running through the zone."""
+        floor, substrate, solid = self.lift(self.tile(cavity=(19.5, 8.0, 2.60, 20.5, 12.0,
+                                                              2.84)))
+        self.assertAlmostEqual(solid, 2.60)
+        self.assertAlmostEqual(floor, 1.88)
+        self.assertGreaterEqual(solid - floor, self.ROOF - 1e-9)
+
+    def test_ground_a_hair_under_a_layer_top_is_still_that_layer(self):
+        """The tracked example has a spot on a seam whose surface sits at about
+        3.065 mm. The slicer takes the layer below 3.08 mm through its middle,
+        prints it solid, and the notch keeps its three layers of roof; judging
+        the layer by its top edge instead cost the whole puzzle a layer."""
+        floor, _, solid = self.lift(self.tile(cavity=(19.5, 8.0, 3.065, 20.5, 12.0, 3.08)))
+        self.assertAlmostEqual(solid, 3.08)
+        self.assertAlmostEqual(floor, 2.36)
+
+    def test_a_dip_past_the_middle_of_a_layer_is_not(self):
+        """The symmetric case: ground that reaches below the plane the slicer
+        cuts that layer on is missing from it, and the roof counts one less."""
+        floor, _, solid = self.lift(self.tile(cavity=(19.5, 8.0, 2.90, 20.5, 12.0, 3.08)))
+        self.assertAlmostEqual(solid, 2.84)
+        self.assertAlmostEqual(floor, 2.12)
+
+    def test_the_floor_is_never_lowered(self):
+        """A lift that finds no room degrades to the whole map's floor rather
+        than below it, even where the roof rule could not be met there."""
+        floor, _, _ = self.lift(self.tile(cavity=(19.5, 8.0, 2.12, 20.5, 12.0, 2.36)))
+        self.assertAlmostEqual(floor, 1.64)
+
+    def test_the_zone_is_the_joint_and_nothing_a_piece_stands_straight_on(self):
+        layout, _, polygons = square_cut(25)
+        seats = seat_polygons(layout, (0.0, 0.0), 0.0)
+        outline = box(0.0, 0.0, layout.grid.width, layout.grid.height)
+        zone = generate_puzzle.joint_zone(polygons, seats, outline)
+        straight = 0.0
+        for polygon, seat in zip(polygons, seats):
+            own = polygon.intersection(seat)
+            straight += own.area
+            self.assertLess(zone.intersection(own).area, 1e-6)
+            # Every knob lies in the zone, under the neighbour it reaches into.
+            self.assertLess(polygon.difference(seat).difference(zone).area, 1e-6)
+        self.assertAlmostEqual(zone.area, outline.area - straight, places=3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -70,6 +70,7 @@ from shapely.ops import polygonize, unary_union
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from cache_common import Progress  # noqa: E402
+from crossings import structural_roof_thickness_mm  # noqa: E402
 from mesh_precision import (classify_cavity_shells,  # noqa: E402
                             classify_positive_shells,
                             minimum_printable_shell_volume_mm3, prepare_export_mesh)
@@ -1069,7 +1070,10 @@ def derive_floor(solids, foundation: int, layer_height_mm: float) -> float:
 
     The result is a derived floor, not the generator's own: it lands wherever
     the map's lowest colour happens to be, and is usually close to ``base_mm``.
-    ``--floor-mm`` overrides it for a map whose base is known.
+    It holds across the whole map, which is what the outline is measured
+    against; the joint itself is cut against `raise_floor`, which lifts it as
+    far as the ground the joint actually crosses allows. ``--floor-mm``
+    overrides both for a map whose base is known.
     """
     others = [solid.bounding_box()[2] for index, solid in enumerate(solids)
               if index != foundation and not solid.is_empty()]
@@ -1159,6 +1163,79 @@ def validate_floor(solids, floor_mm: float, foundation: int):
                 f"Material {index} reaches down to z={low:g} mm, below the {floor_mm:g} mm floor; "
                 f"pass --floor-mm {low:g} or smaller")
     return measure_footprint(solids[foundation], floor_mm)
+
+
+def joint_zone(polygons, seats, footprint):
+    """Where a piece is cut differently above the floor plane and below it.
+
+    Everywhere else a piece is one straight prism from the plate to its
+    surface: its own floor under its own seat.  What is left of the map is the
+    joint itself -- every notch, the knob lying in it and the gap around them --
+    and it is the only ground the floor plane has to answer for.
+    """
+    straight = unary_union([polygon.intersection(seat) for polygon, seat in zip(polygons, seats)])
+    return footprint.difference(straight)
+
+
+def raise_floor(solids, foundation: int, zone, floor_mm: float, profile: PrintProfile,
+                roof_mm: float):
+    """Lift the floor plane as far as the joint zone allows, never below ``floor_mm``.
+
+    `derive_floor` answers for the whole map: one layer below its lowest colour,
+    wherever that is.  The joint only needs the zone it is cut through, and on
+    the tracked example the two are far apart: the map's lowest colour is half
+    a square millimetre of lawn in one corner, nowhere near a seam, while across
+    the zone the substrate stands solid to 2.60 mm.  Cut against the whole map
+    a hundred-piece knob is 1.16 mm thick; cut against the zone it is 1.88 mm.
+
+    Two bounds hold the lift, both judged across the zone alone.  The floor
+    stays one layer below the first layer that is not solid substrate, the same
+    shape of bound `derive_floor` sets against colour, and it covers the void
+    of a tunnel as well as a skin.  And every notch keeps its roof: the
+    neighbour bridging it must stay solid for ``roof_mm`` above the floor, the
+    structural roof the generator holds a tunnel cover to.
+
+    Each layer is judged the way the slicer will print it, on the section
+    through its middle -- the plane `unprintable_ceiling` measures on too --
+    ignoring anything narrower than the placement tolerance.  Colour that dips
+    below that plane unseen can reach at most half a layer lower, and the layer
+    of substrate kept under it covers that.  A Boolean against the zone's prism
+    would be exact in principle, but at the map's edge its walls meet the
+    tile's own and shed slivers that read as colour or air.
+
+    Returns the floor, and the heights at which the zone stops being solid
+    substrate and stops being solid at all; the second is None when the roof
+    did not come into it.
+    """
+    layer = profile.layer_height_mm
+    if zone.is_empty or layer <= 0:
+        return floor_mm, None, None
+    base = int(round((floor_mm - profile.initial_layer_height_mm) / layer))
+    if base < 0 or abs(profile.layer_top_mm(base) - floor_mm) > PLACEMENT_TOLERANCE_MM:
+        return floor_mm, None, None
+    roof_layers = int(math.ceil(roof_mm / layer - 1e-9))
+    top = max(float(solid.bounding_box()[5]) for solid in solids)
+
+    def exposed(index, parts):
+        """Whether ``parts`` leave any of the zone uncovered in layer ``index``."""
+        plane = profile.layer_top_mm(index) - layer / 2
+        covered = unary_union([section_polygon(part.slice(plane), allow_empty=True)
+                               for part in parts])
+        rest = zone.difference(covered)
+        return not rest.is_empty and not rest.buffer(-PLACEMENT_TOLERANCE_MM).is_empty
+
+    substrate = base + 1
+    while (profile.layer_top_mm(substrate) - layer < top
+           and not exposed(substrate, [solids[foundation]])):
+        substrate += 1
+    ground = next((index for index in range(substrate, substrate + roof_layers)
+                   if exposed(index, solids)), None)
+    ceiling = substrate - 2
+    if ground is not None:
+        ceiling = min(ceiling, ground - 1 - roof_layers)
+    floor = profile.layer_top_mm(ceiling) if ceiling > base else floor_mm
+    return (floor, profile.layer_top_mm(substrate) - layer,
+            None if ground is None else profile.layer_top_mm(ground) - layer)
 
 
 def split_cells(solid, grid: Grid, origin):
@@ -2015,8 +2092,9 @@ def build_parser():
                         help="Margin kept clear inside the plate; the project's brim width plus "
                              "its object gap when omitted")
     parser.add_argument("--floor-mm", type=float,
-                        help="Plane the puzzle joint hides below; one layer beneath the lowest "
-                             "colour skin in the model when omitted")
+                        help="Plane the puzzle joint hides below. When omitted: one layer beneath "
+                             "the lowest colour in the model, then raised as far as the ground the "
+                             "joint crosses allows. A value given here is used as it stands")
     parser.add_argument("--knob-recess-mm", type=float,
                         help="Vertical gap between a knob and the neighbour's surface above it; "
                              "two layer heights when omitted")
@@ -2222,14 +2300,6 @@ def main(argv=None):
 
     crumb_mm3 = profile.crumb_mm3
     samples = profile.knob_samples(neck_mm)
-    recess = (profile.vertical_clearance_mm if args.knob_recess_mm is None
-              else args.knob_recess_mm)
-    knob_thickness = floor - recess
-    if knob_thickness < 2 * profile.layer_height_mm:
-        raise PuzzleError(
-            f"A {floor:.3g} mm floor less {recess:g} mm of vertical clearance leaves a "
-            f"{knob_thickness:.3g} mm knob, under two {profile.layer_height_mm:g} mm layers. "
-            "Lower --knob-recess-mm, or raise --floor-mm if you know this map's base.")
 
     spread_w, spread_h = plate_extent(layout, width, height, spacing)
     if spread_w > usable_w + 1e-6 or spread_h > usable_h + 1e-6:
@@ -2255,6 +2325,33 @@ def main(argv=None):
     labels = [piece_label(row, col) for row, col in layout.seeds]
     merged = sum(1 for group in layout.groups if len(group) > 1)
     smallest = min(polygon.area for polygon in polygons)
+
+    # The outline was measured against the whole map's floor. The joint is cut
+    # against the ground it actually crosses, which is usually higher, and a
+    # floor the user gave is taken as it stands.
+    map_floor = floor
+    roof = structural_roof_thickness_mm(profile.nozzle_mm, profile.layer_height_mm)
+    if args.floor_mm is None:
+        floor, substrate_top, solid_top = raise_floor(
+            solids, foundation, joint_zone(placed, seats, footprint), map_floor, profile, roof)
+        if floor > map_floor + 1e-9:
+            if solid_top is not None and abs(solid_top - substrate_top) < 1e-9:
+                across = f"right up to the ground at {substrate_top:.3g} mm"
+            else:
+                across = f"to {substrate_top:.3g} mm" + (
+                    f" and the map to {solid_top:.3g} mm" if solid_top is not None else "")
+            print(f"Floor: {floor:.3g} mm under the joint, up from the {map_floor:.3g} mm the whole "
+                  f"map allows. Across the joint the substrate is solid {across}; the floor keeps "
+                  f"a layer of substrate above it and a {roof:g} mm roof over every notch.",
+                  flush=True)
+    recess = (profile.vertical_clearance_mm if args.knob_recess_mm is None
+              else args.knob_recess_mm)
+    knob_thickness = floor - recess
+    if knob_thickness < 2 * profile.layer_height_mm:
+        raise PuzzleError(
+            f"A {floor:.3g} mm floor less {recess:g} mm of vertical clearance leaves a "
+            f"{knob_thickness:.3g} mm knob, under two {profile.layer_height_mm:g} mm layers. "
+            "Lower --knob-recess-mm, or raise --floor-mm if you know this map's base.")
 
     print(f"Grid {grid.rows} x {grid.cols} = {layout.pieces} pieces, "
           f"{grid.cell_width:.2f} x {grid.cell_height:.2f} mm cells ({grid.aspect:.2f}:1), "
@@ -2293,6 +2390,8 @@ def main(argv=None):
         "piece_mm": [grid.cell_width, grid.cell_height],
         "piece_aspect": grid.aspect,
         "floor_mm": floor,
+        "map_floor_mm": map_floor,
+        "notch_roof_mm": roof,
         "clearance_mm": clearance,
         "plate_gap_mm": plate_gap,
         "surface_kerf_mm": surface_kerf,
