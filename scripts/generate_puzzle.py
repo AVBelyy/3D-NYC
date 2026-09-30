@@ -1396,6 +1396,79 @@ def plate_extent(layout: Layout, width: float, height: float, spacing_mm: float)
             height + (layout.grid.rows - 1) * spacing_mm)
 
 
+def fit_test_block(layout: Layout, rows: int, cols: int) -> list[int]:
+    """The pieces of a ``rows x cols`` block of cells from the middle of the grid.
+
+    The middle rather than a corner so that the block is made of ordinary
+    pieces, knobs and notches on every side, and so that its centre piece is
+    surrounded: the last piece of a puzzle goes into a slot its neighbours have
+    already closed, and that is the fit worth trying first.  A piece counts
+    only if every cell of it lies inside the block.
+    """
+    grid = layout.grid
+    if rows < 1 or cols < 1 or rows > grid.rows or cols > grid.cols:
+        raise PuzzleError(
+            f"A {rows} x {cols} fit test does not fit a {grid.rows} x {grid.cols} grid")
+    top, left = (grid.rows - rows) // 2, (grid.cols - cols) // 2
+    chosen = [index for index, group in enumerate(layout.groups)
+              if all(top <= row < top + rows and left <= col < left + cols for row, col in group)]
+    if len(chosen) < 2:
+        raise PuzzleError(
+            f"The {rows} x {cols} block in the middle of the grid holds {len(chosen)} whole "
+            "piece(s), too few to try a joint on; ask for a larger --fit-test")
+    return chosen
+
+
+def fit_test_offsets(chosen, colouring, footprints, offsets, gap_mm: float, centre):
+    """Lay a block of pieces out on one plate, each colour as its own plate prints it.
+
+    Within a colour nothing changes: the pieces keep the offsets their own plate
+    gives them, so none of them meets an interlocking neighbour and diagonal
+    corners stay the plate gap apart, exactly as in the full print.  The colours
+    are then set side by side, the plate gap apart at their closest, and the
+    whole arrangement is centred where the map itself was.
+
+    ``footprints`` is what each piece covers seen from above -- its own surface
+    and the knobs it reaches under its neighbours.  Returns the offset of each
+    chosen piece and the extent of the arrangement.
+    """
+    placed = {}
+    cursor = None
+    for colour in sorted({colouring[index] for index in chosen}):
+        members = [index for index in chosen if colouring[index] == colour]
+        low_x, _, high_x, _ = unary_union([shapely.affinity.translate(footprints[index],
+                                                                      *offsets[index])
+                                           for index in members]).bounds
+        shift = 0.0 if cursor is None else cursor - low_x
+        for index in members:
+            placed[index] = (offsets[index][0] + shift, offsets[index][1])
+        cursor = high_x + shift + gap_mm
+    bounds = unary_union([shapely.affinity.translate(footprints[index], *placed[index])
+                          for index in chosen]).bounds
+    dx = centre[0] - (bounds[0] + bounds[2]) / 2
+    dy = centre[1] - (bounds[1] + bounds[3]) / 2
+    return ({index: (x + dx, y + dy) for index, (x, y) in placed.items()},
+            (bounds[2] - bounds[0], bounds[3] - bounds[1]))
+
+
+def substrate_only(solids, height_mm: float, crumb_mm3: float):
+    """One piece's filaments, cut off at ``height_mm`` and merged into one solid.
+
+    A fit test tries the joint and nothing else, and the joint is all
+    substrate: everything above the notch roofs, and every colour below them,
+    is filament and time that tell the hand nothing about the fit.  Returns the
+    merged solid and how many negligible shells the cut shed.
+    """
+    import manifold3d as md
+    kept = [solid.trim_by_plane([0.0, 0.0, -1.0], -height_mm) for solid in solids]
+    kept = [solid for solid in kept if not solid.is_empty()]
+    if not kept:
+        return md.Manifold(), 0
+    merged = kept[0] if len(kept) == 1 else md.Manifold.batch_boolean(kept, md.OpType.Add)
+    merged, dropped, _ = drop_negligible_shells(merged, crumb_mm3)
+    return merged, dropped
+
+
 def offset_transform(base: str, dx: float, dy: float) -> str:
     """A 3MF item transform, moved on the plate by (dx, dy).
 
@@ -2144,6 +2217,15 @@ def build_parser():
                              "a map, piece by piece")
     parser.add_argument("--dry-run", action="store_true",
                         help="Plan the cut, write the preview and manifest, and cut no meshes")
+    parser.add_argument("--fit-test", type=parse_grid, metavar="ROWSxCOLS",
+                        help="Instead of the puzzle, write one small plate to try its joints "
+                             "on: the ROWSxCOLS block of pieces from the middle of the grid, "
+                             "cut exactly as the puzzle cuts them, trimmed to "
+                             "--fit-test-height-mm and printed in the substrate's filament "
+                             "alone. The puzzle's own files are left as they are")
+    parser.add_argument("--fit-test-height-mm", type=float,
+                        help="Height a fit test is trimmed at; the floor plus a notch roof "
+                             "when omitted, the least that still roofs every notch")
     return parser
 
 
@@ -2414,9 +2496,49 @@ def main(argv=None):
         "labels": labels,
     }
 
+    # A fit test is the same cut, of fewer pieces: the same grid, seed, curves
+    # and floor, so its joints are the puzzle's own joints.
+    chosen = None
+    manifest = directory / "puzzle.json"
+    if args.fit_test:
+        chosen = fit_test_block(layout, *args.fit_test)
+        test_height = (floor + roof if args.fit_test_height_mm is None
+                       else args.fit_test_height_mm)
+        if test_height <= floor + 1e-9:
+            raise PuzzleError(
+                f"A fit test trimmed at {test_height:g} mm leaves nothing over the notches, "
+                f"which reach up to the {floor:.3g} mm floor, and a knob has to lie under its "
+                f"neighbour for the test to mean anything. Trim at {floor + roof:.3g} mm or "
+                "higher.")
+        if test_height < floor + roof - 1e-9:
+            print(f"warning: trimmed at {test_height:g} mm, the notches keep a "
+                  f"{test_height - floor:.3g} mm roof, under the {roof:g} mm the puzzle "
+                  "itself leaves them; the test will flex more than the puzzle does.",
+                  flush=True)
+        test_offsets, (test_w, test_h) = fit_test_offsets(
+            chosen, colouring, [polygon.union(seat) for polygon, seat in zip(placed, seats)],
+            offsets, plate_gap, ((low[0] + high[0]) / 2, (low[1] + high[1]) / 2))
+        if test_w > usable_w + 1e-6 or test_h > usable_h + 1e-6:
+            raise PuzzleError(
+                f"A {args.fit_test[0]} x {args.fit_test[1]} fit test spreads to {test_w:.1f} x "
+                f"{test_h:.1f} mm, past the plate's {usable_w:g} x {usable_h:g} mm usable; ask "
+                "for a smaller block.")
+        test_name = f"fit_test_{clearance:.2f}mm"
+        manifest = directory / f"{test_name}.json"
+        groups = [(colour, sum(1 for index in chosen if colouring[index] == colour))
+                  for colour in sorted({colouring[index] for index in chosen})]
+        plan["fit_test"] = {"rows": args.fit_test[0], "cols": args.fit_test[1],
+                            "labels": [labels[index] for index in chosen],
+                            "height_mm": test_height, "extent_mm": [test_w, test_h]}
+        print(f"Fit test: {len(chosen)} pieces, {labels[chosen[0]]} to {labels[chosen[-1]]}, "
+              f"trimmed at {test_height:.3g} mm in the substrate's filament alone, on one "
+              f"{test_w:.1f} x {test_h:.1f} mm plate: "
+              + " beside ".join(f"the {count} of plate {colour + 1}" for colour, count in groups)
+              + ", each as its own plate prints them.", flush=True)
+
     directory.mkdir(parents=True, exist_ok=True)
     basemap = None
-    if args.preview:
+    if args.preview and chosen is None:
         basemap = render_basemap(solids, source.colors, low, high, args.preview_px_per_mm)
         write_preview(directory / "preview.svg", grid, placed, low, basemap)
         print(f"Preview {directory / 'preview.svg'} "
@@ -2424,8 +2546,8 @@ def main(argv=None):
               flush=True)
 
     if args.dry_run:
-        write_manifest(directory / "puzzle.json", plan)
-        print(f"Plan {directory / 'puzzle.json'}", flush=True)
+        write_manifest(manifest, plan)
+        print(f"Plan {manifest}", flush=True)
         print(json.dumps({k: v for k, v in plan.items() if k != "labels"}, indent=2), flush=True)
         return 0
 
@@ -2461,8 +2583,11 @@ def main(argv=None):
     pieces = []
     discarded = 0
     shaved = []
-    progress = Progress("Cutting pieces", total=layout.pieces, unit="pieces")
+    wanted = set(range(layout.pieces) if chosen is None else chosen)
+    progress = Progress("Cutting pieces", total=len(wanted), unit="pieces")
     for index, group in enumerate(layout.groups):
+        if index not in wanted:
+            continue
         built = []
         for material in sorted(surfaces):
             parts = [cells[material][row][col] for row, col in group]
@@ -2490,6 +2615,13 @@ def main(argv=None):
             built.append((material, solid))
         if not built:
             raise PuzzleError(f"Piece {labels[index]} is empty")
+        if chosen is not None:
+            merged, dropped = substrate_only([solid for _, solid in built], test_height,
+                                             crumb_mm3)
+            discarded += dropped
+            if merged.is_empty():
+                raise PuzzleError(f"Piece {labels[index]} holds nothing below {test_height:g} mm")
+            built = [(foundation, merged)]
         # A spire too fine for the slicer to lay a bead into is an empty layer
         # of this object, and Bambu will not print an object that has one.
         ceiling = unprintable_ceiling([solid for _, solid in built], floor, profile)
@@ -2530,7 +2662,7 @@ def main(argv=None):
                 "elevated road or a bridge can leave its deck floating; try a different "
                 "--seed, --pieces or --grid.")
         pieces.append({"index": index, "name": f"Piece {labels[index]}", "meshes": meshes})
-        progress.update(index + 1, detail=labels[index])
+        progress.update(len(pieces), detail=labels[index])
     progress.close()
 
     plan["piece_triangles"] = [sum(len(mesh.faces) for _, mesh in piece["meshes"])
@@ -2546,6 +2678,45 @@ def main(argv=None):
               f"(piece {worst}): below {profile.minimum_printable_width_mm:.2f} mm across, the "
               "slicer lays no extrusion and the layer would be an empty one of that object.",
               flush=True)
+    def audit(output, on_plate, mesh_ids, placements):
+        """The 3MF just written, read back and judged by `validate_puzzle`."""
+        expected = {
+            "mesh_ids": list(mesh_ids.values()),
+            "owner": {identifier: key for key, identifier in mesh_ids.items()},
+            "counts": {mesh_ids[(piece["index"], material)]:
+                       (len(mesh.vertices), len(mesh.faces))
+                       for piece in on_plate for material, mesh in piece["meshes"]},
+            "by_piece": {piece["index"]: [mesh_ids[(piece["index"], material)]
+                                          for material, _ in piece["meshes"]]
+                         for piece in on_plate},
+            "indices": [piece["index"] for piece in on_plate],
+            "crumb_mm3": crumb_mm3,
+            "nozzle_mm": profile.nozzle_mm,
+            "layer_height_mm": profile.layer_height_mm,
+            "floor_mm": floor,
+        }
+        return validate_puzzle(output, source, expected, footprint, offsets=placements,
+                               plate_gap_mm=plate_gap, vertical_clearance_mm=recess,
+                               layout=layout, labels=labels, solids=solids)
+
+    if chosen is not None:
+        output = directory / f"{puzzle_id}_{test_name}.3mf"
+        mesh_ids = write_project(output, source, pieces, layout, plan, project,
+                                 offsets=test_offsets)
+        triangles = sum(len(mesh.faces) for piece in pieces for _, mesh in piece["meshes"])
+        print(f"{output} {output.stat().st_size:,} bytes, {len(pieces)} pieces, "
+              f"{triangles:,} triangles ({time.time() - started:.0f}s)", flush=True)
+        plan["fit_test"].update(model=str(output), triangles=triangles)
+        if args.validate:
+            validation = audit(output, pieces, mesh_ids, test_offsets)
+            write_manifest(directory / f"validation_{test_name}.json", validation)
+            print(f"Fit test validation passed: {len(pieces)} pieces, closest "
+                  f"{validation['minimum_neighbour_gap_mm']:.3f} mm apart "
+                  f"({time.time() - started:.0f}s)", flush=True)
+            plan["fit_test"]["minimum_neighbour_gap_mm"] = validation["minimum_neighbour_gap_mm"]
+        write_manifest(manifest, plan)
+        return 0
+
     thumbnail = (plate_thumbnail(basemap, grid, placed, low) if basemap is not None
                  else source.thumbnail)
     plan["plates"] = []
@@ -2562,24 +2733,7 @@ def main(argv=None):
                   "triangles": triangles}
 
         if args.validate:
-            expected = {
-                "mesh_ids": list(mesh_ids.values()),
-                "owner": {identifier: key for key, identifier in mesh_ids.items()},
-                "counts": {mesh_ids[(piece["index"], material)]:
-                           (len(mesh.vertices), len(mesh.faces))
-                           for piece in on_plate for material, mesh in piece["meshes"]},
-                "by_piece": {piece["index"]: [mesh_ids[(piece["index"], material)]
-                                              for material, _ in piece["meshes"]]
-                             for piece in on_plate},
-                "indices": [piece["index"] for piece in on_plate],
-                "crumb_mm3": crumb_mm3,
-                "nozzle_mm": profile.nozzle_mm,
-                "layer_height_mm": profile.layer_height_mm,
-                "floor_mm": floor,
-            }
-            validation = validate_puzzle(output, source, expected, footprint, offsets=offsets,
-                                         plate_gap_mm=plate_gap, vertical_clearance_mm=recess,
-                                         layout=layout, labels=labels, solids=solids)
+            validation = audit(output, on_plate, mesh_ids, offsets)
             write_manifest(directory / f"validation_plate{plate + 1}.json", validation)
             print(f"Plate {plate + 1} validation passed: {len(on_plate)} pieces, closest "
                   f"{validation['minimum_neighbour_gap_mm']:.3f} mm apart "
@@ -2587,7 +2741,7 @@ def main(argv=None):
             record["minimum_neighbour_gap_mm"] = validation["minimum_neighbour_gap_mm"]
         plan["plates"].append(record)
 
-    write_manifest(directory / "puzzle.json", plan)
+    write_manifest(manifest, plan)
     return 0
 
 

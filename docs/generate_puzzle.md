@@ -308,13 +308,12 @@ assumed — `generate_puzzle.knob_interference` reads the number off the sampled
 polyline.
 
 A printed piece is far stiffer than cardboard, and a knob has to enter its notch
-sideways because the map above the notch roofs it over. **Print one pair of
-neighbouring pieces and try the fit before committing both plates** — one piece
-from each, since neighbours never share a plate; delete the other objects in
-Bambu Studio. If they will not go together, raise `--clearance-mm`; if the knob
-rattles, lower it. If the head will not snap past the neck, lower
-`--tab-undercut-mm`; if the pieces pull apart, raise it. Nothing in mesh or
-slicer validation can settle this for you.
+sideways because the map above the notch roofs it over. **Try the fit before
+committing both plates**: [`--fit-test`](#try-the-fit-before-the-puzzle) prints
+a small block of the puzzle's own pieces on one plate. If they will not go
+together, raise `--clearance-mm`; if the knob rattles, lower it. If the head
+will not snap past the neck, lower `--tab-undercut-mm`; if the pieces pull
+apart, raise it. Nothing in mesh or slicer validation can settle this for you.
 
 ## How deep the joint reaches
 
@@ -357,6 +356,60 @@ The lift only ever raises the floor. Where the zone offers no room — colour ju
 under a seam, low ground over a notch — the floor stays where the whole map put
 it. The outline is still measured against the whole-map floor, and
 `--floor-mm` takes a floor as it stands, with no lift.
+
+## Try the fit before the puzzle
+
+A full puzzle is two plates and most of a day of printing, and the fit it
+depends on can only be judged by hand. `--fit-test` cuts a small block of the
+same puzzle instead:
+
+```bash
+.venv/bin/python scripts/generate_puzzle.py output/models/34_w_76_235.3mf --pieces 100 --fit-test 3x3
+```
+
+```text
+Fit test: 9 pieces, D4 to F6, trimmed at 3.08 mm in the substrate's filament alone,
+          on one 154.1 x 76.4 mm plate: the 5 of plate 1 beside the 4 of plate 2,
+          each as its own plate prints them.
+...
+Fit test validation passed: 9 pieces, closest 0.840 mm apart
+```
+
+The block comes from the middle of the grid, and its pieces are cut exactly as
+the full run cuts them — the same grid, seed, curves, clearance and floor — so
+its knobs and notches are the puzzle's own. Only what the joint does not need
+goes: every piece is trimmed at `--fit-test-height-mm`, by default the floor
+plus a notch roof, the least that still roofs every notch, and what is left is
+merged into the substrate's filament. The run refuses a height that leaves the
+notches open and warns below the full roof.
+
+Both colours share the one plate. Each keeps the arrangement its own plate
+would give it, so no piece meets an interlocking neighbour and diagonal corners
+stay the plate gap apart; the two are then set side by side, the plate gap apart
+at their closest. The centre piece has a neighbour on every side, the slot the
+last piece of a puzzle goes into.
+
+The test is written into the puzzle's own directory, and the puzzle's own files
+are left as they are:
+
+| File | Contents |
+| --- | --- |
+| `34_w_76_235_100_fit_test_0.20mm.3mf` | the test plate, named for the clearance it was cut to |
+| `fit_test_0.20mm.json` | the plan, with the block, the trim height and the plate extent |
+| `validation_fit_test_0.20mm.json` | the audit of the written 3MF |
+
+Rerun with another `--clearance-mm` to compare fits; each clearance writes its
+own files. A trimmed piece is thinner than the real one, so its notch flexes a
+little more and a sideways snap feels easier than it will in the puzzle. The fit
+itself, a rattle or a bind, is the same.
+
+To get the sliced file that prints without reslicing, run the print-stats script
+on the test plate. It writes `<model>.gcode.3mf` beside the model and reports the
+filament and the time:
+
+```bash
+.venv/bin/python scripts/compute_print_stats.py output/puzzles/34_w_76_235_100/34_w_76_235_100_fit_test_0.20mm.3mf
+```
 
 ## Spires: what a piece may not contain
 

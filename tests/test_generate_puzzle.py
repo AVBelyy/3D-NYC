@@ -442,6 +442,46 @@ class PlateTests(unittest.TestCase):
                       if plates[a] == plates[b])
         self.assertAlmostEqual(closest, P2S.plate_gap_mm, delta=1e-6)
 
+    def fit_test(self, rows=3, cols=3):
+        layout, _, floors = square_cut(100, samples=None)
+        seats = seat_polygons(layout, (0.0, 0.0), 0.0)
+        footprints = [floor.union(seat) for floor, seat in zip(floors, seats)]
+        plates = plate_colouring(layout)
+        steps = plate_offsets(layout, P2S.plate_gap_mm / math.sqrt(2))
+        chosen = generate_puzzle.fit_test_block(layout, rows, cols)
+        offsets, extent = generate_puzzle.fit_test_offsets(
+            chosen, plates, footprints, steps, P2S.plate_gap_mm, (117.5, 117.5))
+        return layout, chosen, footprints, plates, steps, offsets, extent
+
+    def test_a_fit_test_is_the_block_in_the_middle_of_the_grid(self):
+        layout, chosen, *_ = self.fit_test()
+        self.assertEqual([piece_label(*layout.seeds[index]) for index in chosen],
+                         ["D4", "E4", "F4", "D5", "E5", "F5", "D6", "E6", "F6"])
+        with self.assertRaises(PuzzleError):
+            generate_puzzle.fit_test_block(layout, 11, 3)
+
+    def test_a_fit_test_prints_on_one_plate_each_colour_as_its_own_plate_would(self):
+        """Both colours share the plate, and no two pieces come closer than the
+        plate gap -- not two of one colour, which keep the offsets their own
+        plate gives them, and not two across the colours, set side by side."""
+        _, chosen, footprints, plates, steps, offsets, extent = self.fit_test()
+        placed = {index: shapely.affinity.translate(footprints[index], *offsets[index])
+                  for index in chosen}
+        closest = min(placed[a].distance(placed[b])
+                      for a in chosen for b in chosen if a < b)
+        self.assertAlmostEqual(closest, P2S.plate_gap_mm, delta=1e-6)
+        for a in chosen:
+            for b in chosen:
+                if a < b and plates[a] == plates[b]:
+                    for axis in (0, 1):
+                        self.assertAlmostEqual(offsets[a][axis] - offsets[b][axis],
+                                               steps[a][axis] - steps[b][axis])
+        bounds = shapely.union_all(list(placed.values())).bounds
+        self.assertAlmostEqual((bounds[0] + bounds[2]) / 2, 117.5)
+        self.assertAlmostEqual((bounds[1] + bounds[3]) / 2, 117.5)
+        self.assertAlmostEqual(extent[0], bounds[2] - bounds[0])
+        self.assertLess(extent[0], 256.0)
+
     def test_the_plate_grows_by_one_step_a_seam_and_the_map_does_not(self):
         layout = choose_layout(self.square(), 235.0, 235.0, 100, 1.6, 0.35)
         spacing = P2S.plate_gap_mm / math.sqrt(2)
@@ -736,6 +776,17 @@ class FloorTests(unittest.TestCase):
         than below it, even where the roof rule could not be met there."""
         floor, _, _ = self.lift(self.tile(cavity=(19.5, 8.0, 2.12, 20.5, 12.0, 2.36)))
         self.assertAlmostEqual(floor, 1.64)
+
+    def test_a_fit_test_keeps_the_substrate_and_nothing_above_it(self):
+        """Everything below the trim height becomes one solid of one filament --
+        the lawn skin included -- and nothing above it survives: not the skin's
+        upper part, not a building standing on the tile."""
+        substrate, colour = self.tile()
+        building = self.block(10, 25, 3.08, 14, 29, 12.0)
+        solid, _ = generate_puzzle.substrate_only([substrate, colour, building], 2.84, 1e-3)
+        self.assertEqual(len(solid.decompose()), 1)
+        self.assertAlmostEqual(solid.bounding_box()[5], 2.84)
+        self.assertAlmostEqual(solid.volume(), 40 * 40 * 2.84, places=3)
 
     def test_the_zone_is_the_joint_and_nothing_a_piece_stands_straight_on(self):
         layout, _, polygons = square_cut(25)
