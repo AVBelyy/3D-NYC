@@ -8,6 +8,12 @@ EXTRUSION=re.compile(r'(?:^|\s)E([-+]?(?:\d+(?:\.\d*)?|\.\d+))(?=\s|$)')
 GEOMETRY=re.compile(r'^3D/(Objects/|_rels/)')
 SLICER=Path('/Applications/BambuStudio.app/Contents/MacOS/BambuStudio')
 SLICE_ERROR_LINES=6                     # distinct [error] lines kept from a failed log
+SLICED_SUFFIX='.gcode.3mf'
+
+
+def sliced_path(model):
+    """The sliced project belongs beside the model it was sliced from."""
+    return model.with_suffix(SLICED_SUFFIX)
 
 
 def printer_model_id(printer_model,slicer=SLICER):
@@ -89,7 +95,7 @@ def run_slice(model,output,slicer=SLICER,export_project=False,announce=True):
         '--debug','3','--arrange','0','--orient','0','--slice','1',
         '--mtcpp','10000000','--mstpp','7200','--outputdir',str(output)]
     # --export-3mf is resolved under --outputdir, so an absolute path here yields a bad concatenation.
-    if export_project:command+=['--export-3mf',f'{model.stem}.gcode.3mf']
+    if export_project:command+=['--export-3mf',f'{model.stem}{SLICED_SUFFIX}']
     command.append(str(model.resolve()))
     with model.open('rb') as f:sha=hashlib.file_digest(f,'sha256').hexdigest()
     record={'command':command,'input':str(model.resolve()),'input_sha256':sha,
@@ -105,7 +111,7 @@ def run_slice(model,output,slicer=SLICER,export_project=False,announce=True):
         finished=datetime.datetime.now().astimezone().isoformat(),
         result='completed' if result.returncode==0 else 'failed')
     if result.returncode:record['diagnosis']=slice_failure(output)
-    exported=output/f'{model.stem}.gcode.3mf'
+    exported=output/f'{model.stem}{SLICED_SUFFIX}'
     if export_project and result.returncode==0 and exported.exists():
         record['sliced_file']=str(as_sliced_file(exported,slicer))
     write_json(output/'run.json',record)
@@ -147,7 +153,7 @@ def main():
     parser.add_argument('--slicer',type=Path,default=SLICER)
     parser.add_argument('--name',default='slice_'+datetime.datetime.now().strftime('%Y%m%dT%H%M%S'))
     parser.add_argument('--replace',action='store_true',help='Replace an existing derived slice directory')
-    parser.add_argument('--export-project',action='store_true',help='Also write <model>.gcode.3mf, a sliced project that Bambu Studio opens ready to print')
+    parser.add_argument('--export-project',action='store_true',help='Also write <model>.gcode.3mf beside the model, a sliced project that Bambu Studio opens ready to print')
     args=parser.parse_args()
     output=VALID/args.name
     if output.exists() and args.replace:shutil.rmtree(output)
@@ -157,6 +163,13 @@ def main():
         try:record['support_audit']=audit_sliced_gcode(output/'plate_1.gcode')
         except (OSError,RuntimeError) as error:
             record.update(result='failed',support_audit={'result':'failed','error':str(error)});code=1
+    # The slice directory is often the throwaway one map_common hands a run outside a job, and
+    # the sliced project is a deliverable of the model, not of the run. It moves whenever Bambu
+    # produced it: the support audit judges the G-code, it does not unmake the file.
+    if 'sliced_file' in record:
+        project=sliced_path(args.model)
+        shutil.move(record['sliced_file'],project)
+        record['sliced_file']=str(project)
     write_json(output/'run.json',record)
     print(json.dumps(record,indent=2),flush=True)
     raise SystemExit(code)

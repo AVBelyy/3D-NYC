@@ -3,10 +3,9 @@ import argparse,hashlib,json,re,shutil,statistics,tempfile,zipfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from cache_common import Progress
-from slice_3mf import SLICER,run_slice
+from slice_3mf import SLICED_SUFFIX,SLICER,run_slice,sliced_path
 
 SPOOL_G=1000.
-SLICED_SUFFIX='.gcode.3mf'
 STATS_MEMBER='Metadata/print_stats.json'
 CARRIED=('Metadata/generation_command.json',)
 DURATION=re.compile(r'(\d+(?:\.\d+)?)\s*([dhms])')
@@ -132,11 +131,6 @@ def part_labels(model):
 
 def sha256(path):
     with path.open('rb') as stream:return hashlib.file_digest(stream,'sha256').hexdigest()
-
-
-def sliced_path(model):
-    """The sliced project belongs beside the model it was sliced from."""
-    return model.with_suffix(SLICED_SUFFIX)
 
 
 def read_embedded_stats(project,digest=None):

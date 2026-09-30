@@ -649,4 +649,5 @@ map underneath it.
 - It does not route the cut around anything. The surface grid is regular by
   design; a building on a grid line is cut by it.
 - It does not slice. Open the result in Bambu Studio, or run
-  `scripts/slice_3mf.py` against it.
+  `scripts/slice_3mf.py --model <plate>.3mf --export-project`, which writes the
+  sliced `<plate>.gcode.3mf` beside it.
